@@ -24,18 +24,18 @@ v0; `wall_s`, quality, build and test results are.
 
 The question this answers is not "which model is best?" It is:
 
-> On this machine, with this engine, quant and context budget, which model
+> On this setup, with this provider/model, quant and context budget, which model
 > builds a real browser app with the fewest issues in the least wall time?
 
-The unit of comparison is a **deployment**: model + quantization + engine +
-hardware + sampling settings. That is the only comparison that is meaningful
-when one box is a 36 GB Mac running Splash and the other is a 16 GB 6800XT
-running Strata.
+The unit of comparison is a **deployment**: whatever `provider/model` your
+OpenCode config exposes, with its own endpoint, quantization, context and
+sampling settings. The harness has no model list, endpoint list, machine list
+or engine knowledge. It asks the local `opencode` CLI for the model list and
+passes the selected reference straight to `opencode run`.
 
-The harness itself runs on a control Mac that does not host either model server.
-The model endpoints are remote. That is deliberate: the control Mac has the
-headroom for Docker, and the agent container can be isolated from the tests
-without competing with Splash or Strata for memory.
+The harness runs on a control machine with Docker, a browser and the hidden
+tests. The agent container mounts only the workdir and the user's OpenCode
+config; the model server stays wherever the config points.
 
 ## 0. What to keep from planner-bench — and what to change
 
@@ -301,19 +301,16 @@ Clone the `planner-bench` shape:
 
 ```
 spritebench/
-  prompt/PROMPT.md
-  prompt/SOURCE.sha256
-  config/opencode.json
-  config/arms.json
+  PROMPT.md
+  bench.py
+  docker/
+    agent.Dockerfile
+    entrypoint.sh
+    serve.mjs
   tasks/spriteforge-lite/
-    PROMPT.md
     seed/
     tests/                 # hidden
     reference/             # instrumented spriteforge; never visible to model
-  tools/
-    setup.sh
-    bench.py               # check | run | grade | report | probe
-    perf-proxy.py           # reused from planner-bench
   runs/
   results.csv
   report.md
@@ -321,41 +318,32 @@ spritebench/
 
 ### Run flow
 
-1. Copy the seed into `runs/<task>/<arm>/r<rep>/workdir`.
-2. Start the perf proxy; write a per-run OpenCode config with the arm pinned.
-3. Start the timer; run `opencode run` with the task prompt (or `--agent`).
+1. Copy the seed into `runs/<timestamp>-<model>-r<rep>/workdir`.
+2. Mount the local OpenCode config directory; start the agent container with
+   the selected `provider/model`.
+3. Start the timer; run `opencode run` with the task prompt.
 4. At exit or watchdog, kill the process group; record `watchdog`.
-5. If needed, run `npm run build` once; record exit code and duration.
-6. Start `vite preview` on a random port; wait for HTTP 200.
-7. Copy hidden tests to `runs/.../e2e/`; run
-   `npx playwright test --reporter=json` with `BASE_URL`.
-8. Collect console errors, page errors, screenshot at 1280×800.
-9. Write `meta.json`, `test-results.json`, `perf.jsonl`, `results.csv`.
+5. Run the build container without tests; record typecheck/build codes.
+6. Run the test container with `dist/` and hidden `tests/` mounted; serve
+   `dist/` and run Playwright with JSON output.
+7. Parse test results, write `score.json` and `report.md`, append
+   `results.csv`.
 
 ### Metrics
 
 | Metric | Source |
 |---|---|
 | `wall_s` | harness timer around the agent run |
-| `agent_think_s` | sum of model request durations |
-| `tool_s` | `wall_s - agent_think_s` |
-| `time_to_first_build` | first successful `npm run build` |
-| `time_to_completion` | `COMPLETION.md` or exit |
 | `watchdog` | hard safety or inactivity timeout fired |
 | `build_ok`, `typecheck_ok` | harness commands |
 | `p0_pass`, `p1_pass`, `p2_pass` | Playwright JSON |
 | `quality` | weighted pass rate |
 | `major_issues`, `minor_issues` | failed P1/P2 tests |
-| `console_errors`, `page_errors` | browser events |
-| `tokens_in/out/reasoning` | OpenCode JSON + proxy |
-| `ttft_ms`, `prefill_tps`, `decode_tps` | proxy |
-| `cached_tokens`, `draft_accept_pct` | proxy |
-| `peak_ram/VRAM` | OS tooling, optional |
-| `screenshot` | Playwright |
+| `completion`, `agent_ok`, `self_test_runs` | agent log |
+| `report`, `score.json` | run artifacts |
 
-The proxy is the same one used by `planner-bench`; it already observes server
-vs client timing and records reasoning tokens when the provider reports them.
-Do not interpret `reasoning_tokens=0` as "no thinking" — check the raw stream.
+The perf proxy (model think/tool time, tokens, TTFT, prefill/decode) is
+designed but not wired in v0. `wall_s`, quality, build and test results are.
 
 ### Agent self-testing is part of the task
 
@@ -409,14 +397,12 @@ Recommended isolation, strongest first:
    - The agent gets only the workdir mounted at `/work`.
    - Do not mount `spritebench/`, the user's home, the Docker socket, or the
      test directory.
-   - The model server stays outside; the agent container reaches it through
-     `host.docker.internal` (Mac/Windows) or the host gateway (Linux).
+   - The model endpoint is whatever the mounted OpenCode config points at;
+     the agent container only needs network access to it.
    - Hidden tests live on the host, or in a separate test container that is
      started only after the agent is dead.
    - Use an empty `/tmp`, a fresh home, no shell history.
-   - On the Mac, Docker Desktop or a small Linux VM (Lima/UTM) works. On the
-     PC, Docker/Podman works; the agent container needs no GPU because Strata
-     runs on the host.
+   - The agent container needs no GPU; inference stays on the model server.
 2. **Two-machine isolation (practical with your setup).**
    - Keep the hidden tests and the Playwright harness only on the *other*
      machine. The agent host gets the workdir and the model endpoint, nothing
@@ -509,90 +495,80 @@ not trust the model's `node_modules` or test scripts.
 
 ### One command, no manual churn
 
-The only interface should be:
+The only interface is:
 
 ```bash
 ./bench.py models
-./bench.py run --model pc/ista-iq3_xxs --goal balanced
+./bench.py run --model provider/model --goal balanced
 ./bench.py report
 ```
 
+`./bench.py models` prints provider counts from the local `opencode models`
+command; `--provider` lists that provider's models, `--all` lists everything.
+`run` with no `--model` asks for a provider, then shows that provider's models
+as a numbered menu; `--provider` skips the first prompt. The model reference is
+passed unchanged to `opencode run`.
+
 `run` does the whole sequence:
 
-1. Resolve the model from `config/models.json`.
-2. Preflight the endpoint (`GET /v1/models`); fail with a clear message if
-   Splash/Strata is not running.
+1. Resolve the model from `opencode models` (or accept `--model` with
+   `--no-preflight`).
+2. Find the OpenCode config directory (`opencode debug paths`, or `--config`).
 3. Create `runs/<timestamp>-<model>/` and copy the seed into `workdir/`.
-4. Generate a per-run OpenCode config containing only that provider/model.
-5. Start the **agent container** with only `workdir/` and the config mounted.
-   It has Node, Chromium and Playwright for its own testing, plus a public
-   smoke suite in the seed. It has no hidden tests, no reference, no host home
-   and no Docker socket.
-6. Wait for `COMPLETION.md` (60 s grace), process exit, or watchdog.
-7. Copy `workdir/` to an eval directory.
-8. Run the **build container** without tests: `npm ci --ignore-scripts
-   --offline`, `npm run typecheck`, `npm run build`.
-9. Run the **test container** with `dist/` and the hidden tests mounted
+4. Start the **agent container** with `workdir/` and the config directory
+   mounted. It has Node, Chromium, Playwright and the public smoke suite; it
+   never sees the hidden tests, the reference, the host home or the Docker
+   socket.
+5. Wait for `COMPLETION.md` (60 s grace), process exit, or watchdog.
+6. Run the **build container** without tests: `npm ci --ignore-scripts`,
+   `npm run typecheck`, `npm run build`.
+7. Run the **test container** with `dist/` and the hidden tests mounted
    read-only; serve `dist/` and run Playwright.
-10. Parse results, write `score.json` and `report.md`, append `results.csv`,
-    and print the score.
+8. Parse results, write `score.json` and `report.md`, append `results.csv`,
+   and print the score.
 
 Typical output:
 
 ```
-pc/ista-iq3_xxs                              rep 1
+provider/model                                      rep 1
   build   ok        typecheck ok
-  P0      6/6       P1 8/9       P2 5/7
-  quality 0.92      minor 2      major 1
+  P0      4/4       P1 8/9       P2 5/5
+  quality 0.94      minor 0      major 1
   wall    18m 42s
-  tokens  (proxy hook; not wired in v0)
-  report  runs/2026-11-02T14-05-22-pc-ista-iq3_xxs/report.md
+  report  runs/2026-11-02T14-05-22-.../report.md
 ```
 
-`./bench.py models` prints the configured list; `./bench.py run` with no
-`--model` shows the same list as a numbered menu. `--reps 2` repeats and
-aggregates. `--all` runs every configured model (use with care; no scoring cap).
-`--dry-run` prints the Docker commands and mounts without executing.
+`--reps 2` repeats and aggregates. `--all` runs every model in the list (use
+with care; no scoring cap). `--dry-run` prints the Docker commands and mounts
+without executing.
 
-### Model config
+### OpenCode config
 
-`config/models.json` is the only thing to edit when adding a model:
+There is no `config/models.json`. The local OpenCode config is the source of
+truth:
 
-```json
-{
-  "models": {
-    "mac/qwen3.8-27b": {
-      "machine": "mac-splash",
-      "provider": "splash",
-      "base_url": "http://192.168.10.112:8000/v1",
-      "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M",
-      "context": 32768,
-      "thinking": "medium"
-    },
-    "pc/ista-iq3_xxs": {
-      "machine": "pc-strata",
-      "provider": "strata",
-      "base_url": "http://192.168.10.136:8080/v1",
-      "model": "ista-flash-next-iq3_xxs",
-      "context": 32768,
-      "thinking": "medium"
-    }
-  }
-}
+```bash
+./bench.py models
+./bench.py run --model provider/model
+./bench.py run --model provider/model --config ~/.config/opencode
+./bench.py run --model provider/model --config /path/to/opencode.json
 ```
 
-API keys come from environment variables (`SPLASH_API_KEY`,
-`STRATA_API_KEY`, or `BENCH_API_KEY` as a fallback), never from the JSON.
-The harness writes a temporary `opencode.json` per run and mounts it read-only.
+The default config directory comes from `opencode debug paths`. The agent
+container mounts it read-only at `/config/opencode` and copies it into a
+writable XDG config. `--env KEY` passes an environment variable into the
+container; variables referenced as `{env:KEY}` in the config are passed
+automatically when present on the host. `--variant`, `--agent` and `--pure`
+map directly to `opencode run`.
 
 ### What Docker hides — and what it does not
 
 Dockerizing the **tests** does not hide them from an agent running on the host.
 The agent must be the isolated process:
 
-- agent container: mounts `workdir/` and the per-run config only. It contains
-  Chromium/Playwright and the seed's `public-tests/`, but never the hidden
-  `tests/`;
+- agent container: mounts `workdir/` and the user's OpenCode config only. It
+  contains Chromium/Playwright and the seed's `public-tests/`, but never the
+  hidden `tests/`;
 - build container: mounts `workdir/` only;
 - test container: mounts `dist/` and hidden `tests/` read-only.
 
@@ -606,8 +582,8 @@ container.
 ```bash
 ./bench.py check
 ./bench.py models
-./bench.py run --model mac/qwen3.8-27b --dry-run
-./bench.py run --model mac/qwen3.8-27b
+./bench.py run --model provider/model --dry-run
+./bench.py run --model provider/model
 ./bench.py report
 ```
 
@@ -641,46 +617,32 @@ Do not hide the quality/time tradeoff behind one arbitrary weight. Pick a goal:
 All three modes still require `fatal == 0` and `quality >= 0.80`. Report the
 full Pareto table, not just the winner:
 
-| Arm | Quality | Time | Minor | Major | Fatal | Verdict |
+| Model | Quality | Time | Minor | Major | Fatal | Verdict |
 |---|---:|---:|---:|---:|---:|---|
-| PC / Swift IQ3_XXS | 0.92 | 14m | 2 | 0 | 0 | eligible |
-| PC / ISTA IQ3_XXS | 0.95 | 19m | 1 | 0 | 0 | eligible |
-| Mac / Qwen3.8-27B | 0.88 | 11m | 3 | 0 | 0 | eligible |
-| Mac / Flash-Next Q2_0 | 0.90 | 17m | 2 | 0 | 0 | tight memory |
+| provider/model-a | 0.92 | 14m | 2 | 0 | 0 | eligible |
+| provider/model-b | 0.95 | 19m | 1 | 0 | 0 | eligible |
+| provider/model-c | 0.88 | 11m | 3 | 0 | 0 | eligible |
+| provider/model-d | 0.90 | 17m | 2 | 0 | 0 | eligible |
 
 The decision is allowed to be "both are fine; use the faster one for the
 implementer and the higher-quality one for the planner." That is the point.
 
-## 7. Experiment matrix
+## 7. Experiment design
 
-### Mac 36 GB + Splash
+There is no fixed matrix. `./bench.py models` shows the providers in your
+OpenCode config; `./bench.py models --provider NAME` shows that provider's
+models. Pick two to four `provider/model` references that you actually care
+about; `--provider` filters the run menu too.
 
-- `qwen3.8-27b` — UD-Q4_K_M; the safe baseline.
-- `qwen3.8-flash-next` — ISTA Q2_0; tight memory, run with everything else closed.
-- `qwen3.6-35b-a3b` — UD-Q4_K_M; fast fallback.
-- `swift-1.5-27b` — existing arm, if available.
+Settings come from the selected model's OpenCode config: context, output limit,
+temperature, reasoning field, tool support, and variants. `--variant` selects a
+variant if the config defines one. The harness does not override context or
+sampling, so the comparison is between the deployments as configured.
 
-### PC 6800XT 16 GB + Strata
-
-- `qwen3.6-35b-a3b` — UD-Q4_K_M; likely the practical speed winner.
-- `swift-1.5-flash-next` — IQ3_XXS; current setup.
-- `ista-flash-next` — IQ3_XXS; the main unknown.
-- `ista-flash-next` — IQ2_XS; faster, lower quality.
-- Gyro is probably out on RDNA2; check support before downloading.
-
-Fixed settings per run:
-
-- context 32K (the task does not need 262K; using the full window would
-  conflate memory pressure with app quality);
-- KV cache q8_0;
-- temperature 0.6, top_p 0.95, top_k 20, min_p 0.0;
-- thinking effort `medium` (record it; do not compare xhigh vs none by accident);
-- same OpenCode agent prompt, same tools, same watchdog settings.
-
-Start with **one rep per arm** (pilot). Promote the top two per machine to a
-second rep. If the top two are within 10% on time and 5% on quality, run a
-third. With no scoring cap the calendar time depends on the models; the pilot
-is the point where you decide whether the matrix is worth expanding.
+Start with **one rep per model**. Promote the top two to a second rep. If they
+are within 10% on time and 5% on quality, run a third. With no scoring cap the
+calendar time depends on the models; the pilot is the point where you decide
+whether the matrix is worth expanding.
 
 ## 8. Avoiding a rigged benchmark
 
@@ -688,8 +650,8 @@ The planner-bench critique applies here too. Mitigations:
 
 - **Build, don't recite.** The app must boot and pass browser tests; prose is
   worthless.
-- **Hidden, randomised tests.** The prompt gives the contract, not the cases.
-  Coordinates, colours and frame order vary by rep.
+- **Hidden tests.** The prompt gives the contract, not the cases. v0 uses fixed
+  coordinates; per-rep randomisation is the next hardening step.
 - **Behaviour, not code.** Tests click, drag, read canvas pixels, reload the
   page and parse a PNG. They do not grep for function names.
 - **Custom app.** SpriteForge is not a standard benchmark task; the reference
@@ -718,13 +680,13 @@ The planner-bench critique applies here too. Mitigations:
 - Strip the app to a placeholder seed that still builds.
 - Write `PROMPT.md` with the contract and P0/P1/P2.
 - Add `check` validation: prompt hash, seed builds, tests pass on reference.
-- Run one pilot arm on the PC (fastest box) to calibrate task scope and check
-  that the watchdog is not firing during normal work.
+- Run one pilot model to calibrate task scope and check that the watchdog is
+  not firing during normal work.
 
 ### Phase 2 — matrix
 
 - Run the pilot matrix (one rep per arm).
-- Promote the top two per machine; run the second rep.
+- Promote the top two models; run the second rep.
 - Grade, report, inspect screenshots, write verdict.
 
 ### Phase 3 — extend
@@ -739,7 +701,7 @@ The planner-bench critique applies here too. Mitigations:
    time and can be gamed; hidden browser tests are enough.
 2. **Visual rubric?** One screenshot per run and a 0–2 human/VLM score is
    cheap, but it reintroduces subjectivity. Use it as a note, not the verdict.
-3. **Run both machines in parallel?** Yes for wall time; keep one request per
-   machine and record thermal state.
+3. **Run models in parallel?** Only if they use separate model servers; keep
+   one request per server and record thermal state.
 4. **Watchdog values.** 4 hours hard, 30 minutes inactivity. Adjust only if a
    legitimate slow model trips them.
