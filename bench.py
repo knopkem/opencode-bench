@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""spritebench: one-command build-and-play benchmark for local deployments.
+"""spritebench: one-command build-and-play benchmark for OpenCode models.
 
 Usage:
-    ./bench.py build
     ./bench.py models
-    ./bench.py run --model pc/swift-iq2-xs
+    ./bench.py run --model provider/model
     ./bench.py report
 
-The agent runs in a container with only the workdir and its own config mounted.
+There is no model list in this repo. `models` asks the local `opencode` CLI what
+its current configuration exposes, and `run --model` passes that reference
+straight through to `opencode run` inside the agent container. The agent
+container gets the local OpenCode config mounted read-only, plus Chromium,
+Playwright and the seed's public smoke tests.
+
 The hidden Playwright suite is mounted only into the test container after the
 agent is dead.
 """
@@ -25,13 +29,10 @@ import statistics
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config" / "models.json"
 TASK_DIR = ROOT / "tasks" / "spriteforge-lite"
 SEED_DIR = TASK_DIR / "seed"
 TESTS_DIR = TASK_DIR / "tests"
@@ -42,6 +43,7 @@ REPORT_PATH = ROOT / "report.md"
 
 DEFAULT_IMAGE = os.environ.get("SPRITEBENCH_IMAGE", "spritebench:latest")
 DEFAULT_ENGINE = os.environ.get("SPRITEBENCH_ENGINE", "docker")
+OPENCODE = os.environ.get("SPRITEBENCH_OPENCODE", "opencode")
 
 EXPECTED = {"P0": 4, "P1": 9, "P2": 5}
 WEIGHT = {"P0": 3, "P1": 2, "P2": 1}
@@ -49,9 +51,7 @@ CSV_FIELDS = [
     "run_id",
     "timestamp",
     "model",
-    "machine",
     "provider",
-    "quant",
     "rep",
     "goal",
     "build_ok",
@@ -72,12 +72,6 @@ CSV_FIELDS = [
     "completion",
     "agent_ok",
     "self_test_runs",
-    "tokens_in",
-    "tokens_out",
-    "reasoning_tokens",
-    "ttft_ms",
-    "prefill_tps",
-    "decode_tps",
     "report",
 ]
 
@@ -86,32 +80,12 @@ def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
-def load_models() -> dict:
-    try:
-        data = json.loads(CONFIG_PATH.read_text())
-    except FileNotFoundError:
-        sys.exit(f"error: {CONFIG_PATH} missing")
-    except json.JSONDecodeError as exc:
-        sys.exit(f"error: {CONFIG_PATH}: {exc}")
-    models = data.get("models")
-    if not isinstance(models, dict) or not models:
-        sys.exit(f"error: {CONFIG_PATH} has no models")
-    return models
-
-
 def slug(value: str) -> str:
     return re.sub(r"[^a-z0-9_.-]+", "-", value.lower()).strip("-")
 
 
-def model_ref(entry: dict) -> str:
-    return f"{entry['provider']}/{entry['model']}"
-
-
-def api_key(entry: dict) -> str:
-    name = entry.get("api_key_env")
-    if name:
-        return os.environ.get(name, "local-benchmark")
-    return os.environ.get("BENCH_API_KEY", "local-benchmark")
+def provider_of(model: str) -> str:
+    return model.split("/", 1)[0] if "/" in model else model
 
 
 def run_command(
@@ -119,7 +93,6 @@ def run_command(
     *,
     log_path: Path | None = None,
     dry_run: bool = False,
-    check: bool = False,
     env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     printable = " ".join(shlex.quote(part) for part in cmd)
@@ -131,7 +104,7 @@ def run_command(
         with log_path.open("w", encoding="utf-8") as handle:
             handle.write(f"+ {printable}\n\n")
             handle.flush()
-            proc = subprocess.run(
+            return subprocess.run(
                 cmd,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -139,8 +112,7 @@ def run_command(
                 env=env,
                 check=False,
             )
-        return proc
-    return subprocess.run(cmd, text=True, env=env, check=check)
+    return subprocess.run(cmd, text=True, env=env, check=False)
 
 
 def engine_available(engine: str, dry_run: bool = False) -> bool:
@@ -169,69 +141,100 @@ def image_exists(engine: str, image: str) -> bool:
     return proc.returncode == 0
 
 
-def preflight(entry: dict, timeout: float = 5.0) -> tuple[bool, str]:
-    base = str(entry.get("base_url", "")).rstrip("/")
-    if not base:
-        return False, "missing base_url"
-    url = f"{base}/models"
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {api_key(entry)}"},
-    )
+def config_env(config_dir: Path | None) -> dict[str, str]:
+    env = os.environ.copy()
+    if config_dir is not None:
+        if config_dir.name == "opencode":
+            env["XDG_CONFIG_HOME"] = str(config_dir.parent)
+        else:
+            for name in ("opencode.json", "opencode.jsonc"):
+                candidate = config_dir / name
+                if candidate.exists():
+                    env["OPENCODE_CONFIG"] = str(candidate)
+                    break
+    return env
+
+
+def list_models(provider: str | None = None, config_dir: Path | None = None) -> list[str]:
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return True, f"HTTP {response.status}"
-    except urllib.error.HTTPError as exc:
-        # The server answered. 401/404 still means it is reachable.
-        return True, f"HTTP {exc.code}"
-    except Exception as exc:  # noqa: BLE001 - report the transport failure
-        return False, str(exc)
+        proc = subprocess.run(
+            [OPENCODE, "models"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=config_env(config_dir),
+            check=False,
+        )
+    except FileNotFoundError:
+        sys.exit(f"error: {OPENCODE} not found on PATH")
+    except subprocess.TimeoutExpired:
+        sys.exit("error: `opencode models` timed out")
+    if proc.returncode != 0:
+        sys.exit(f"error: `opencode models` failed:\n{proc.stdout}{proc.stderr}")
+
+    models: list[str] = []
+    for line in proc.stdout.splitlines():
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        if not re.match(r"^[^\s/]+/\S+$", line):
+            continue
+        if provider and not line.startswith(f"{provider}/"):
+            continue
+        if line not in models:
+            models.append(line)
+    return models
 
 
-def write_opencode_config(entry: dict, path: Path) -> None:
-    provider = str(entry["provider"])
-    model = str(entry["model"])
-    context = int(entry.get("context", 32768))
-    output = int(entry.get("output", 16384))
-    thinking = str(entry.get("thinking", "medium"))
-    config = {
-        "$schema": "https://opencode.ai/config.json",
-        "model": f"{provider}/{model}",
-        "small_model": f"{provider}/{model}",
-        "provider": {
-            provider: {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": entry.get("display_name", provider),
-                "options": {
-                    "baseURL": entry["base_url"],
-                    "apiKey": api_key(entry),
-                },
-                "models": {
-                    model: {
-                        "name": entry.get("display_name", model),
-                        "tool_call": True,
-                        "reasoning": True,
-                        "temperature": True,
-                        "interleaved": {"field": "reasoning_content"},
-                        "attachment": True,
-                        "limit": {
-                            "context": context,
-                            "input": max(1024, context - output),
-                            "output": output,
-                        },
-                        "options": {
-                            "reasoningEffort": thinking,
-                            "temperature": entry.get("temperature", 0.6),
-                            "top_p": entry.get("top_p", 0.95),
-                            "top_k": entry.get("top_k", 20),
-                        },
-                    }
-                },
-            }
-        },
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+def resolve_config_dir(explicit: str | None, run_dir: Path) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if path.is_file():
+            # XDG layout: <root>/opencode/opencode.jsonc
+            target = run_dir / "opencode-config" / "opencode"
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target / path.name)
+            return target
+        if path.is_dir():
+            return path
+        sys.exit(f"error: OpenCode config not found: {path}")
+
+    try:
+        proc = subprocess.run(
+            [OPENCODE, "debug", "paths"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        for line in proc.stdout.splitlines():
+            match = re.match(r"^config\s+(.+)$", line.strip())
+            if match:
+                path = Path(match.group(1)).expanduser()
+                if path.exists():
+                    return path
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    fallback = Path.home() / ".config" / "opencode"
+    if fallback.exists():
+        return fallback
+    sys.exit("error: could not find the OpenCode config directory; pass --config")
+
+
+def config_env_names(config_dir: Path) -> set[str]:
+    names: set[str] = set()
+    if config_dir.is_file():
+        files = [config_dir]
+    else:
+        files = list(config_dir.glob("*.json")) + list(config_dir.glob("*.jsonc"))
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name in re.findall(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", text):
+            if name in os.environ:
+                names.add(name)
+    return names
 
 
 def copy_seed(destination: Path) -> None:
@@ -240,28 +243,38 @@ def copy_seed(destination: Path) -> None:
     shutil.copytree(
         SEED_DIR,
         destination,
-        ignore=shutil.ignore_patterns("node_modules", ".git", "dist"),
+        ignore=shutil.ignore_patterns("node_modules", ".git", "dist", "test-results"),
     )
     shutil.copy2(PROMPT_PATH, destination / "PROMPT.md")
 
 
+def agent_command(args: argparse.Namespace) -> str:
+    parts = [
+        'exec opencode run --format json --auto --model "$SPRITEBENCH_MODEL"',
+    ]
+    if args.variant:
+        parts.append(f"--variant {shlex.quote(args.variant)}")
+    if args.agent:
+        parts.append(f"--agent {shlex.quote(args.agent)}")
+    if args.pure:
+        parts.append("--pure")
+    parts.append('"$(cat /work/PROMPT.md)"')
+    return " ".join(parts)
+
+
 def start_agent(
-    entry: dict,
-    workdir: Path,
+    model: str,
     config_dir: Path,
+    workdir: Path,
     run_dir: Path,
     *,
-    engine: str,
-    image: str,
-    timeout: int,
-    idle_timeout: int,
-    dry_run: bool,
+    env_names: set[str],
+    args: argparse.Namespace,
 ) -> dict:
-    name = f"spritebench-{slug(entry['provider'])}-{int(time.time())}"
+    name = f"spritebench-{slug(provider_of(model))}-{int(time.time())}"
     log_path = run_dir / "agent.log"
-    ref = model_ref(entry)
     command = [
-        engine,
+        args.engine,
         "run",
         "--rm",
         "--name",
@@ -270,24 +283,19 @@ def start_agent(
         "-v",
         f"{workdir}:/work",
         "-v",
-        f"{config_dir}:/config:ro",
-        "-e",
-        "OPENCODE_CONFIG=/config/opencode.json",
+        f"{config_dir}:/config/opencode:ro",
         "-e",
         "HOME=/home/agent",
         "-e",
         "XDG_CONFIG_HOME=/home/agent/.config",
         "-e",
-        f"SPRITEBENCH_MODEL={ref}",
-        "-w",
-        "/work",
-        image,
-        "bash",
-        "-lc",
-        'exec opencode run --format json --auto --model "$SPRITEBENCH_MODEL" "$(cat /work/PROMPT.md)"',
+        f"SPRITEBENCH_MODEL={model}",
     ]
+    for key in sorted(env_names):
+        command += ["-e", key]
+    command += ["-w", "/work", args.image, "bash", "-lc", agent_command(args)]
 
-    if dry_run:
+    if args.dry_run:
         print("+ " + " ".join(shlex.quote(part) for part in command))
         return {
             "wall_s": 0.0,
@@ -328,21 +336,21 @@ def start_agent(
 
             if completion_path.exists() and completion_seen_at is None:
                 completion_seen_at = now
-                print(f"  COMPLETION.md seen; stopping in 60s unless the agent exits")
+                print("  COMPLETION.md seen; stopping in 60s unless the agent exits")
             if completion_seen_at is not None and now - completion_seen_at > 60:
                 watchdog = "completion"
                 break
-            if now - start > timeout:
+            if now - start > args.timeout:
                 watchdog = "hard"
                 break
-            if now - last_change > idle_timeout:
+            if now - last_change > args.idle_timeout:
                 watchdog = "idle"
                 break
             time.sleep(2)
 
         if watchdog != "exit":
             subprocess.run(
-                [engine, "rm", "-f", name],
+                [args.engine, "rm", "-f", name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -397,11 +405,9 @@ def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
     proc = run_command(command, log_path=run_dir / "build-run.log", dry_run=dry_run)
     if dry_run:
         return {"typecheck_ok": True, "build_ok": True, "dist": True}
-    typecheck_code = read_code(run_dir / "typecheck.code")
-    build_code = read_code(run_dir / "build.code")
     return {
-        "typecheck_ok": typecheck_code == 0,
-        "build_ok": build_code == 0 and proc.returncode == 0,
+        "typecheck_ok": read_code(run_dir / "typecheck.code") == 0,
+        "build_ok": read_code(run_dir / "build.code") == 0 and proc.returncode == 0,
         "dist": (workdir / "dist" / "index.html").exists(),
     }
 
@@ -493,7 +499,6 @@ def score_run(tests: dict[str, bool], build: dict, *, goal: str) -> dict:
         details.append({"title": title, "tier": tier, "ok": ok})
 
     for tier, expected in EXPECTED.items():
-        # Missing tests are failures, not invisible.
         counts[tier]["pass"] = min(counts[tier]["pass"], expected)
 
     weighted_total = sum(WEIGHT[tier] * EXPECTED[tier] for tier in EXPECTED)
@@ -521,7 +526,6 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"# {meta['run_id']}",
         "",
         f"- model: `{meta['model']}`",
-        f"- machine: {meta['machine']}",
         f"- provider: {meta['provider']}",
         f"- goal: {meta['goal']}",
         f"- wall: {meta['wall_s']:.1f}s",
@@ -606,6 +610,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     ]
     if args.playwright_image:
         command += ["--build-arg", f"PLAYWRIGHT_IMAGE={args.playwright_image}"]
+    if args.opencode_version:
+        command += ["--build-arg", f"OPENCODE_VERSION={args.opencode_version}"]
     command.append(str(ROOT))
     print("+ " + " ".join(shlex.quote(part) for part in command))
     if args.dry_run:
@@ -613,81 +619,110 @@ def cmd_build(args: argparse.Namespace) -> int:
     return subprocess.run(command, check=False).returncode
 
 
+def provider_counts(models: list[str]) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for model in models:
+        provider = provider_of(model)
+        counts[provider] = counts.get(provider, 0) + 1
+    return sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+
+
 def cmd_models(args: argparse.Namespace) -> int:
-    models = load_models()
-    print(f"{'name':28} {'machine':14} {'provider':9} {'model'}")
-    print("-" * 100)
-    for name, entry in models.items():
-        print(
-            f"{name:28} {entry.get('machine', '?'):14} "
-            f"{entry.get('provider', '?'):9} {entry.get('model', '?')}"
-        )
+    config_dir = resolve_config_dir(args.config, RUNS_DIR / "_models")
+    models = list_models(args.provider, config_dir)
+    if not models:
+        eprint("error: `opencode models` returned no models")
+        return 1
+    if args.provider or args.all:
+        for model in models:
+            print(model)
+    else:
+        for provider, count in provider_counts(models):
+            print(f"{provider:28} {count:4} model(s)")
+    print(f"\n{len(models)} model(s); config {config_dir}")
     return 0
 
 
-def choose_model(models: dict, requested: str | None) -> list[str]:
+def choose_model(models: list[str], requested: str | None, provider: str | None) -> list[str]:
     if requested and requested != "all":
         if requested not in models:
-            eprint(f"error: unknown model '{requested}' (have: {', '.join(models)})")
+            eprint(f"error: model '{requested}' is not in `opencode models`")
+            eprint("hint: run ./bench.py models, or pass --no-preflight to try anyway")
             raise SystemExit(2)
         return [requested]
     if requested == "all":
-        return list(models)
-    names = list(models)
-    print("Select a deployment:")
-    for index, name in enumerate(names, 1):
-        entry = models[name]
-        print(f"  {index}. {name:28} {entry.get('machine', '?')}")
+        return models
+
+    if not provider:
+        counts = provider_counts(models)
+        print("Providers:")
+        for index, (name, count) in enumerate(counts, 1):
+            print(f"  {index:3}. {name:28} {count:4} model(s)")
+        raw = input("provider> ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(counts):
+            provider = counts[int(raw) - 1][0]
+        else:
+            provider = raw or None
+
+    candidates = [model for model in models if not provider or model.startswith(f"{provider}/")]
+    if not candidates:
+        eprint(f"error: no models under provider '{provider}'")
+        raise SystemExit(2)
+
+    if len(candidates) > 50:
+        needle = input("filter (substring, empty for all)> ").strip().lower()
+        if needle:
+            candidates = [model for model in candidates if needle in model.lower()]
+    if not candidates:
+        eprint("error: no models matched")
+        raise SystemExit(2)
+
+    print(f"Models under {provider or 'all'}:")
+    for index, model in enumerate(candidates, 1):
+        print(f"  {index:3}. {model}")
     raw = input("model> ").strip()
     try:
-        return [names[int(raw) - 1]]
+        return [candidates[int(raw) - 1]]
     except (ValueError, IndexError):
+        # Also accept a full model reference typed directly.
+        if raw in candidates:
+            return [raw]
         eprint("error: invalid selection")
         raise SystemExit(2)
 
 
-def run_one(
-    name: str,
-    entry: dict,
-    *,
-    rep: int,
-    args: argparse.Namespace,
-) -> dict:
-    models = load_models()
-    if not args.no_preflight and not args.dry_run:
-        ok, detail = preflight(entry)
-        print(f"  endpoint {entry['base_url']}: {'ok' if ok else 'FAIL'} ({detail})")
-        if not ok:
-            raise SystemExit("error: model endpoint is not reachable; start Splash/Strata or pass --no-preflight")
-
-    if not args.dry_run and not image_exists(args.engine, args.image):
-        raise SystemExit(f"error: image {args.image} missing; run ./bench.py build")
-
+def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"{timestamp}-{slug(name)}-r{rep}"
+    run_id = f"{timestamp}-{slug(model)}-r{rep}"
     run_dir = RUNS_DIR / run_id
     if run_dir.exists():
         shutil.rmtree(run_dir)
     workdir = run_dir / "workdir"
-    config_dir = run_dir / "config"
+    config_dir = resolve_config_dir(args.config, run_dir)
     copy_seed(workdir)
-    write_opencode_config(entry, config_dir / "opencode.json")
+
+    env_names = config_env_names(config_dir) | set(args.env or [])
+    if not args.no_preflight:
+        available = list_models(provider_of(model), config_dir)
+        if model not in available:
+            raise SystemExit(
+                f"error: '{model}' is not in `opencode models` for {config_dir}; "
+                "run ./bench.py models or pass --no-preflight"
+            )
 
     print(f"run {run_id}")
     print(f"  workdir {workdir}")
-    print(f"  model   {model_ref(entry)}")
+    print(f"  model   {model}")
+    print(f"  config  {config_dir}")
     print(f"  goal    {args.goal}")
 
     agent = start_agent(
-        entry,
-        workdir,
+        model,
         config_dir,
+        workdir,
         run_dir,
-        engine=args.engine,
-        image=args.image,
-        timeout=args.timeout,
-        idle_timeout=args.idle_timeout,
-        dry_run=args.dry_run,
+        env_names=env_names,
+        args=args,
     )
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
     if build["dist"]:
@@ -709,10 +744,8 @@ def run_one(
     meta = {
         "run_id": run_id,
         "timestamp": timestamp,
-        "model": name,
-        "machine": entry.get("machine", ""),
-        "provider": entry.get("provider", ""),
-        "quant": entry.get("quant", entry.get("model", "")),
+        "model": model,
+        "provider": provider_of(model),
         "rep": rep,
         "goal": args.goal,
         "wall_s": agent["wall_s"],
@@ -756,20 +789,20 @@ def run_one(
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    models = load_models()
-    names = choose_model(models, args.model)
-    if args.dry_run:
-        print(f"dry run: {len(names)} model(s), {args.reps} rep(s)")
-    for name in names:
+    config_dir = resolve_config_dir(args.config, RUNS_DIR / "_models")
+    models = list_models(args.provider, config_dir)
+    if not models:
+        eprint("error: `opencode models` returned no models")
+        return 1
+    names = choose_model(models, args.model, args.provider)
+    for model in names:
         for rep in range(1, args.reps + 1):
-            run_one(name, models[name], rep=rep, args=args)
+            run_one(model, rep=rep, args=args)
     return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
     problems: list[str] = []
-    if not CONFIG_PATH.exists():
-        problems.append(f"missing {CONFIG_PATH}")
     if not PROMPT_PATH.exists():
         problems.append(f"missing {PROMPT_PATH}")
     if not (SEED_DIR / "package.json").exists():
@@ -783,6 +816,16 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append(f"{args.engine} is not available")
     elif not args.dry_run and not image_exists(args.engine, args.image):
         problems.append(f"image {args.image} missing; run ./bench.py build")
+
+    config_dir = None
+    models: list[str] = []
+    try:
+        config_dir = resolve_config_dir(args.config, RUNS_DIR / "_check")
+        models = list_models(None, config_dir)
+        if not models:
+            problems.append("`opencode models` returned no models")
+    except SystemExit as exc:
+        problems.append(str(exc))
 
     versions = None
     if not problems and not args.dry_run:
@@ -821,7 +864,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"  image   {args.image}")
     print(f"  seed    {SEED_DIR}")
     print(f"  tests   {TESTS_DIR} ({len(hidden)} spec files)")
-    print(f"  models  {len(load_models())}")
+    print(f"  config  {config_dir}")
+    print(f"  models  {len(models)}")
     if versions:
         print(f"  tools   {versions}")
     return 0
@@ -880,13 +924,27 @@ def make_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SPRITEBENCH_PLAYWRIGHT_IMAGE", ""),
         help="override the Playwright base image tag",
     )
+    build.add_argument(
+        "--opencode-version",
+        default=os.environ.get("SPRITEBENCH_OPENCODE_VERSION", ""),
+        help="override the OpenCode 2 version installed in the image",
+    )
     build.set_defaults(func=cmd_build)
 
-    models = sub.add_parser("models", help="list configured deployments")
+    models = sub.add_parser("models", help="list models from `opencode models`")
+    models.add_argument("--provider", default=None)
+    models.add_argument("--all", action="store_true", help="print every model reference")
+    models.add_argument("--config", default=None, help="OpenCode config file or directory")
     models.set_defaults(func=cmd_models)
 
-    run = sub.add_parser("run", help="run one or more deployments")
-    run.add_argument("--model", default=None, help="model key, or 'all'")
+    run = sub.add_parser("run", help="run one or more OpenCode models")
+    run.add_argument("--model", default=None, help="provider/model, or 'all'")
+    run.add_argument("--provider", default=None, help="filter the model menu")
+    run.add_argument("--config", default=None, help="OpenCode config file or directory")
+    run.add_argument("--env", action="append", default=[], metavar="KEY", help="pass an env var")
+    run.add_argument("--variant", default=None, help="OpenCode model variant")
+    run.add_argument("--agent", default=None, help="OpenCode agent name")
+    run.add_argument("--pure", action="store_true", help="run OpenCode without external plugins")
     run.add_argument("--reps", type=int, default=1)
     run.add_argument("--goal", choices=["speed", "quality", "balanced"], default="balanced")
     run.add_argument("--timeout", type=int, default=4 * 3600, help="hard safety timeout")
@@ -897,6 +955,7 @@ def make_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check", help="validate config, seed, tests and image")
     check.add_argument("--dry-run", action="store_true")
+    check.add_argument("--config", default=None, help="OpenCode config file or directory")
     check.set_defaults(func=cmd_check)
 
     report = sub.add_parser("report", help="render results.csv")
