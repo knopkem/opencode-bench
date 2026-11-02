@@ -18,7 +18,11 @@ OpenCode config is the source of truth.
 ./bench.py models                # provider summary from `opencode models`
 ./bench.py models --provider NAME
 ./bench.py run --model provider/model
-./bench.py report
+./bench.py run --model provider/model --variant xhigh   # if the model defines it
+./bench.py status                # latest run, container and live engine status
+./bench.py preview               # serve the latest built app
+./bench.py rescore --run RUN_ID  # re-run build+tests after a suite fix
+./bench.py report                # table plus failed test names
 ```
 
 `run` with no `--model` asks for a provider, then shows that provider's models
@@ -46,7 +50,10 @@ The runner uses the OpenCode config that `opencode` already uses:
   referenced as `{env:KEY}` in the config are passed automatically when they
   exist on the host.
 - `--variant` maps to `opencode run --variant`; `--agent` sets the agent;
-  `--pure` disables external plugins.
+  `--pure` disables external plugins. Thinking is controlled by the selected
+  model entry in your OpenCode config (`body.thinking`, `reasoningEffort`,
+  `variants`), not by this harness. If a model entry has `thinking: false` and
+  no variants, `bench.py` cannot turn thinking on.
 - API keys stay in your OpenCode config or environment; this repo stores none.
 
 The agent container mounts the config directory read-only at `/config/opencode`
