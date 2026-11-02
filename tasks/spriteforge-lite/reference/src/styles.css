@@ -1,0 +1,87 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; background: #1d1f26; color: #d7dae0; font-family: system-ui, sans-serif; font-size: 14px; }
+
+#app {
+  display: grid;
+  grid-template-columns: 158px 512px minmax(320px, 1fr);
+  grid-template-rows: auto auto;
+  gap: 8px;
+  padding: 8px;
+  max-width: 1280px;
+}
+.toolbar   { grid-column: 1; grid-row: 1; }
+.centercol { grid-column: 2; grid-row: 1; }
+.rightcol  { grid-column: 3; grid-row: 1; }
+.bottom    { grid-column: 1 / 4; grid-row: 2; width: 100%; }
+
+h3 { margin: 2px 0 6px; font-size: 13px; color: #9aa3ad; text-transform: uppercase; letter-spacing: .5px; }
+
+button {
+  background: #2b2d40; color: #d7dae0; border: 1px solid #414751;
+  border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+button:hover { background: #414751; }
+.smallbtn { padding: 4px 8px; margin: 2px 0; }
+.tool-btn { display: block; width: 100%; text-align: left; margin: 2px 0; padding: 5px 8px; }
+.tool-btn.active { background: #5e666f; border-color: #9aa3ad; font-weight: bold; }
+.tbtn { margin-right: 4px; }
+
+.canvaswrap {
+  position: relative; width: 512px; height: 512px; outline: none;
+  border: 2px solid #414751; border-radius: 6px; overflow: hidden;
+  background: repeating-conic-gradient(#2a2c36 0% 25%, #22242c 0% 50%) 0 0 / 32px 32px;
+}
+.canvaswrap:focus { border-color: #29adff; box-shadow: 0 0 0 2px #29adff44; }
+#main-canvas, #overlay { position: absolute; inset: 0; image-rendering: pixelated; }
+#overlay { pointer-events: none; }
+
+.status { min-height: 22px; line-height: 22px; color: #7a868e; font-size: 12px; }
+.hint { color: #7a868e; font-size: 11px; }
+.brushrow, .editrow { margin-top: 6px; }
+.brushsize { color: #ffcd77; font-weight: bold; }
+
+.panel { background: #22242c; border: 1px solid #414751; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+.row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+.lbl { font-size: 12px; color: #9aa3ad; }
+
+select, input[type="number"] {
+  background: #2b2d40; color: #d7dae0; border: 1px solid #414751;
+  border-radius: 4px; padding: 3px 6px; font-size: 12px;
+}
+input[type="number"] { width: 64px; }
+input[type="range"] { accent-color: #29adff; }
+input[type="checkbox"] { accent-color: #29adff; }
+#picker { width: 40px; height: 26px; border: none; padding: 0; background: none; cursor: pointer; }
+.palrow { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+
+.swatches { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; margin: 6px 0; }
+.swatch { width: 100%; height: 26px; border: 1px solid #414751; border-radius: 3px; padding: 0; }
+.swatch.selected { outline: 2px solid #ffcd77; border-color: #ffcd77; }
+.curcolor-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.cur-swatch { width: 44px; height: 26px; border: 2px solid #9aa3ad; border-radius: 4px; }
+.cur-hex { font-size: 12px; color: #c4ccd4; font-family: monospace; }
+
+.layerlist { max-height: 240px; overflow-y: auto; }
+.layer-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 4px; margin: 2px 0;
+  border: 1px solid #414751; border-radius: 4px; background: #2b2d40; cursor: grab;
+}
+.layer-row.active { border-color: #29adff; background: #31354a; }
+.lname { flex: 0 0 90px; font-size: 12px; user-select: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lopacity { font-size: 11px; color: #9aa3ad; width: 34px; text-align: right; }
+.rename-input { width: 90px; background: #1d1f26; color: #d7dae0; border: 1px solid #29adff; border-radius: 3px; font-size: 12px; }
+
+.transport { display: flex; align-items: center; gap: 4px; margin-bottom: 6px; flex-wrap: wrap; }
+.filmstrip {
+  display: flex; gap: 4px; overflow-x: auto; padding: 6px;
+  background: #22242c; border: 1px solid #414751; border-radius: 6px; min-height: 76px;
+}
+figure.thumb { margin: 0; text-align: center; cursor: pointer; }
+figure.thumb canvas {
+  width: 48px; height: 48px; image-rendering: pixelated; display: block;
+  border: 2px solid #414751; border-radius: 3px;
+  background: repeating-conic-gradient(#2a2c36 0% 25%, #22242c 0% 50%) 0 0 / 12px 12px;
+}
+figcaption { font-size: 10px; color: #9aa3ad; margin-top: 2px; }
+figure.thumb.active-thumb canvas { border-color: #ffcd77; box-shadow: 0 0 0 2px #ffcd7755; }
+figure.thumb.active-thumb figcaption { color: #ffcd77; font-weight: bold; }
