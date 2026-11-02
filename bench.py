@@ -55,6 +55,9 @@ CSV_FIELDS = [
     "provider",
     "rep",
     "goal",
+    "variant",
+    "thinking",
+    "reasoning_effort",
     "build_ok",
     "typecheck_ok",
     "p0_pass",
@@ -226,6 +229,49 @@ def resolve_config_dir(explicit: str | None, run_dir: Path) -> Path:
     if fallback.exists():
         return fallback
     sys.exit("error: could not find the OpenCode config directory; pass --config")
+
+
+def model_thinking(model: str, variant: str | None) -> tuple[str, str]:
+    """Return (thinking label, reasoning effort) from the effective config."""
+    try:
+        proc = subprocess.run(
+            [OPENCODE, "debug", "config", "--standalone"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        sources = json.loads(proc.stdout)
+        info: dict = {}
+        for source in sources:
+            if isinstance(source.get("info"), dict):
+                info.update(source["info"])
+        providers = info.get("providers") or info.get("provider") or {}
+        provider, _, model_id = model.partition("/")
+        entry = (providers.get(provider) or {}).get("models", {}).get(model_id)
+        if not entry:
+            return "unknown", ""
+        body = dict(entry.get("body") or {})
+        settings = dict(entry.get("settings") or {})
+        if variant:
+            for candidate in entry.get("variants") or []:
+                if candidate.get("id") == variant:
+                    body.update(candidate.get("body") or {})
+                    settings.update(candidate.get("settings") or {})
+                    break
+        thinking = body.get("thinking")
+        effort = settings.get("reasoningEffort") or body.get("reasoningEffort") or ""
+        if thinking is True:
+            return "on", str(effort)
+        if thinking is False:
+            return "off", str(effort)
+        if effort == "none":
+            return "off", "none"
+        if effort:
+            return "on", str(effort)
+        return "unknown", ""
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+        return "unknown", ""
 
 
 def config_env_names(config_dir: Path) -> set[str]:
@@ -535,6 +581,9 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         f"- model: `{meta['model']}`",
         f"- provider: {meta['provider']}",
+        f"- variant: {meta.get('variant', 'default')}",
+        f"- thinking: {meta.get('thinking', 'unknown')}"
+        + (f" ({meta['reasoning_effort']})" if meta.get("reasoning_effort") else ""),
         f"- goal: {meta['goal']}",
         f"- wall: {format_duration(meta['wall_s'])}",
         f"- watchdog: {meta['watchdog']}",
@@ -569,7 +618,24 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
     (run_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def ensure_results_schema() -> None:
+    if not RESULTS_PATH.exists():
+        return
+    with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        header = reader.fieldnames or []
+        rows = list(reader)
+    if header == CSV_FIELDS:
+        return
+    with RESULTS_PATH.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
+
+
 def rewrite_result(run_id: str, row: dict) -> None:
+    ensure_results_schema()
     if not RESULTS_PATH.exists():
         return
     with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
@@ -589,6 +655,7 @@ def rewrite_result(run_id: str, row: dict) -> None:
 
 
 def append_result(row: dict) -> None:
+    ensure_results_schema()
     exists = RESULTS_PATH.exists()
     with RESULTS_PATH.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
@@ -601,9 +668,12 @@ def print_summary(meta: dict, score: dict) -> None:
     counts = score["counts"]
     print("")
     print(f"{meta['model']}  rep {meta['rep']}")
+    thinking = meta.get("thinking", "unknown")
+    effort = meta.get("reasoning_effort") or ""
     print(
         f"  build {'ok' if meta['build_ok'] else 'FAIL'}"
         f"   typecheck {'ok' if meta['typecheck_ok'] else 'FAIL'}"
+        f"   thinking {thinking}" + (f" ({effort})" if effort else "")
     )
     print(
         f"  P0 {counts['P0']['pass']}/{counts['P0']['total']}"
@@ -737,10 +807,13 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
                 "run ./bench.py models or pass --no-preflight"
             )
 
+    variant = args.variant or "default"
+    thinking, effort = model_thinking(model, args.variant)
     print(f"run {run_id}")
     print(f"  workdir {workdir}")
     print(f"  model   {model}")
     print(f"  config  {config_dir}")
+    print(f"  thinking {thinking}" + (f" ({effort})" if effort else "") + f"  variant={variant}")
     print(f"  goal    {args.goal}")
 
     agent = start_agent(
@@ -775,6 +848,9 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
         "provider": provider_of(model),
         "rep": rep,
         "goal": args.goal,
+        "variant": variant,
+        "thinking": thinking,
+        "reasoning_effort": effort,
         "wall_s": agent["wall_s"],
         "watchdog": agent["watchdog"],
         "completion": agent["completion"],
@@ -912,6 +988,10 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         eprint(f"error: {score_path} missing; this run has no agent metadata")
         return 1
     meta = json.loads(score_path.read_text())
+    meta.setdefault("variant", "default")
+    if not meta.get("thinking") or meta.get("thinking") == "unknown":
+        selected_variant = meta["variant"] if meta["variant"] != "default" else None
+        meta["thinking"], meta["reasoning_effort"] = model_thinking(meta["model"], selected_variant)
     workdir = run_dir / "workdir"
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
     if not build["dist"]:
@@ -992,9 +1072,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     if (run_dir / "score.json").exists():
         try:
             meta = json.loads((run_dir / "score.json").read_text())
+            thinking = meta.get("thinking", "unknown")
+            effort = meta.get("reasoning_effort") or ""
             print(
                 f"score      quality={meta.get('quality', 0):.2f} "
-                f"eligible={meta.get('eligible')} wall={format_duration(meta.get('wall_s', 0))}"
+                f"eligible={meta.get('eligible')} wall={format_duration(meta.get('wall_s', 0))} "
+                f"thinking={thinking}" + (f" ({effort})" if effort else "")
             )
         except json.JSONDecodeError:
             pass
@@ -1088,6 +1171,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not RESULTS_PATH.exists():
         print("no results yet; run ./bench.py run --model ...")
         return 0
+    ensure_results_schema()
     with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     if not rows:
@@ -1101,17 +1185,24 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines = [
         "# spritebench report",
         "",
-        "| model | runs | quality med | wall med | minor med | eligible |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| model | thinking | runs | quality med | wall med | minor med | eligible |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for model, items in sorted(by_model.items()):
         quality = statistics.median(float(item["quality"]) for item in items)
         wall = statistics.median(float(item["wall_s"]) for item in items)
         minor = statistics.median(int(item["minor_issues"]) for item in items)
         eligible = any(item["eligible"] == "True" for item in items)
+        labels = sorted(
+            {
+                (item.get("thinking") or "unknown")
+                + (f" ({item['reasoning_effort']})" if item.get("reasoning_effort") else "")
+                for item in items
+            }
+        )
         lines.append(
-            f"| {model} | {len(items)} | {quality:.2f} | {format_duration(wall)} | {minor:.0f} | "
-            f"{'yes' if eligible else 'no'} |"
+            f"| {model} | {', '.join(labels)} | {len(items)} | {quality:.2f} | "
+            f"{format_duration(wall)} | {minor:.0f} | {'yes' if eligible else 'no'} |"
         )
     lines += [
         "",

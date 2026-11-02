@@ -82,6 +82,10 @@ A model that spends time debugging and still fails loses on both quality and
 time. A model that debugs and passes trades time for quality; the report shows
 the Pareto table instead of hiding it behind one weighted score.
 
+Each run report records `variant`, `thinking` (`on`/`off`/`unknown`) and
+`reasoning_effort`, so a no-thinking baseline is distinguishable from a
+thinking run.
+
 v0 records `wall_s` and the score. `agent_think_s` / `tool_s` and the token /
 TTFT columns are reserved for the perf-proxy hook; they are not wired yet.
 
