@@ -20,8 +20,9 @@ OpenCode config is the source of truth.
 ./bench.py run --model provider/model
 ./bench.py run --model provider/model --variant high   # if defined
 ./bench.py run --model provider/model --variant all --keep-going
-./bench.py status                # latest run, container, live engine status
-./bench.py preview               # serve the latest built app
+./bench.py status                # newest run, container, live engine status
+./bench.py preview               # serve the newest built app
+./bench.py preview --run RUN_ID  # serve a specific run
 ./bench.py leaderboard --serve   # serve the all-runs leaderboard
 ./bench.py rescore --run RUN_ID  # re-run build+tests on an existing workdir
 ./bench.py report                # table plus failed test names
@@ -82,7 +83,7 @@ then exits:
 - Run IDs include the variant, so results do not collide.
 - For a real overnight session, run it under `tmux` or `nohup`.
 
-## Multiple shells
+## Parallel runs (multiple shells)
 
 Each `bench.py run` process is safe to run alongside other shells:
 
@@ -111,6 +112,23 @@ still run sequentially, so two shells on different providers can run their
 Do not run two shells against the same provider/model at the same time: they
 will contend for the same model server and inflate `wall_s`. The file safety is
 there for independent providers, not for parallelising one provider’s variants.
+
+### “Latest” is ambiguous with parallel runs
+
+- `./bench.py preview` serves the newest `dist/` by modification time. When more
+  than one run is finishing around the same time, pass the run explicitly:
+  `./bench.py preview --run RUN_ID`.
+- `./bench.py status` reports the newest run by `agent.log` mtime and has no
+  `--run` option. For any other run, read
+  `runs/<run_id>/score.json`, or use the leaderboard/report, which cover all
+  completed runs.
+- `./bench.py report` and `./bench.py leaderboard` include every completed run,
+  so they are the reliable cross-run views.
+- Run IDs are printed when a run starts and are also the directory names in
+  `runs/`. A same-second collision gets a `-2`, `-3`, … suffix; use the exact ID
+  from the console or `results.csv`.
+- To see active agent containers:
+  `docker ps --filter name=spritebench --format '{{.Names}} {{.Status}}'`.
 
 ## Configuration
 
@@ -174,15 +192,18 @@ count survives after the agent container exits.
 `reasoning_effort` and `compactions`. Console/report displays format wall time
 as `HH:MM:SS`.
 
-`./bench.py preview` serves the latest built `dist/` on
-`http://127.0.0.1:4173/`. `./bench.py status` shows the latest run, container,
-live engine `/status` when the provider exposes one, and score.
+`./bench.py preview` serves the newest built `dist/` on
+`http://127.0.0.1:4173/`. With parallel runs, pass `--run RUN_ID` to choose a
+specific run. `./bench.py status` shows the newest run by `agent.log` mtime,
+container, live engine `/status` when the provider exposes one, and score; it
+does not take a run ID.
 
 ## Leaderboard
 
 `./bench.py leaderboard` renders **all runs** from `results.csv` into
-`leaderboard.html`. It is rebuilt automatically after every scored or rescored
-run.
+`leaderboard.html`, regardless of which shell started them. It is rebuilt
+automatically after every scored or rescored run and is the recommended
+cross-run view when several shells are active.
 
 ```bash
 ./bench.py leaderboard              # write leaderboard.html
@@ -191,8 +212,9 @@ run.
 ```
 
 The served page refreshes every 30 seconds; add `--open` to launch the browser.
-The server only serves the leaderboard page, not the project tree, so hidden
-tests and reference code are not exposed.
+It reads a locked snapshot of `results.csv`, so it is safe to leave running
+while parallel shells finish. The server only serves the leaderboard page, not
+the project tree, so hidden tests and reference code are not exposed.
 
 Runs are ranked by:
 
