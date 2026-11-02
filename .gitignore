@@ -1,0 +1,8 @@
+runs/
+results.csv
+report.md
+**/node_modules/
+**/dist/
+**/test-results/
+**/playwright-report/
+__pycache__/
