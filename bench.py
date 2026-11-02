@@ -29,6 +29,7 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,6 +87,13 @@ def slug(value: str) -> str:
 
 def provider_of(model: str) -> str:
     return model.split("/", 1)[0] if "/" in model else model
+
+
+def format_duration(seconds: float | str) -> str:
+    total = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def run_command(
@@ -528,7 +536,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- model: `{meta['model']}`",
         f"- provider: {meta['provider']}",
         f"- goal: {meta['goal']}",
-        f"- wall: {meta['wall_s']:.1f}s",
+        f"- wall: {format_duration(meta['wall_s'])}",
         f"- watchdog: {meta['watchdog']}",
         f"- completion file: {meta['completion']}",
         f"- agent exit ok: {meta['agent_ok']}",
@@ -561,6 +569,25 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
     (run_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def rewrite_result(run_id: str, row: dict) -> None:
+    if not RESULTS_PATH.exists():
+        return
+    with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    changed = False
+    for index, existing in enumerate(rows):
+        if existing.get("run_id") == run_id:
+            rows[index] = {key: row.get(key, "") for key in CSV_FIELDS}
+            changed = True
+            break
+    if not changed:
+        rows.append({key: row.get(key, "") for key in CSV_FIELDS})
+    with RESULTS_PATH.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def append_result(row: dict) -> None:
     exists = RESULTS_PATH.exists()
     with RESULTS_PATH.open("a", newline="", encoding="utf-8") as handle:
@@ -589,7 +616,7 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   {'ELIGIBLE' if score['eligible'] else 'not eligible'}"
     )
     print(
-        f"  wall {meta['wall_s']:.1f}s"
+        f"  wall {format_duration(meta['wall_s'])}"
         f"   watchdog {meta['watchdog']}"
         f"   self-tests {meta['self_test_runs']}"
     )
@@ -871,6 +898,192 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rescore(args: argparse.Namespace) -> int:
+    if args.run:
+        run_dir = RUNS_DIR / args.run
+    else:
+        runs = [path for path in RUNS_DIR.iterdir() if (path / "workdir").is_dir()] if RUNS_DIR.exists() else []
+        if not runs:
+            eprint("error: no runs found")
+            return 1
+        run_dir = max(runs, key=lambda path: (path / "workdir").stat().st_mtime)
+    score_path = run_dir / "score.json"
+    if not score_path.exists():
+        eprint(f"error: {score_path} missing; this run has no agent metadata")
+        return 1
+    meta = json.loads(score_path.read_text())
+    workdir = run_dir / "workdir"
+    build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
+    if not build["dist"]:
+        eprint("error: build produced no dist/index.html")
+        return 1
+    tests = run_tests(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
+    score = score_run(tests["tests"], build, goal=meta.get("goal", "balanced"))
+    meta.update(
+        {
+            "build_ok": build["build_ok"],
+            "typecheck_ok": build["typecheck_ok"],
+            "test_ok": tests["test_ok"],
+            "test_error": tests["error"],
+            "counts": score["counts"],
+            "quality": score["quality"],
+            "fatal": score["fatal"],
+            "major": score["major"],
+            "minor": score["minor"],
+            "eligible": score["eligible"],
+        }
+    )
+    write_run_report(run_dir, meta, score)
+    score_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    row = {
+        **meta,
+        "major_issues": score["major"],
+        "minor_issues": score["minor"],
+        "p0_pass": score["counts"]["P0"]["pass"],
+        "p0_total": score["counts"]["P0"]["total"],
+        "p1_pass": score["counts"]["P1"]["pass"],
+        "p1_total": score["counts"]["P1"]["total"],
+        "p2_pass": score["counts"]["P2"]["pass"],
+        "p2_total": score["counts"]["P2"]["total"],
+    }
+    rewrite_result(meta["run_id"], row)
+    print_summary(meta, score)
+    print("  rescored with the current hidden suite")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    runs = [
+        path
+        for path in RUNS_DIR.iterdir()
+        if path.is_dir() and (path / "agent.log").exists()
+    ] if RUNS_DIR.exists() else []
+    if not runs:
+        print("no runs yet")
+        return 0
+    run_dir = max(runs, key=lambda path: (path / "agent.log").stat().st_mtime)
+    log_path = run_dir / "agent.log"
+    first = ""
+    try:
+        first = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        pass
+
+    model_match = re.search(r"SPRITEBENCH_MODEL=([^\s]+)", first)
+    name_match = re.search(r"--name\s+(\S+)", first)
+    model = model_match.group(1) if model_match else "?"
+    container = name_match.group(1) if name_match else None
+
+    print(f"run        {run_dir.name}")
+    print(f"model      {model}")
+    print(f"agent log  {log_path}")
+    if container:
+        ps = subprocess.run(
+            [args.engine, "ps", "--filter", f"name={container}", "--format", "{{.Status}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status = ps.stdout.strip() or "not running"
+        print(f"container  {container}  {status}")
+
+    if (run_dir / "COMPLETION.md").exists():
+        print("completion COMPLETION.md present")
+    if (run_dir / "score.json").exists():
+        try:
+            meta = json.loads((run_dir / "score.json").read_text())
+            print(
+                f"score      quality={meta.get('quality', 0):.2f} "
+                f"eligible={meta.get('eligible')} wall={format_duration(meta.get('wall_s', 0))}"
+            )
+        except json.JSONDecodeError:
+            pass
+
+    # Best-effort live engine status. This is optional and provider-specific;
+    # a missing /status endpoint is not an error.
+    try:
+        provider = provider_of(model)
+        proc = subprocess.run(
+            [OPENCODE, "debug", "config"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        sources = json.loads(proc.stdout)
+        info: dict = {}
+        for source in sources:
+            if isinstance(source.get("info"), dict):
+                info.update(source["info"])
+        providers = info.get("providers") or info.get("provider") or {}
+        entry = providers.get(provider) or {}
+        settings = entry.get("settings") or entry.get("options") or {}
+        base = settings.get("baseURL")
+        if base:
+            root = re.sub(r"/v1/?$", "", str(base).rstrip("/"))
+            try:
+                with urllib.request.urlopen(f"{root}/status", timeout=3) as response:
+                    payload = response.read().decode("utf-8", errors="replace")
+                print(f"engine     {payload[:600]}")
+            except Exception as exc:  # noqa: BLE001 - status is best effort
+                print(f"engine     no /status endpoint ({exc})")
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+        pass
+
+    print("")
+    print("agent log tail:")
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+    for line in lines:
+        print(line[:400])
+    return 0
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    if args.run:
+        run_dir = RUNS_DIR / args.run
+    else:
+        runs = [
+            path
+            for path in RUNS_DIR.iterdir()
+            if (path / "workdir" / "dist" / "index.html").exists()
+        ] if RUNS_DIR.exists() else []
+        if not runs:
+            eprint("error: no built run found")
+            return 1
+        run_dir = max(runs, key=lambda path: (path / "workdir" / "dist").stat().st_mtime)
+    dist = run_dir / "workdir" / "dist"
+    if not (dist / "index.html").exists():
+        eprint(f"error: {dist}/index.html missing; run ./bench.py rescore")
+        return 1
+    print(f"serving {dist}")
+    print(f"open http://127.0.0.1:{args.port}/")
+    print("Ctrl+C to stop")
+    return subprocess.run(
+        ["node", str(ROOT / "docker" / "serve.mjs"), str(dist), str(args.port)],
+        check=False,
+    ).returncode
+
+
+def failed_tests(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    failures: list[str] = []
+
+    def walk(suites: list) -> None:
+        for suite in suites:
+            for spec in suite.get("specs", []):
+                if spec.get("ok") is False:
+                    failures.append(str(spec.get("title", "")))
+            walk(suite.get("suites", []))
+
+    walk(data.get("suites", []))
+    return failures
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     if not RESULTS_PATH.exists():
         print("no results yet; run ./bench.py run --model ...")
@@ -897,14 +1110,27 @@ def cmd_report(args: argparse.Namespace) -> int:
         minor = statistics.median(int(item["minor_issues"]) for item in items)
         eligible = any(item["eligible"] == "True" for item in items)
         lines.append(
-            f"| {model} | {len(items)} | {quality:.2f} | {wall:.0f}s | {minor:.0f} | "
+            f"| {model} | {len(items)} | {quality:.2f} | {format_duration(wall)} | {minor:.0f} | "
             f"{'yes' if eligible else 'no'} |"
         )
     lines += [
         "",
         "Full rows: `results.csv`. Per-run artifacts: `runs/<run_id>/`.",
         "",
+        "## Failures",
+        "",
     ]
+    any_failure = False
+    for row in rows:
+        report_path = Path(row.get("report", ""))
+        failures = failed_tests(report_path.parent / "playwright.json")
+        if failures:
+            any_failure = True
+            for failure in failures:
+                lines.append(f"- `{row['model']}` / `{row['run_id']}`: {failure}")
+    if not any_failure:
+        lines.append("None.")
+    lines.append("")
     text = "\n".join(lines)
     REPORT_PATH.write_text(text, encoding="utf-8")
     print(text)
@@ -957,6 +1183,19 @@ def make_parser() -> argparse.ArgumentParser:
     check.add_argument("--dry-run", action="store_true")
     check.add_argument("--config", default=None, help="OpenCode config file or directory")
     check.set_defaults(func=cmd_check)
+
+    rescore = sub.add_parser("rescore", help="rerun build+tests on an existing run")
+    rescore.add_argument("--run", default=None, help="run directory name (default: latest)")
+    rescore.set_defaults(func=cmd_rescore)
+
+    preview = sub.add_parser("preview", help="serve the latest built app")
+    preview.add_argument("--run", default=None, help="run directory name (default: latest)")
+    preview.add_argument("--port", type=int, default=4173)
+    preview.set_defaults(func=cmd_preview)
+
+    status = sub.add_parser("status", help="show the latest run and live engine status")
+    status.add_argument("--config", default=None, help="OpenCode config file or directory")
+    status.set_defaults(func=cmd_status)
 
     report = sub.add_parser("report", help="render results.csv")
     report.set_defaults(func=cmd_report)

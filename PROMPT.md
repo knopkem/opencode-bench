@@ -102,6 +102,8 @@ default document.
 
 - Logical pixel `(x, y)` is at CSS offset `(x * 16 + 8, y * 16 + 8)`.
 - `pixels` is row-major, 32×32, `-1` transparent, otherwise a palette index.
+- The canvas may render a checkerboard for transparent cells. Transparency is
+  defined by `getState().pixels` (`-1`), not by the canvas alpha channel.
 - Left click draws; right click erases.
 - Pencil/eraser support brush sizes 1 and 2.
 - Shortcuts fire only while the canvas area has focus:

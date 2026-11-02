@@ -198,6 +198,8 @@ Why both DOM and API:
 
 - Logical coordinate `(x, y)` maps to CSS `(x * 16 + 8, y * 16 + 8)`.
 - `pixels` is row-major, 32×32, `-1` for transparent.
+- The canvas may render a checkerboard for transparent cells. Transparency is
+  defined by the state pixels, not by the canvas alpha channel.
 - Left click draws; right click erases.
 - Pencil/eraser support brush 1 and 2.
 - Keyboard shortcuts fire only when the canvas area has focus: `B`, `E`, `L`,
@@ -500,6 +502,7 @@ The only interface is:
 ```bash
 ./bench.py models
 ./bench.py run --model provider/model --goal balanced
+./bench.py status
 ./bench.py report
 ```
 
@@ -534,7 +537,7 @@ provider/model                                      rep 1
   build   ok        typecheck ok
   P0      4/4       P1 8/9       P2 5/5
   quality 0.94      minor 0      major 1
-  wall    18m 42s
+  wall    00:18:42
   report  runs/2026-11-02T14-05-22-.../report.md
 ```
 

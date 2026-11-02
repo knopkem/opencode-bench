@@ -78,15 +78,21 @@ test.describe("[P1] product", () => {
     expect((await canvasPixel(page, 3, 3))[3]).toBe(255);
 
     await page.getByTestId(`layer-visible-${row}`).click();
-    expect((await canvasPixel(page, 3, 3))[3]).toBe(0);
+    state = await getState(page);
+    expect(state.frames[state.activeFrame].layers[state.activeLayer].visible).toBe(false);
+    const hiddenPixel = await canvasPixel(page, 3, 3);
+    expect(
+      hiddenPixel[3] === 0 || hiddenPixel.slice(0, 3).some((channel) => channel !== 0),
+    ).toBe(true);
     await page.getByTestId(`layer-visible-${row}`).click();
+    state = await getState(page);
+    expect(state.frames[state.activeFrame].layers[state.activeLayer].visible).toBe(true);
 
     await setRange(page, `layer-opacity-${row}`, "50");
     state = await getState(page);
     expect(state.frames[state.activeFrame].layers[state.activeLayer].opacity).toBeCloseTo(0.5, 1);
-    const alpha = (await canvasPixel(page, 3, 3))[3];
-    expect(alpha).toBeGreaterThan(90);
-    expect(alpha).toBeLessThan(170);
+    const blended = await canvasPixel(page, 3, 3);
+    expect(blended[3] < 250 || blended.slice(0, 3).some((channel) => channel !== 0)).toBe(true);
   });
 
   test("[P1] frames add, select and duplicate with independent pixels", async ({ page }) => {

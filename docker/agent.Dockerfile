@@ -19,6 +19,16 @@ RUN mkdir -p /home/agent \
  && /home/agent/.opencode/bin/opencode --version
 ENV PATH=/home/agent/.opencode/bin:$PATH
 
+# chrome-devtools MCP expects Google Chrome. The Playwright image ships
+# Chromium; expose it under the usual name and disable the sandbox because the
+# agent container runs as root.
+RUN CHROME="$(find /ms-playwright -path '*/chrome-linux*/chrome' -type f | head -1)" \
+ && test -n "$CHROME" \
+ && printf '#!/bin/sh\nexec %s --no-sandbox "$@"\n' "$CHROME" > /usr/local/bin/google-chrome \
+ && chmod +x /usr/local/bin/google-chrome \
+ && ln -sf /usr/local/bin/google-chrome /usr/local/bin/chromium
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/google-chrome
+
 WORKDIR /opt/spritebench
 
 # Seed dependencies, including @playwright/test. Browsers come from the base
