@@ -383,11 +383,13 @@ def copy_seed(destination: Path) -> None:
 
 
 def agent_command(args: argparse.Namespace) -> str:
-    parts = [
-        'exec opencode run --format json --auto --model "$SPRITEBENCH_MODEL"',
-    ]
+    model_ref = '"$SPRITEBENCH_MODEL"'
     if args.variant:
-        parts.append(f"--variant {shlex.quote(args.variant)}")
+        # OpenCode 2 encodes the variant in the model reference, not a flag.
+        model_ref = '"${SPRITEBENCH_MODEL}#${SPRITEBENCH_VARIANT}"'
+    parts = [
+        f"exec opencode run --format json --auto --model {model_ref}",
+    ]
     if args.agent:
         parts.append(f"--agent {shlex.quote(args.agent)}")
     if args.pure:
@@ -445,6 +447,8 @@ def start_agent(
         "-e",
         f"SPRITEBENCH_MODEL={model}",
     ]
+    if args.variant:
+        command += ["-e", f"SPRITEBENCH_VARIANT={args.variant}"]
     for key in sorted(env_names):
         command += ["-e", key]
     command += ["-w", "/work", args.image, "bash", "-lc", agent_command(args)]
