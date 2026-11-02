@@ -28,7 +28,7 @@ export class App {
   tool: Tool = "pencil";
   brush: 1 | 2 = 1;
   colorIndex = 0;
-  onion = 30; // percent
+  onion = 50; // percent
   playing = false;
   timer: number | null = null;
   dragFrom: { x: number; y: number } | null = null;
@@ -374,6 +374,8 @@ export class App {
     const onionSlider = document.createElement("input");
     onionSlider.type = "range"; onionSlider.min = "0"; onionSlider.max = "100"; onionSlider.value = String(this.onion);
     onionSlider.id = "onion";
+    onionSlider.dataset.testid = "onion-opacity";
+    onionSlider.setAttribute("aria-label", "Onion skin opacity");
     const onionVal = el("span", "lbl", `${this.onion}%`);
     onionRow.append(el("span", "lbl", "Onion skin (prev frame):"), onionSlider, onionVal);
     onionSlider.addEventListener("input", () => {

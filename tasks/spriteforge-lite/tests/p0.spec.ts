@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { canvasPixel, clickPixel, getState, pixel, reset } from "./helpers";
+import { canvasPixel, clickPixel, dragPixels, getState, pixel, reset } from "./helpers";
 
 test.describe("[P0] core", () => {
   test.beforeEach(async ({ page }) => {
@@ -34,6 +34,23 @@ test.describe("[P0] core", () => {
     // remain is the drawn black pixel.
     const erased = await canvasPixel(page, 5, 5);
     expect(erased[3] === 0 || erased.slice(0, 3).some((channel) => channel !== 0)).toBe(true);
+  });
+
+  test("[P0] pencil and eraser drag paint continuous strokes", async ({ page }) => {
+    const y = 7;
+    await dragPixels(page, { x: 4, y }, { x: 12, y });
+    for (let x = 4; x <= 12; x++) {
+      expect(await pixel(page, x, y), `pencil pixel (${x}, ${y})`).toBe(0);
+    }
+    expect(await pixel(page, 4, y + 2)).toBe(-1);
+
+    await page.getByTestId("tool-eraser").click();
+    await dragPixels(page, { x: 7, y }, { x: 9, y });
+    expect(await pixel(page, 4, y)).toBe(0);
+    for (let x = 7; x <= 9; x++) {
+      expect(await pixel(page, x, y), `eraser pixel (${x}, ${y})`).toBe(-1);
+    }
+    expect(await pixel(page, 12, y)).toBe(0);
   });
 
   test("[P0] undo restores and redo reapplies", async ({ page }) => {

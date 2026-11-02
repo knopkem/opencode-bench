@@ -17,7 +17,7 @@ suite.
 On 2026-11-02, against this build:
 
 - public smoke suite: 4/4 passed;
-- hidden suite: 18/18 passed three times in a row;
+- hidden suite: 20/20 passed three times in a row;
 - `npm run build`: passed.
 
 The hidden suite also caught a real bug in the reference: clicking a layer's

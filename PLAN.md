@@ -10,9 +10,9 @@ Implemented:
 - agent/eval Docker image definition with Node, Chromium, Playwright and
   OpenCode;
 - seed with `public-tests/` and a `test:e2e` script;
-- hidden 18-test Playwright suite;
+- hidden 20-test Playwright suite;
 - instrumented reference (test IDs, state API, PNG export);
-- reference validation: 18/18 hidden tests passed three times, 4/4 public
+- reference validation: 20/20 hidden tests passed three times, 4/4 public
   smoke tests passed, `npm run build` clean.
 
 The Dockerfile passes `docker build --check`. The full image build was not
@@ -257,12 +257,13 @@ The task is scored, not all-or-nothing. P0 is fatal, P1 is major, P2 is minor.
 harness mounts it at `/opt/spritebench/tests` only in the test container after
 the agent stops.
 
-The v0 suite has 18 tests. Each test is weighted by tier:
+The v0 suite has 20 tests. Each test is weighted by tier:
 
 | Test | Tier | Weight |
 |---|---|---|
 | App mounts, default document, 512×512 canvas | P0 | 3 |
 | Pencil draws and right-click erases | P0 | 3 |
+| Pencil/eraser drag paints continuous strokes | P0 | 3 |
 | Undo restores and redo reapplies | P0 | 3 |
 | No console/page errors | P0 | 3 |
 | Palette selection draws the selected colour | P1 | 2 |
@@ -276,6 +277,7 @@ The v0 suite has 18 tests. Each test is weighted by tier:
 | PNG export contains the drawn pixel | P1 | 2 |
 | Keyboard shortcuts + focus scoping | P2 | 1 |
 | Edge pixels `(0,0)`, `(31,31)` | P2 | 1 |
+| Onion opacity 50% blends previous frame | P2 | 1 |
 | Empty undo / last layer/frame guards | P2 | 1 |
 | Layout at 1280×800, no overflow | P2 | 1 |
 | Status feedback | P2 | 1 |
@@ -504,13 +506,18 @@ The only interface is:
 ./bench.py run --model provider/model --goal balanced
 ./bench.py status
 ./bench.py report
+./bench.py leaderboard --serve
 ```
 
 `./bench.py models` prints provider counts from the local `opencode models`
 command; `--provider` lists that provider's models, `--all` lists everything.
 `run` with no `--model` asks for a provider, then shows that provider's models
-as a numbered menu; `--provider` skips the first prompt. The model reference is
-passed unchanged to `opencode run`.
+as a numbered menu; `--provider` skips the first prompt. If the model defines
+variants and `--variant` was not given, it asks which variant to use (option 0
+is the model default), ordered from highest reasoning effort to lowest.
+`--variant all` runs every defined variant in that order for the selected
+model(s), then exits; `--keep-going` continues past failures for an overnight
+matrix. The model reference is passed unchanged to `opencode run`.
 
 `run` does the whole sequence:
 
@@ -535,8 +542,8 @@ Typical output:
 ```
 provider/model                                      rep 1
   build   ok        typecheck ok
-  P0      4/4       P1 8/9       P2 5/5
-  quality 0.94      minor 0      major 1
+  P0      5/5       P1 8/9       P2 5/6
+  quality 0.92      minor 1      major 1
   wall    00:18:42
   report  runs/2026-11-02T14-05-22-.../report.md
 ```
@@ -630,6 +637,13 @@ full Pareto table, not just the winner:
 The decision is allowed to be "both are fine; use the faster one for the
 implementer and the higher-quality one for the planner." That is the point.
 
+For a single cross-run view, `./bench.py leaderboard` renders all runs from
+`results.csv` into `leaderboard.html`. It ranks runs by a transparent score:
+80% quality, 15% relative speed, 5% compactions (`1 / (1 + count)`). The page
+shows the raw metrics too, so the weighted rank never hides the quality/time
+tradeoff. `--serve` hosts it on `127.0.0.1:4174`; the page can auto-refresh for
+overnight monitoring. Only the generated page is served, not the project tree.
+
 ## 7. Experiment design
 
 There is no fixed matrix. `./bench.py models` shows the providers in your
@@ -641,6 +655,13 @@ Settings come from the selected model's OpenCode config: context, output limit,
 temperature, reasoning field, tool support, and variants. `--variant` selects a
 variant if the config defines one. The harness does not override context or
 sampling, so the comparison is between the deployments as configured.
+
+Multiple shells may run different providers concurrently. Each process owns one
+model sequence; variants within that model stay sequential. Shared state is
+coordinated with a cross-process `results.csv` lock, atomic leaderboard writes,
+atomically claimed run directories and uniquely named agent containers. Two
+shells must not target the same provider/model at once, because they would
+contend for the same model server and distort `wall_s`.
 
 Start with **one rep per model**. Promote the top two to a second rep. If they
 are within 10% on time and 5% on quality, run a third. With no scoring cap the

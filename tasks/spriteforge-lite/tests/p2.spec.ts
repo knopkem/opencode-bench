@@ -1,5 +1,14 @@
 import { expect, test } from "@playwright/test";
-import { canvasBox, clickPixel, getState, pixel, reset } from "./helpers";
+import {
+  canvasBox,
+  canvasPixel,
+  clickPixel,
+  getState,
+  hexToRgb,
+  pixel,
+  reset,
+  setRange,
+} from "./helpers";
 
 test.describe("[P2] polish and edge cases", () => {
   test.beforeEach(async ({ page }) => {
@@ -41,6 +50,78 @@ test.describe("[P2] polish and edge cases", () => {
     expect(after.frames[after.activeFrame].layers[after.activeLayer].pixels).toEqual(
       before.frames[before.activeFrame].layers[before.activeLayer].pixels,
     );
+  });
+
+  test("[P2] onion opacity blends the previous frame at 50%", async ({ page }) => {
+    const base = await getState(page);
+    let previousSlot = 0;
+    let brightest = -1;
+    for (let index = 0; index < base.palette.length; index++) {
+      const [r, g, b] = hexToRgb(base.palette[index]);
+      if (r + g + b > brightest) {
+        brightest = r + g + b;
+        previousSlot = index;
+      }
+    }
+    const previousPixels = new Array(32 * 32).fill(previousSlot);
+    const currentPixels = new Array(32 * 32).fill(-1);
+    await page.evaluate(
+      ({ baseState, previous, current }) => {
+        (window as any).__spriteforge.loadState({
+          ...baseState,
+          activeFrame: 1,
+          activeLayer: 0,
+          frames: [
+            {
+              hold: 1,
+              layers: [
+                { name: "Previous", visible: true, opacity: 1, pixels: previous },
+              ],
+            },
+            {
+              hold: 1,
+              layers: [{ name: "Current", visible: true, opacity: 1, pixels: current }],
+            },
+          ],
+        });
+      },
+      { baseState: base, previous: previousPixels, current: currentPixels },
+    );
+
+    const slider = page.getByTestId("onion-opacity");
+    await expect(slider).toHaveValue("50");
+
+    const readAt = async (value: string) => {
+      await setRange(page, "onion-opacity", value);
+      return canvasPixel(page, 5, 5);
+    };
+
+    const off = await readAt("0");
+    const full = await readAt("100");
+    const half = await readAt("50");
+    const previousColor = hexToRgb(base.palette[previousSlot]);
+
+    expect([off[0], off[1], off[2], off[3]]).not.toEqual(full);
+    for (let channel = 0; channel < 3; channel++) {
+      expect(Math.abs(full[channel] - previousColor[channel])).toBeLessThanOrEqual(2);
+    }
+    expect(full[3]).toBe(255);
+
+    if (off[3] === 0) {
+      // Transparent canvas: the onion colour stays, alpha carries the 50%.
+      expect(half[3]).toBeGreaterThan(100);
+      expect(half[3]).toBeLessThan(160);
+      for (let channel = 0; channel < 3; channel++) {
+        expect(Math.abs(half[channel] - previousColor[channel])).toBeLessThanOrEqual(2);
+      }
+    } else {
+      // Checkerboard painted into the canvas: the pixel is a 50/50 blend.
+      expect(half[3]).toBe(255);
+      for (let channel = 0; channel < 3; channel++) {
+        const midpoint = Math.round((off[channel] + full[channel]) / 2);
+        expect(Math.abs(half[channel] - midpoint)).toBeLessThanOrEqual(2);
+      }
+    }
   });
 
   test("[P2] empty undo and last-layer/frame deletion are safe", async ({ page }) => {

@@ -41,6 +41,7 @@ special-case tests.
 | Layers | `[data-testid="layer-add"]`, `[data-testid="layer-delete"]`, `layer-list`, `layer-row-0`…, `layer-visible-0`…, `layer-opacity-0`… | Add, delete, toggle, opacity |
 | Frames | `[data-testid="frame-add"]`, `[data-testid="frame-duplicate"]`, `[data-testid="frame-delete"]`, `frame-list`, `frame-0`… | Add, duplicate, delete, select |
 | Transport | `[data-testid="play"]`, `[data-testid="pause"]`, `[data-testid="fps"]` | Play/pause; FPS input |
+| Onion | `[data-testid="onion-opacity"]` | Range input 0–100, default 50; 0 disables; previous frame composited at that opacity |
 | Export | `[data-testid="export"]` | Downloads `spriteforge.png` |
 | Status | `[data-testid="status"]` | Human-readable feedback |
 
@@ -105,6 +106,9 @@ default document.
 - The canvas may render a checkerboard for transparent cells. Transparency is
   defined by `getState().pixels` (`-1`), not by the canvas alpha channel.
 - Left click draws; right click erases.
+- Pencil and eraser paint continuously while the pointer is held and dragged.
+  Interpolate between pointer samples so a fast drag does not leave gaps. A
+  single click paints or erases one pixel.
 - Pencil/eraser support brush sizes 1 and 2.
 - Shortcuts fire only while the canvas area has focus:
   `B`, `E`, `L`, `R`, `O`, `G`, `I`, `[`, `]`, `Ctrl+Z`,
@@ -131,6 +135,8 @@ At 1280×800:
   errors.
 - Default document: 1 layer, 1 frame, 16-colour palette, fps 8, loop on.
 - Pencil draws a pixel; eraser clears it.
+- Pencil press-and-drag paints a continuous stroke; eraser press-and-drag
+  clears a continuous stroke.
 - Undo restores the previous pixel; redo reapplies it.
 
 ### P1 — the product
@@ -152,7 +158,10 @@ At 1280×800:
 - Undo on empty history; deleting the last layer/frame is refused gracefully.
 - Palette add/remove/reorder preserves pixel indices (or clearly marks pixels
   using a removed colour as transparent).
-- Onion skin of the previous frame with opacity.
+- Onion skin of the previous frame at the opacity set by
+  `[data-testid="onion-opacity"]` (default 50%; 0 = off). At 50%, the previous
+  frame is blended at half strength; at 100%, it is fully visible through
+  transparent areas of the active frame.
 - Status text updates for tool/frame/undo.
 - No placeholder text, no dead buttons, no layout overflow.
 
