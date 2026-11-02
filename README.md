@@ -145,8 +145,9 @@ The runner uses the OpenCode config that `opencode` already uses:
 - `--env KEY` passes an environment variable into the agent container. Variables
   referenced as `{env:KEY}` in the config are passed automatically when they
   exist on the host.
-- `--variant` maps to `opencode run --variant`; `--agent` sets the agent;
-  `--pure` disables external plugins.
+- `--variant` is passed to OpenCode 2 in the model reference
+  (`provider/model#variant`); `--agent` sets the agent; `--pure` disables
+  external plugins.
 - Thinking is controlled by the selected model entry in your OpenCode config
   (`body.thinking`, `reasoningEffort`, `variants`), not by this harness. If a
   model entry has `thinking: false` and no variants, `bench.py` cannot turn
