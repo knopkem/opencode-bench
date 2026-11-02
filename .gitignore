@@ -1,6 +1,8 @@
 runs/
 results.csv
+results.csv.lock
 report.md
+leaderboard.html
 **/node_modules/
 **/dist/
 **/test-results/

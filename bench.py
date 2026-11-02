@@ -20,17 +20,25 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
+import html
+import io
 import json
 import os
 import re
 import shlex
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
 import time
 import urllib.request
+import uuid
+import webbrowser
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -46,8 +54,19 @@ DEFAULT_IMAGE = os.environ.get("SPRITEBENCH_IMAGE", "spritebench:latest")
 DEFAULT_ENGINE = os.environ.get("SPRITEBENCH_ENGINE", "docker")
 OPENCODE = os.environ.get("SPRITEBENCH_OPENCODE", "opencode")
 
-EXPECTED = {"P0": 4, "P1": 9, "P2": 5}
+EXPECTED = {"P0": 5, "P1": 9, "P2": 6}
 WEIGHT = {"P0": 3, "P1": 2, "P2": 1}
+REASONING_ORDER = {
+    "xhigh": 6,
+    "high": 5,
+    "medium": 4,
+    "low": 3,
+    "minimal": 2,
+    "none": 1,
+    "off": 0,
+}
+LEADERBOARD_PATH = ROOT / "leaderboard.html"
+LEADERBOARD_WEIGHTS = {"quality": 0.80, "wall": 0.15, "compactions": 0.05}
 CSV_FIELDS = [
     "run_id",
     "timestamp",
@@ -72,6 +91,7 @@ CSV_FIELDS = [
     "fatal",
     "eligible",
     "wall_s",
+    "compactions",
     "watchdog",
     "completion",
     "agent_ok",
@@ -97,6 +117,27 @@ def format_duration(seconds: float | str) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def results_lock():
+    """Serialize results.csv and leaderboard updates across processes."""
+    lock_path = RESULTS_PATH.with_suffix(".csv.lock")
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def run_command(
@@ -231,8 +272,7 @@ def resolve_config_dir(explicit: str | None, run_dir: Path) -> Path:
     sys.exit("error: could not find the OpenCode config directory; pass --config")
 
 
-def model_thinking(model: str, variant: str | None) -> tuple[str, str]:
-    """Return (thinking label, reasoning effort) from the effective config."""
+def load_model_entry(model: str) -> dict | None:
     try:
         proc = subprocess.run(
             [OPENCODE, "debug", "config", "--standalone"],
@@ -248,30 +288,70 @@ def model_thinking(model: str, variant: str | None) -> tuple[str, str]:
                 info.update(source["info"])
         providers = info.get("providers") or info.get("provider") or {}
         provider, _, model_id = model.partition("/")
-        entry = (providers.get(provider) or {}).get("models", {}).get(model_id)
-        if not entry:
-            return "unknown", ""
-        body = dict(entry.get("body") or {})
-        settings = dict(entry.get("settings") or {})
-        if variant:
-            for candidate in entry.get("variants") or []:
-                if candidate.get("id") == variant:
-                    body.update(candidate.get("body") or {})
-                    settings.update(candidate.get("settings") or {})
-                    break
-        thinking = body.get("thinking")
-        effort = settings.get("reasoningEffort") or body.get("reasoningEffort") or ""
-        if thinking is True:
-            return "on", str(effort)
-        if thinking is False:
-            return "off", str(effort)
-        if effort == "none":
-            return "off", "none"
-        if effort:
-            return "on", str(effort)
-        return "unknown", ""
+        return (providers.get(provider) or {}).get("models", {}).get(model_id)
     except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
-        return "unknown", ""
+        return None
+
+
+def describe_variant(entry: dict, variant: str | None) -> tuple[str, str]:
+    body = dict(entry.get("body") or {})
+    settings = dict(entry.get("settings") or {})
+    if variant:
+        for candidate in entry.get("variants") or []:
+            if candidate.get("id") == variant:
+                body.update(candidate.get("body") or {})
+                settings.update(candidate.get("settings") or {})
+                break
+    thinking = body.get("thinking")
+    effort = settings.get("reasoningEffort") or body.get("reasoningEffort") or ""
+    if thinking is True:
+        return "on", str(effort)
+    if thinking is False:
+        return "off", str(effort)
+    if effort == "none":
+        return "off", "none"
+    if effort:
+        return "on", str(effort)
+    return "unknown", ""
+
+
+def model_thinking(model: str, variant: str | None) -> tuple[str, str]:
+    entry = load_model_entry(model)
+    return describe_variant(entry, variant) if entry else ("unknown", "")
+
+
+def model_variants(model: str) -> list[tuple[str, str, str]]:
+    entry = load_model_entry(model)
+    if not entry:
+        return []
+    out: list[tuple[str, str, str]] = []
+    for candidate in entry.get("variants") or []:
+        variant_id = str(candidate.get("id", ""))
+        if not variant_id:
+            continue
+        thinking, effort = describe_variant(entry, variant_id)
+        out.append((variant_id, thinking, effort))
+    return out
+
+
+def variant_rank(variant_id: str, thinking: str, effort: str) -> int:
+    """Rank a variant by reasoning effort; higher first."""
+    key = (effort or variant_id or "").strip().lower()
+    if key in REASONING_ORDER:
+        return REASONING_ORDER[key]
+    if thinking == "off":
+        return 0
+    if thinking == "on":
+        return 2
+    return -1
+
+
+def ordered_variants(model: str) -> list[tuple[str, str, str]]:
+    """Return variants from highest reasoning effort to lowest."""
+    return sorted(
+        model_variants(model),
+        key=lambda item: (-variant_rank(item[0], item[1], item[2]), item[0]),
+    )
 
 
 def config_env_names(config_dir: Path) -> set[str]:
@@ -316,16 +396,34 @@ def agent_command(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
+def count_compactions(data_dir: Path) -> int:
+    database = data_dir / "opencode.db"
+    if not database.exists():
+        return 0
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "select count(*) from session_message where type = 'compaction'"
+            ).fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
 def start_agent(
     model: str,
     config_dir: Path,
     workdir: Path,
+    data_dir: Path,
     run_dir: Path,
     *,
     env_names: set[str],
     args: argparse.Namespace,
 ) -> dict:
-    name = f"spritebench-{slug(provider_of(model))}-{int(time.time())}"
+    name = f"spritebench-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
     log_path = run_dir / "agent.log"
     command = [
         args.engine,
@@ -338,6 +436,8 @@ def start_agent(
         f"{workdir}:/work",
         "-v",
         f"{config_dir}:/config/opencode:ro",
+        "-v",
+        f"{data_dir}:/home/agent/.local/share/opencode",
         "-e",
         "HOME=/home/agent",
         "-e",
@@ -586,6 +686,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         + (f" ({meta['reasoning_effort']})" if meta.get("reasoning_effort") else ""),
         f"- goal: {meta['goal']}",
         f"- wall: {format_duration(meta['wall_s'])}",
+        f"- compactions: {meta.get('compactions', 0)}",
         f"- watchdog: {meta['watchdog']}",
         f"- completion file: {meta['completion']}",
         f"- agent exit ok: {meta['agent_ok']}",
@@ -618,7 +719,16 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
     (run_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def ensure_results_schema() -> None:
+def _write_result_rows(rows: list[dict]) -> None:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
+    atomic_write_text(RESULTS_PATH, buffer.getvalue())
+
+
+def _ensure_results_schema_unlocked() -> None:
     if not RESULTS_PATH.exists():
         return
     with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
@@ -627,41 +737,41 @@ def ensure_results_schema() -> None:
         rows = list(reader)
     if header == CSV_FIELDS:
         return
-    with RESULTS_PATH.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
+    _write_result_rows(rows)
+
+
+def ensure_results_schema() -> None:
+    with results_lock():
+        _ensure_results_schema_unlocked()
+
+
+def _read_result_rows_unlocked() -> list[dict]:
+    _ensure_results_schema_unlocked()
+    if not RESULTS_PATH.exists():
+        return []
+    with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
 
 def rewrite_result(run_id: str, row: dict) -> None:
-    ensure_results_schema()
-    if not RESULTS_PATH.exists():
-        return
-    with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    changed = False
-    for index, existing in enumerate(rows):
-        if existing.get("run_id") == run_id:
-            rows[index] = {key: row.get(key, "") for key in CSV_FIELDS}
-            changed = True
-            break
-    if not changed:
-        rows.append({key: row.get(key, "") for key in CSV_FIELDS})
-    with RESULTS_PATH.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    with results_lock():
+        rows = _read_result_rows_unlocked()
+        changed = False
+        for index, existing in enumerate(rows):
+            if existing.get("run_id") == run_id:
+                rows[index] = {key: row.get(key, "") for key in CSV_FIELDS}
+                changed = True
+                break
+        if not changed:
+            rows.append({key: row.get(key, "") for key in CSV_FIELDS})
+        _write_result_rows(rows)
 
 
 def append_result(row: dict) -> None:
-    ensure_results_schema()
-    exists = RESULTS_PATH.exists()
-    with RESULTS_PATH.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        if not exists:
-            writer.writeheader()
-        writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
+    with results_lock():
+        rows = _read_result_rows_unlocked()
+        rows.append({key: row.get(key, "") for key in CSV_FIELDS})
+        _write_result_rows(rows)
 
 
 def print_summary(meta: dict, score: dict) -> None:
@@ -687,6 +797,7 @@ def print_summary(meta: dict, score: dict) -> None:
     )
     print(
         f"  wall {format_duration(meta['wall_s'])}"
+        f"   compactions {meta.get('compactions', 0)}"
         f"   watchdog {meta['watchdog']}"
         f"   self-tests {meta['self_test_runs']}"
     )
@@ -725,7 +836,9 @@ def provider_counts(models: list[str]) -> list[tuple[str, int]]:
 
 
 def cmd_models(args: argparse.Namespace) -> int:
-    config_dir = resolve_config_dir(args.config, RUNS_DIR / "_models")
+    config_dir = resolve_config_dir(
+        args.config, RUNS_DIR / f"_models-{uuid.uuid4().hex[:8]}"
+    )
     models = list_models(args.provider, config_dir)
     if not models:
         eprint("error: `opencode models` returned no models")
@@ -788,13 +901,69 @@ def choose_model(models: list[str], requested: str | None, provider: str | None)
         raise SystemExit(2)
 
 
-def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
+def choose_variant(model: str, requested: str | None) -> str | None:
+    variants = ordered_variants(model)
+    ids = [variant_id for variant_id, _, _ in variants]
+    if requested:
+        if requested == "default":
+            return None
+        if ids and requested not in ids:
+            eprint(f"error: variant '{requested}' is not defined for {model}")
+            eprint(f"available: default, {', '.join(ids)}")
+            raise SystemExit(2)
+        return requested
+    if not variants:
+        return None
+    if not sys.stdin.isatty():
+        print(f"  variant: no TTY; using default (available: default, {', '.join(ids)})")
+        return None
+
+    default_thinking, default_effort = model_thinking(model, None)
+    print(f"Variants for {model}:")
+    default_label = f"default ({default_thinking}"
+    if default_effort:
+        default_label += f" {default_effort}"
+    default_label += ")"
+    print(f"   0. {default_label}")
+    for index, (variant_id, thinking, effort) in enumerate(variants, 1):
+        label = f"{variant_id} ({thinking}"
+        if effort:
+            label += f" {effort}"
+        label += ")"
+        print(f"  {index:2}. {label}")
+    raw = input("variant> ").strip()
+    if not raw or raw == "0" or raw == "default":
+        return None
+    if raw.isdigit() and 1 <= int(raw) <= len(variants):
+        return variants[int(raw) - 1][0]
+    if raw in ids:
+        return raw
+    eprint("error: invalid variant")
+    raise SystemExit(2)
+
+
+def claim_run_dir(base_id: str) -> tuple[str, Path]:
+    """Atomically claim a unique run directory, even from multiple shells."""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, 100):
+        run_id = base_id if attempt == 1 else f"{base_id}-{attempt}"
+        run_dir = RUNS_DIR / run_id
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        return run_id, run_dir
+    raise SystemExit(f"error: could not claim a unique run directory for {base_id}")
+
+
+def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | None) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"{timestamp}-{slug(model)}-r{rep}"
-    run_dir = RUNS_DIR / run_id
-    if run_dir.exists():
-        shutil.rmtree(run_dir)
+    variant_slug = slug(variant) if variant else "default"
+    base_id = f"{timestamp}-{slug(model)}-{variant_slug}-r{rep}"
+    run_id, run_dir = claim_run_dir(base_id)
     workdir = run_dir / "workdir"
+    data_dir = run_dir / "opencode-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
     config_dir = resolve_config_dir(args.config, run_dir)
     copy_seed(workdir)
 
@@ -807,22 +976,25 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
                 "run ./bench.py models or pass --no-preflight"
             )
 
-    variant = args.variant or "default"
-    thinking, effort = model_thinking(model, args.variant)
+    variant_label = variant or "default"
+    thinking, effort = model_thinking(model, variant)
+    run_args = argparse.Namespace(**vars(args))
+    run_args.variant = variant
     print(f"run {run_id}")
     print(f"  workdir {workdir}")
     print(f"  model   {model}")
     print(f"  config  {config_dir}")
-    print(f"  thinking {thinking}" + (f" ({effort})" if effort else "") + f"  variant={variant}")
+    print(f"  thinking {thinking}" + (f" ({effort})" if effort else "") + f"  variant={variant_label}")
     print(f"  goal    {args.goal}")
 
     agent = start_agent(
         model,
         config_dir,
         workdir,
+        data_dir,
         run_dir,
         env_names=env_names,
-        args=args,
+        args=run_args,
     )
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
     if build["dist"]:
@@ -848,10 +1020,11 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
         "provider": provider_of(model),
         "rep": rep,
         "goal": args.goal,
-        "variant": variant,
+        "variant": variant_label,
         "thinking": thinking,
         "reasoning_effort": effort,
         "wall_s": agent["wall_s"],
+        "compactions": count_compactions(data_dir),
         "watchdog": agent["watchdog"],
         "completion": agent["completion"],
         "agent_ok": agent["agent_ok"],
@@ -887,20 +1060,45 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace) -> dict:
         "p2_total": score["counts"]["P2"]["total"],
     }
     append_result(row)
+    try:
+        write_leaderboard()
+    except Exception as exc:  # noqa: BLE001 - the run result is already saved
+        eprint(f"warning: could not update leaderboard: {exc}")
     print_summary(meta, score)
     return meta
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    config_dir = resolve_config_dir(args.config, RUNS_DIR / "_models")
+    config_dir = resolve_config_dir(
+        args.config, RUNS_DIR / f"_models-{uuid.uuid4().hex[:8]}"
+    )
     models = list_models(args.provider, config_dir)
     if not models:
         eprint("error: `opencode models` returned no models")
         return 1
     names = choose_model(models, args.model, args.provider)
+    failed = 0
     for model in names:
-        for rep in range(1, args.reps + 1):
-            run_one(model, rep=rep, args=args)
+        if args.variant == "all":
+            variants: list[str | None] = [
+                variant_id for variant_id, _, _ in ordered_variants(model)
+            ]
+            if not variants:
+                variants = [None]
+        else:
+            variants = [choose_variant(model, args.variant)]
+        for variant in variants:
+            for rep in range(1, args.reps + 1):
+                try:
+                    run_one(model, rep=rep, args=args, variant=variant)
+                except (Exception, SystemExit) as exc:
+                    failed += 1
+                    eprint(f"error: run failed for {model} variant={variant or 'default'}: {exc}")
+                    if not args.keep_going:
+                        return 1
+    if failed:
+        eprint(f"{failed} run(s) failed")
+        return 1
     return 0
 
 
@@ -915,6 +1113,16 @@ def cmd_check(args: argparse.Namespace) -> int:
     hidden = sorted(TESTS_DIR.glob("*.spec.ts"))
     if not hidden:
         problems.append(f"no hidden specs in {TESTS_DIR}")
+    tier_counts = {tier: 0 for tier in EXPECTED}
+    for path in hidden:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for tier in tier_counts:
+            tier_counts[tier] += len(re.findall(rf'test\("\[{tier}\]', text))
+    for tier, expected in EXPECTED.items():
+        if tier_counts[tier] != expected:
+            problems.append(
+                f"hidden suite has {tier_counts[tier]} {tier} tests, expected {expected}"
+            )
     if not engine_available(args.engine, args.dry_run):
         problems.append(f"{args.engine} is not available")
     elif not args.dry_run and not image_exists(args.engine, args.image):
@@ -923,7 +1131,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     config_dir = None
     models: list[str] = []
     try:
-        config_dir = resolve_config_dir(args.config, RUNS_DIR / "_check")
+        config_dir = resolve_config_dir(
+            args.config, RUNS_DIR / f"_check-{uuid.uuid4().hex[:8]}"
+        )
         models = list_models(None, config_dir)
         if not models:
             problems.append("`opencode models` returned no models")
@@ -966,7 +1176,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     print("ok")
     print(f"  image   {args.image}")
     print(f"  seed    {SEED_DIR}")
-    print(f"  tests   {TESTS_DIR} ({len(hidden)} spec files)")
+    counts_label = " / ".join(f"{tier} {tier_counts[tier]}" for tier in EXPECTED)
+    print(f"  tests   {TESTS_DIR} ({sum(tier_counts.values())} tests: {counts_label})")
     print(f"  config  {config_dir}")
     print(f"  models  {len(models)}")
     if versions:
@@ -992,6 +1203,8 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     if not meta.get("thinking") or meta.get("thinking") == "unknown":
         selected_variant = meta["variant"] if meta["variant"] != "default" else None
         meta["thinking"], meta["reasoning_effort"] = model_thinking(meta["model"], selected_variant)
+    if (run_dir / "opencode-data").exists():
+        meta["compactions"] = count_compactions(run_dir / "opencode-data")
     workdir = run_dir / "workdir"
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
     if not build["dist"]:
@@ -1027,6 +1240,10 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         "p2_total": score["counts"]["P2"]["total"],
     }
     rewrite_result(meta["run_id"], row)
+    try:
+        write_leaderboard()
+    except Exception as exc:  # noqa: BLE001 - the score is already saved
+        eprint(f"warning: could not update leaderboard: {exc}")
     print_summary(meta, score)
     print("  rescored with the current hidden suite")
     return 0
@@ -1077,6 +1294,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(
                 f"score      quality={meta.get('quality', 0):.2f} "
                 f"eligible={meta.get('eligible')} wall={format_duration(meta.get('wall_s', 0))} "
+                f"compactions={meta.get('compactions', 0)} "
                 f"thinking={thinking}" + (f" ({effort})" if effort else "")
             )
         except json.JSONDecodeError:
@@ -1167,15 +1385,325 @@ def failed_tests(path: Path) -> list[str]:
     return failures
 
 
-def cmd_report(args: argparse.Namespace) -> int:
-    if not RESULTS_PATH.exists():
-        print("no results yet; run ./bench.py run --model ...")
+def _valid_result_rows(rows: list[dict]) -> list[dict]:
+    valid: list[dict] = []
+    for row in rows:
+        if not row.get("run_id") or not row.get("model"):
+            continue
+        try:
+            float(row.get("quality") or "")
+            float(row.get("wall_s") or "")
+        except (TypeError, ValueError):
+            eprint(f"warning: skipping malformed results row {row.get('run_id')!r}")
+            continue
+        valid.append(row)
+    return valid
+
+
+def load_result_rows() -> list[dict]:
+    with results_lock():
+        rows = _read_result_rows_unlocked()
+    return _valid_result_rows(rows)
+
+
+def compaction_count(row: dict) -> int | None:
+    value = (row.get("compactions") or "").strip()
+    if not value:
+        return None
+    try:
+        return max(0, int(float(value)))
+    except ValueError:
+        return None
+
+
+def leaderboard_entries(rows: list[dict]) -> list[dict]:
+    walls = [float(row["wall_s"]) for row in rows]
+    fastest = min(walls) if walls else 0.0
+    weights = LEADERBOARD_WEIGHTS
+    entries: list[dict] = []
+    for row in rows:
+        quality = max(0.0, min(1.0, float(row["quality"])))
+        wall = max(0.0, float(row["wall_s"]))
+        compactions = compaction_count(row)
+        speed = fastest / wall if wall > 0 and fastest > 0 else 0.0
+        compaction_score = 1.0 / (1.0 + compactions) if compactions is not None else 0.0
+        score = 100.0 * (
+            weights["quality"] * quality
+            + weights["wall"] * speed
+            + weights["compactions"] * compaction_score
+        )
+        entries.append(
+            {
+                "row": row,
+                "quality": quality,
+                "wall": wall,
+                "compactions": compactions,
+                "speed": speed,
+                "score": score,
+                "eligible": str(row.get("eligible", "")).lower() == "true",
+            }
+        )
+    entries.sort(
+        key=lambda entry: (
+            -entry["score"],
+            -entry["quality"],
+            entry["wall"],
+            entry["compactions"] is None,
+            entry["compactions"] or 0,
+            entry["row"]["run_id"],
+        )
+    )
+    return entries
+
+
+def thinking_label(row: dict) -> str:
+    thinking = row.get("thinking") or "unknown"
+    effort = row.get("reasoning_effort") or ""
+    return f"{thinking} ({effort})" if effort else thinking
+
+
+def write_leaderboard() -> Path:
+    with results_lock():
+        return _write_leaderboard_unlocked()
+
+
+def _write_leaderboard_unlocked() -> Path:
+    rows = _valid_result_rows(_read_result_rows_unlocked())
+    entries = leaderboard_entries(rows)
+    escaped = html.escape
+
+    cards = [
+        ("Runs", str(len(entries))),
+        ("Eligible", str(sum(1 for entry in entries if entry["eligible"]))),
+        (
+            "Best quality",
+            f"{max((entry['quality'] for entry in entries), default=0.0):.2f}",
+        ),
+        (
+            "Fastest",
+            format_duration(min((entry["wall"] for entry in entries), default=0.0)),
+        ),
+    ]
+    cards_html = "".join(
+        f'<div class="card"><span>{escaped(label)}</span><b>{escaped(value)}</b></div>'
+        for label, value in cards
+    )
+
+    rank_rows: list[str] = []
+    for rank, entry in enumerate(entries, 1):
+        row = entry["row"]
+        quality = entry["quality"]
+        quality_class = "high" if quality >= 0.99 else "mid" if quality >= 0.8 else "low"
+        eligible = entry["eligible"]
+        model = escaped(str(row.get("model", "")))
+        variant = escaped(str(row.get("variant") or "default"))
+        thinking = escaped(thinking_label(row))
+        run_id = escaped(str(row.get("run_id", "")))
+        compactions = "—" if entry["compactions"] is None else str(entry["compactions"])
+        counts = " · ".join(
+            f'{escaped(str(row.get(f"p{tier}_pass") or "0"))}/{escaped(str(row.get(f"p{tier}_total") or "0"))}'
+            for tier in (0, 1, 2)
+        )
+        search = escaped(
+            " ".join(
+                [
+                    str(row.get("model", "")),
+                    str(row.get("variant", "")),
+                    thinking_label(row),
+                    str(row.get("run_id", "")),
+                ]
+            ).lower()
+        )
+        rank_rows.append(
+            f'<tr class="{"ineligible" if not eligible else ""}" data-search="{search}">'
+            f'<td class="rank">{rank}</td>'
+            f'<td><div class="score"><span class="bar" style="width:{min(100.0, entry["score"]):.1f}%"></span>'
+            f'<b>{entry["score"]:.1f}</b></div></td>'
+            f'<td class="model"><div>{model}</div><div class="runid">{run_id}</div></td>'
+            f'<td>{variant}</td>'
+            f'<td>{thinking}</td>'
+            f'<td><span class="quality {quality_class}">{quality:.2f}</span></td>'
+            f'<td class="counts">{counts}</td>'
+            f'<td class="wall">{format_duration(entry["wall"])}</td>'
+            f'<td class="num">{compactions}</td>'
+            f'<td>{"yes" if eligible else "no"}</td>'
+            f"</tr>"
+        )
+
+    if not entries:
+        table = '<p class="empty">No runs yet. Start with <code>./bench.py run --model ...</code>.</p>'
+    else:
+        table = (
+            '<div class="table-wrap"><table>'
+            "<thead><tr>"
+            "<th>#</th><th>Score</th><th>Model / run</th><th>Variant</th><th>Thinking</th>"
+            "<th>Quality</th><th>P0 · P1 · P2</th><th>Wall</th><th>Compactions</th><th>Eligible</th>"
+            "</tr></thead><tbody>"
+            + "".join(rank_rows)
+            + "</tbody></table></div>"
+        )
+
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    weights = LEADERBOARD_WEIGHTS
+    css = """
+:root { color-scheme: dark; --bg:#0f1117; --panel:#171a23; --line:#272c3a;
+        --text:#e7ebf5; --muted:#8b93a7; --accent:#4a90d9; --good:#3ecf8e;
+        --warn:#f0b429; --bad:#ef5b5b; }
+* { box-sizing: border-box; }
+body { margin:0; padding:32px; background:var(--bg); color:var(--text);
+       font:15px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+header { display:flex; gap:24px; align-items:flex-end; justify-content:space-between;
+         flex-wrap:wrap; margin-bottom:20px; }
+h1 { margin:0; font-size:28px; letter-spacing:-.02em; }
+.sub { margin:6px 0 0; color:var(--muted); }
+.cards { display:flex; gap:10px; flex-wrap:wrap; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+        padding:10px 14px; min-width:110px; }
+.card span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase;
+             letter-spacing:.06em; }
+.card b { font-size:20px; font-variant-numeric:tabular-nums; }
+.formula { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:12px 16px; color:var(--muted); margin-bottom:18px; }
+.formula b { color:var(--text); }
+.toolbar { display:flex; gap:12px; align-items:center; margin:0 0 14px; flex-wrap:wrap; }
+input[type="search"] { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                       border-radius:8px; padding:9px 12px; min-width:280px; }
+button { background:var(--accent); border:0; color:#fff; border-radius:8px; padding:9px 14px;
+         font:inherit; cursor:pointer; }
+.table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; }
+table { width:100%; border-collapse:collapse; min-width:1050px; }
+thead th { position:sticky; top:0; background:#1b1f2b; color:var(--muted); font-size:12px;
+           text-transform:uppercase; letter-spacing:.05em; text-align:left; padding:12px 14px;
+           border-bottom:1px solid var(--line); white-space:nowrap; }
+tbody td { padding:12px 14px; border-bottom:1px solid var(--line); vertical-align:middle; }
+tbody tr:last-child td { border-bottom:0; }
+tbody tr:hover { background:#1b1f2b; }
+tr.ineligible { opacity:.55; }
+.rank { font-size:18px; font-weight:700; color:var(--muted); }
+tbody tr:nth-child(1) .rank { color:var(--warn); }
+tbody tr:nth-child(2) .rank { color:#c9d1e3; }
+tbody tr:nth-child(3) .rank { color:#b07d4f; }
+.score { position:relative; min-width:120px; height:24px; display:flex; align-items:center; }
+.score .bar { position:absolute; inset:0 auto 0 0; background:linear-gradient(90deg,#2f6db3,#4a90d9);
+              border-radius:6px; opacity:.55; }
+.score b { position:relative; padding-left:8px; font-variant-numeric:tabular-nums; }
+.model div:first-child { font-weight:600; }
+.runid { color:var(--muted); font:11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+         word-break:break-all; max-width:360px; }
+.counts, .wall, .num { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.quality { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:700;
+           font-variant-numeric:tabular-nums; }
+.quality.high { background:rgba(62,207,142,.15); color:var(--good); }
+.quality.mid { background:rgba(240,180,41,.15); color:var(--warn); }
+.quality.low { background:rgba(239,91,91,.15); color:var(--bad); }
+.empty { color:var(--muted); }
+footer { color:var(--muted); margin-top:18px; font-size:13px; }
+code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+@media (max-width:700px) { body { padding:18px; } h1 { font-size:22px; } }
+"""
+    text = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spritebench leaderboard</title>
+<style>{css}</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>spritebench leaderboard</h1>
+    <p class="sub">Build-and-play benchmark · updated {escaped(updated)}</p>
+  </div>
+  <div class="cards">{cards_html}</div>
+</header>
+<div class="formula">
+  <b>Score = {weights["quality"]:.0%} quality + {weights["wall"]:.0%} speed + {weights["compactions"]:.0%} compactions.</b>
+  Speed is relative to the fastest run (<code>fastest wall / run wall</code>);
+  compactions score as <code>1 / (1 + count)</code>. Ranked by score, then quality,
+  wall time and compactions. Missing compaction data counts as zero.
+</div>
+<div class="toolbar">
+  <input id="filter" type="search" placeholder="Filter model, variant, thinking or run id">
+  <button type="button" onclick="location.reload()">Refresh</button>
+</div>
+{table}
+<footer>
+  Generated by <code>./bench.py leaderboard</code>. Serve live with
+  <code>./bench.py leaderboard --serve</code>; add <code>?live=1</code> for auto-refresh.
+  Raw data: <code>results.csv</code>.
+</footer>
+<script>
+const filter = document.getElementById('filter');
+filter?.addEventListener('input', () => {{
+  const needle = filter.value.trim().toLowerCase();
+  for (const row of document.querySelectorAll('tbody tr')) {{
+    row.style.display = !needle || row.dataset.search.includes(needle) ? '' : 'none';
+  }}
+}});
+if (new URLSearchParams(location.search).get('live') === '1') {{
+  setTimeout(() => location.reload(), 30000);
+}}
+</script>
+</body>
+</html>
+"""
+    atomic_write_text(LEADERBOARD_PATH, text)
+    return LEADERBOARD_PATH
+
+
+class LeaderboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path.split("?", 1)[0] not in ("/", "/index.html", "/leaderboard.html"):
+            self.send_error(404)
+            return
+        try:
+            write_leaderboard()
+            body = LEADERBOARD_PATH.read_bytes()
+        except OSError:
+            self.send_error(500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+def cmd_leaderboard(args: argparse.Namespace) -> int:
+    path = write_leaderboard()
+    print(f"leaderboard {path}")
+    if not args.serve:
+        if args.open:
+            webbrowser.open(path.as_uri())
         return 0
-    ensure_results_schema()
-    with RESULTS_PATH.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), LeaderboardHandler)
+    except OSError as exc:
+        eprint(f"error: cannot listen on 127.0.0.1:{args.port}: {exc}")
+        return 1
+    url = f"http://127.0.0.1:{args.port}/?live=1"
+    print(f"serving {url}")
+    print("Ctrl+C to stop")
+    if args.open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("")
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    rows = load_result_rows()
     if not rows:
-        print("no results yet")
+        print("no results yet; run ./bench.py run --model ...")
         return 0
 
     by_model: dict[str, list[dict]] = {}
@@ -1185,12 +1713,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines = [
         "# spritebench report",
         "",
-        "| model | thinking | runs | quality med | wall med | minor med | eligible |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| model | thinking | runs | quality med | wall med | compactions med | minor med | eligible |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for model, items in sorted(by_model.items()):
         quality = statistics.median(float(item["quality"]) for item in items)
         wall = statistics.median(float(item["wall_s"]) for item in items)
+        compactions = statistics.median(int(item.get("compactions") or 0) for item in items)
         minor = statistics.median(int(item["minor_issues"]) for item in items)
         eligible = any(item["eligible"] == "True" for item in items)
         labels = sorted(
@@ -1202,11 +1731,14 @@ def cmd_report(args: argparse.Namespace) -> int:
         )
         lines.append(
             f"| {model} | {', '.join(labels)} | {len(items)} | {quality:.2f} | "
-            f"{format_duration(wall)} | {minor:.0f} | {'yes' if eligible else 'no'} |"
+            f"{format_duration(wall)} | {compactions:.0f} | {minor:.0f} | "
+            f"{'yes' if eligible else 'no'} |"
         )
     lines += [
         "",
         "Full rows: `results.csv`. Per-run artifacts: `runs/<run_id>/`.",
+        "",
+        "Leaderboard: `leaderboard.html` (rebuild with `./bench.py leaderboard --serve`).",
         "",
         "## Failures",
         "",
@@ -1223,7 +1755,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         lines.append("None.")
     lines.append("")
     text = "\n".join(lines)
-    REPORT_PATH.write_text(text, encoding="utf-8")
+    atomic_write_text(REPORT_PATH, text)
+    write_leaderboard()
     print(text)
     return 0
 
@@ -1259,9 +1792,18 @@ def make_parser() -> argparse.ArgumentParser:
     run.add_argument("--provider", default=None, help="filter the model menu")
     run.add_argument("--config", default=None, help="OpenCode config file or directory")
     run.add_argument("--env", action="append", default=[], metavar="KEY", help="pass an env var")
-    run.add_argument("--variant", default=None, help="OpenCode model variant")
+    run.add_argument(
+        "--variant",
+        default=None,
+        help="OpenCode model variant, or 'all' to run every variant (high to low) then stop",
+    )
     run.add_argument("--agent", default=None, help="OpenCode agent name")
     run.add_argument("--pure", action="store_true", help="run OpenCode without external plugins")
+    run.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="continue to the next model/variant if a run fails",
+    )
     run.add_argument("--reps", type=int, default=1)
     run.add_argument("--goal", choices=["speed", "quality", "balanced"], default="balanced")
     run.add_argument("--timeout", type=int, default=4 * 3600, help="hard safety timeout")
@@ -1283,6 +1825,14 @@ def make_parser() -> argparse.ArgumentParser:
     preview.add_argument("--run", default=None, help="run directory name (default: latest)")
     preview.add_argument("--port", type=int, default=4173)
     preview.set_defaults(func=cmd_preview)
+
+    leaderboard = sub.add_parser(
+        "leaderboard", help="render and optionally serve the all-runs leaderboard"
+    )
+    leaderboard.add_argument("--serve", action="store_true", help="serve it on localhost")
+    leaderboard.add_argument("--port", type=int, default=4174)
+    leaderboard.add_argument("--open", action="store_true", help="open it in the browser")
+    leaderboard.set_defaults(func=cmd_leaderboard)
 
     status = sub.add_parser("status", help="show the latest run and live engine status")
     status.add_argument("--config", default=None, help="OpenCode config file or directory")
