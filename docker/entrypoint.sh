@@ -16,8 +16,8 @@ fi
 # fresh copy from the macOS host, so use the preinstalled tree instead of
 # running npm install inside the agent (network, platform binaries, time).
 if [ -d /work ] && [ -w /work ] && [ ! -e /work/node_modules ] \
-   && [ -d /opt/spritebench/node_modules ]; then
-  cp -a /opt/spritebench/node_modules /work/node_modules
+   && [ -d /opt/opencode-bench/node_modules ]; then
+  cp -a /opt/opencode-bench/node_modules /work/node_modules
 fi
 
 exec "$@"

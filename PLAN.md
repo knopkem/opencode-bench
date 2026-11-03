@@ -1,4 +1,4 @@
-# SpriteBench
+# opencode-bench
 
 **A build-and-play benchmark for local coding deployments.**
 
@@ -49,7 +49,7 @@ model selection:
    edge case without the resulting app actually working. The rubric is the real
    discriminator, and it is manual.
 
-SpriteBench replaces the plan-only task with a **build task**: a real app that
+opencode-bench replaces the plan-only task with a **build task**: a real app that
 must boot, render, accept input, persist state and pass a hidden browser test
 suite. The model cannot pass by describing the right answer; it has to ship it.
 
@@ -254,7 +254,7 @@ The task is scored, not all-or-nothing. P0 is fatal, P1 is major, P2 is minor.
 ## 4. Hidden Playwright suite
 
 `tasks/spriteforge-lite/tests/` is never copied into the model's workdir. The
-harness mounts it at `/opt/spritebench/tests` only in the test container after
+harness mounts it at `/opt/opencode-bench/tests` only in the test container after
 the agent stops.
 
 The v0 suite has 20 tests. Each test is weighted by tier:
@@ -304,7 +304,7 @@ the test, not the model.
 Clone the `planner-bench` shape:
 
 ```
-spritebench/
+opencode-bench/
   PROMPT.md
   bench.py
   docker/
@@ -399,7 +399,7 @@ Recommended isolation, strongest first:
 
 1. **Container or VM per run (preferred).**
    - The agent gets only the workdir mounted at `/work`.
-   - Do not mount `spritebench/`, the user's home, the Docker socket, or the
+   - Do not mount `opencode-bench/`, the user's home, the Docker socket, or the
      test directory.
    - The model endpoint is whatever the mounted OpenCode config points at;
      the agent container only needs network access to it.
@@ -416,7 +416,7 @@ Recommended isolation, strongest first:
    - Remove SSH keys/agent forwarding from the agent host, or the model could
      reach the test machine. Do not expose the test directory over the network.
 3. **Separate Unix user with restrictive permissions.**
-   - Create `spritebench-agent`; make `spritebench/` mode `700` owned by your
+   - Create `opencode-bench-agent`; make `opencode-bench/` mode `700` owned by your
      main user; run OpenCode as the agent user.
    - This is weaker than a container: the agent shares the kernel and can read
      anything world-readable. Audit parent directory permissions first.

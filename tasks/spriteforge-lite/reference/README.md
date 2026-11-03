@@ -36,10 +36,10 @@ cd ../seed
 APP_DIR="$(cd ../reference/dist && pwd)" \
 APP_PORT=4173 \
 SERVE_SCRIPT="$(cd ../../../docker && pwd)/serve.mjs" \
-RESULT_FILE=/tmp/spritebench-reference.json \
+RESULT_FILE=/tmp/opencode-bench-reference.json \
 NODE_PATH="$(pwd)/node_modules" \
 npx playwright test --config ../tests/playwright.config.ts
 ```
 
 The hidden suite expects the app at `APP_DIR`; the Docker runner supplies
-`/app` and `/opt/spritebench/tests` instead.
+`/app` and `/opt/opencode-bench/tests` instead.

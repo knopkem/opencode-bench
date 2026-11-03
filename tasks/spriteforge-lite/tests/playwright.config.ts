@@ -2,7 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 const appDir = process.env.APP_DIR || "/app";
 const appPort = process.env.APP_PORT || "4173";
-const serveScript = process.env.SERVE_SCRIPT || "/opt/spritebench/serve.mjs";
+const serveScript = process.env.SERVE_SCRIPT || "/opt/opencode-bench/serve.mjs";
 const baseURL = process.env.BASE_URL || `http://127.0.0.1:${appPort}`;
 
 export default defineConfig({

@@ -1,4 +1,4 @@
-# spritebench
+# opencode-bench
 
 Build-and-play benchmark for OpenCode models.
 
@@ -9,6 +9,26 @@ a score and report.
 
 There is no model list, endpoint list or machine list in this repo. The local
 OpenCode config is the source of truth.
+
+## What the model does
+
+Each run gives the model a fresh copy of a small TypeScript + Vite seed app and
+one task: build **SpriteForge Lite**, a working single-page sprite editor. The
+seed mounts a placeholder; the model must replace it with a real app and leave
+`npm run build` and `npm run typecheck` green.
+
+The app must provide a 32×32 logical canvas shown at 512×512, pencil and eraser
+with continuous drag, line/rectangle/ellipse/fill/eyedropper tools, palette and
+brush selection, undo/redo, layers with visibility and opacity, frames with
+playback and onion skin, `localStorage` persistence, PNG export, keyboard
+shortcuts, and the `window.__spriteforge` state API. It must use the required
+`data-testid` selectors and write `COMPLETION.md` when finished.
+
+There is no fixed time limit, only watchdogs for hung runs. The model may run
+the public smoke tests and add its own tests under `tests-local/`, but cannot
+add dependencies, use the network, or modify the hidden suite. The hidden
+20-test Playwright suite (P0: 5, P1: 9, P2: 6) is mounted only after the agent
+exits and is never visible to the model.
 
 ## Quick start
 
@@ -128,7 +148,7 @@ there for independent providers, not for parallelising one provider’s variants
   `runs/`. A same-second collision gets a `-2`, `-3`, … suffix; use the exact ID
   from the console or `results.csv`.
 - To see active agent containers:
-  `docker ps --filter name=spritebench --format '{{.Names}} {{.Status}}'`.
+  `docker ps --filter name=opencode-bench --format '{{.Names}} {{.Status}}'`.
 
 ## Configuration
 
@@ -304,7 +324,7 @@ leaderboard.html             generated all-runs leaderboard
 - The reference implementation is instrumented with test IDs, state API, PNG
   export and play/pause controls.
 - Hidden suite: 20/20 against the reference; public smoke: 4/4.
-- The image is built (`spritebench:latest`), and `docker build --check` passes.
+- The image is built (`opencode-bench:latest`), and `docker build --check` passes.
 - OpenCode 2.2.5 v2 installer verified locally.
 - The current hidden suite covers canvas/drawing, continuous pencil/eraser
   drags, palette, layers, frames, playback, persistence, PNG export, onion
