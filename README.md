@@ -217,7 +217,7 @@ It reads a locked snapshot of `results.csv`, so it is safe to leave running
 while parallel shells finish. The server only serves the leaderboard page, not
 the project tree, so hidden tests and reference code are not exposed.
 
-Runs are ranked by:
+Runs are scored and ranked by:
 
 ```
 score = 80% quality + 15% speed + 5% compactions
@@ -229,6 +229,13 @@ Quality carries the most weight, then wall time, then compactions. Ties break
 on quality, wall time, compactions and run ID. The page also shows the raw
 quality, P0/P1/P2 counts, `HH:MM:SS` wall time, compaction count and eligibility
 for each run.
+
+The leaderboard has **Provider** and **Reasoning** filter drop-downs. It opens
+sorted by **Score**, highest first. Click any sortable column header to sort by
+it, and click again to reverse the direction. `Started` sorts newest first and
+`Wall` sorts fastest first by default. Rank numbers follow the current filtered
+and sorted view. Filter and sort choices are remembered in the browser, so the
+30-second live refresh keeps them.
 
 ## Scoring
 

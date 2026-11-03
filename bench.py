@@ -1466,6 +1466,48 @@ def thinking_label(row: dict) -> str:
     return f"{thinking} ({effort})" if effort else thinking
 
 
+def run_started(row: dict) -> datetime | None:
+    """Parse the run's UTC start timestamp."""
+    value = (row.get("timestamp") or "").strip()
+    if not value:
+        run_id = (row.get("run_id") or "").strip()
+        if len(run_id) >= 16:
+            value = run_id[:16]
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def started_label(row: dict) -> tuple[str, str]:
+    """Return a short UTC start time and a full tooltip for the runner."""
+    started = run_started(row)
+    if started is None:
+        return "—", ""
+    return (
+        started.strftime("%b %d %H:%M"),
+        started.strftime("%Y-%m-%d %H:%M:%S UTC"),
+    )
+
+
+def reasoning_key(row: dict) -> str:
+    return (
+        row.get("reasoning_effort") or row.get("thinking") or "unknown"
+    ).strip().lower() or "unknown"
+
+
+def reasoning_rank(row: dict) -> int:
+    return REASONING_ORDER.get(reasoning_key(row), -1)
+
+
+def provider_label(row: dict) -> str:
+    return str(
+        row.get("provider") or str(row.get("model", "")).split("/", 1)[0] or "unknown"
+    )
+
+
 def write_leaderboard() -> Path:
     with results_lock():
         return _write_leaderboard_unlocked()
@@ -1475,6 +1517,20 @@ def _write_leaderboard_unlocked() -> Path:
     rows = _valid_result_rows(_read_result_rows_unlocked())
     entries = leaderboard_entries(rows)
     escaped = html.escape
+
+    providers = sorted({provider_label(entry["row"]) for entry in entries})
+    reasoning_values = sorted(
+        {reasoning_key(entry["row"]) for entry in entries},
+        key=lambda value: (-REASONING_ORDER.get(value, -1), value),
+    )
+    provider_options = '<option value="">All providers</option>' + "".join(
+        f'<option value="{escaped(provider)}">{escaped(provider)}</option>'
+        for provider in providers
+    )
+    reasoning_options = '<option value="">All reasoning</option>' + "".join(
+        f'<option value="{escaped(value)}">{escaped(value)}</option>'
+        for value in reasoning_values
+    )
 
     cards = [
         ("Runs", str(len(entries))),
@@ -1503,6 +1559,17 @@ def _write_leaderboard_unlocked() -> Path:
         variant = escaped(str(row.get("variant") or "default"))
         thinking = escaped(thinking_label(row))
         run_id = escaped(str(row.get("run_id", "")))
+        started, started_full = started_label(row)
+        started = escaped(started)
+        provider = provider_label(row)
+        reasoning = reasoning_key(row)
+        effort_rank = reasoning_rank(row)
+        started_dt = run_started(row)
+        started_epoch = int(started_dt.timestamp()) if started_dt else 0
+        p0_pass = int(row.get("p0_pass") or 0)
+        p1_pass = int(row.get("p1_pass") or 0)
+        p2_pass = int(row.get("p2_pass") or 0)
+        counts_rank = p0_pass * 100 + p1_pass * 10 + p2_pass
         compactions = "—" if entry["compactions"] is None else str(entry["compactions"])
         counts = " · ".join(
             f'{escaped(str(row.get(f"p{tier}_pass") or "0"))}/{escaped(str(row.get(f"p{tier}_total") or "0"))}'
@@ -1514,16 +1581,27 @@ def _write_leaderboard_unlocked() -> Path:
                     str(row.get("model", "")),
                     str(row.get("variant", "")),
                     thinking_label(row),
+                    started,
                     str(row.get("run_id", "")),
                 ]
             ).lower()
         )
         rank_rows.append(
-            f'<tr class="{"ineligible" if not eligible else ""}" data-search="{search}">'
+            f'<tr class="{"ineligible" if not eligible else ""}" data-search="{search}"'
+            f' data-provider="{escaped(provider)}" data-reasoning="{escaped(reasoning)}"'
+            f' data-model="{escaped(str(row.get("model", "")))}"'
+            f' data-started="{started_epoch}"'
+            f' data-variant="{escaped(str(row.get("variant") or "default"))}"'
+            f' data-thinking="{effort_rank}" data-quality="{quality:.6f}"'
+            f' data-counts="{counts_rank}" data-wall="{entry["wall"]:.6f}"'
+            f' data-compactions="{entry["compactions"] if entry["compactions"] is not None else 0}"'
+            f' data-eligible="{1 if eligible else 0}"'
+            f' data-score="{entry["score"]:.6f}" data-run="{run_id}">'
             f'<td class="rank">{rank}</td>'
             f'<td><div class="score"><span class="bar" style="width:{min(100.0, entry["score"]):.1f}%"></span>'
             f'<b>{entry["score"]:.1f}</b></div></td>'
             f'<td class="model"><div>{model}</div><div class="runid">{run_id}</div></td>'
+            f'<td class="started" title="{escaped(started_full)}">{started}</td>'
             f'<td>{variant}</td>'
             f'<td>{thinking}</td>'
             f'<td><span class="quality {quality_class}">{quality:.2f}</span></td>'
@@ -1540,8 +1618,17 @@ def _write_leaderboard_unlocked() -> Path:
         table = (
             '<div class="table-wrap"><table>'
             "<thead><tr>"
-            "<th>#</th><th>Score</th><th>Model / run</th><th>Variant</th><th>Thinking</th>"
-            "<th>Quality</th><th>P0 · P1 · P2</th><th>Wall</th><th>Compactions</th><th>Eligible</th>"
+            "<th>#</th>"
+            '<th data-sort="score" data-type="number" data-default-dir="desc">Score</th>'
+            '<th data-sort="model" data-type="text" data-default-dir="asc">Model / run</th>'
+            '<th data-sort="started" data-type="number" data-default-dir="desc">Started (UTC)</th>'
+            '<th data-sort="variant" data-type="text" data-default-dir="asc">Variant</th>'
+            '<th data-sort="thinking" data-type="number" data-default-dir="desc">Thinking</th>'
+            '<th data-sort="quality" data-type="number" data-default-dir="desc">Quality</th>'
+            '<th data-sort="counts" data-type="number" data-default-dir="desc">P0 · P1 · P2</th>'
+            '<th data-sort="wall" data-type="number" data-default-dir="asc">Wall</th>'
+            '<th data-sort="compactions" data-type="number" data-default-dir="asc">Compactions</th>'
+            '<th data-sort="eligible" data-type="number" data-default-dir="desc">Eligible</th>'
             "</tr></thead><tbody>"
             + "".join(rank_rows)
             + "</tbody></table></div>"
@@ -1572,13 +1659,21 @@ h1 { margin:0; font-size:28px; letter-spacing:-.02em; }
 .toolbar { display:flex; gap:12px; align-items:center; margin:0 0 14px; flex-wrap:wrap; }
 input[type="search"] { background:var(--panel); border:1px solid var(--line); color:var(--text);
                        border-radius:8px; padding:9px 12px; min-width:280px; }
+.toolbar label { color:var(--muted); }
+select { background:var(--panel); border:1px solid var(--line); color:var(--text);
+         border-radius:8px; padding:9px 12px; font:inherit; }
 button { background:var(--accent); border:0; color:#fff; border-radius:8px; padding:9px 14px;
          font:inherit; cursor:pointer; }
 .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; }
-table { width:100%; border-collapse:collapse; min-width:1050px; }
+table { width:100%; border-collapse:collapse; min-width:1150px; }
 thead th { position:sticky; top:0; background:#1b1f2b; color:var(--muted); font-size:12px;
            text-transform:uppercase; letter-spacing:.05em; text-align:left; padding:12px 14px;
            border-bottom:1px solid var(--line); white-space:nowrap; }
+thead th[data-sort] { cursor:pointer; user-select:none; }
+thead th[data-sort]:hover { color:var(--text); }
+thead th[data-sort]::after { content:"↕"; opacity:.35; margin-left:6px; font-size:10px; }
+thead th[data-sort][data-dir="asc"]::after { content:"▲"; opacity:1; }
+thead th[data-sort][data-dir="desc"]::after { content:"▼"; opacity:1; }
 tbody td { padding:12px 14px; border-bottom:1px solid var(--line); vertical-align:middle; }
 tbody tr:last-child td { border-bottom:0; }
 tbody tr:hover { background:#1b1f2b; }
@@ -1594,6 +1689,7 @@ tbody tr:nth-child(3) .rank { color:#b07d4f; }
 .model div:first-child { font-weight:600; }
 .runid { color:var(--muted); font:11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
          word-break:break-all; max-width:360px; }
+.started { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; }
 .counts, .wall, .num { font-variant-numeric:tabular-nums; white-space:nowrap; }
 .quality { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:700;
            font-variant-numeric:tabular-nums; }
@@ -1624,11 +1720,17 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 <div class="formula">
   <b>Score = {weights["quality"]:.0%} quality + {weights["wall"]:.0%} speed + {weights["compactions"]:.0%} compactions.</b>
   Speed is relative to the fastest run (<code>fastest wall / run wall</code>);
-  compactions score as <code>1 / (1 + count)</code>. Ranked by score, then quality,
-  wall time and compactions. Missing compaction data counts as zero.
+  compactions score as <code>1 / (1 + count)</code>. The default sort is score,
+  highest first. Click a column header to sort by it and click again to reverse.
+  Use the Provider and Reasoning filters to narrow the table. Missing compaction
+  data counts as zero.
 </div>
 <div class="toolbar">
   <input id="filter" type="search" placeholder="Filter model, variant, thinking or run id">
+  <label for="filter-provider">Provider</label>
+  <select id="filter-provider">{provider_options}</select>
+  <label for="filter-reasoning">Reasoning</label>
+  <select id="filter-reasoning">{reasoning_options}</select>
   <button type="button" onclick="location.reload()">Refresh</button>
 </div>
 {table}
@@ -1638,13 +1740,123 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
   Raw data: <code>results.csv</code>.
 </footer>
 <script>
-const filter = document.getElementById('filter');
-filter?.addEventListener('input', () => {{
-  const needle = filter.value.trim().toLowerCase();
-  for (const row of document.querySelectorAll('tbody tr')) {{
-    row.style.display = !needle || row.dataset.search.includes(needle) ? '' : 'none';
+const search = document.getElementById('filter');
+const providerFilter = document.getElementById('filter-provider');
+const reasoningFilter = document.getElementById('filter-reasoning');
+const tableBody = document.querySelector('tbody');
+const SORT_STATE_KEY = 'spritebench-sort-state';
+const FILTER_KEY = 'spritebench-filters';
+let sortKey = 'score';
+let sortDir = 'desc';
+try {{
+  const savedSort = JSON.parse(localStorage.getItem(SORT_STATE_KEY) || '{{}}');
+  if (savedSort.key && document.querySelector(`th[data-sort="${{savedSort.key}}"]`)) {{
+    sortKey = savedSort.key;
+    sortDir = savedSort.dir === 'asc' ? 'asc' : 'desc';
   }}
+  const savedFilters = JSON.parse(localStorage.getItem(FILTER_KEY) || '{{}}');
+  if (savedFilters.provider && providerFilter) providerFilter.value = savedFilters.provider;
+  if (savedFilters.reasoning && reasoningFilter) reasoningFilter.value = savedFilters.reasoning;
+}} catch (error) {{}}
+
+function saveFilters() {{
+  try {{
+    localStorage.setItem(FILTER_KEY, JSON.stringify({{
+      provider: providerFilter?.value || '',
+      reasoning: reasoningFilter?.value || ''
+    }}));
+  }} catch (error) {{}}
+}}
+
+function updateRanks() {{
+  let rank = 0;
+  for (const row of tableBody.querySelectorAll('tr')) {{
+    const cell = row.querySelector('.rank');
+    if (row.style.display === 'none') {{
+      if (cell) cell.textContent = '';
+    }} else {{
+      rank += 1;
+      if (cell) cell.textContent = String(rank);
+    }}
+  }}
+}}
+
+function applyView() {{
+  const needle = (search?.value || '').trim().toLowerCase();
+  const provider = providerFilter?.value || '';
+  const reasoning = reasoningFilter?.value || '';
+  for (const row of tableBody.querySelectorAll('tr')) {{
+    const ok = (!needle || row.dataset.search.includes(needle))
+      && (!provider || row.dataset.provider === provider)
+      && (!reasoning || row.dataset.reasoning === reasoning);
+    row.style.display = ok ? '' : 'none';
+  }}
+  updateRanks();
+}}
+
+function sortRows() {{
+  const header = document.querySelector(`th[data-sort="${{sortKey}}"]`);
+  const type = header?.dataset.type || 'text';
+  const direction = sortDir === 'asc' ? 1 : -1;
+  const rows = [...tableBody.querySelectorAll('tr')];
+  rows.sort((a, b) => {{
+    let av;
+    let bv;
+    if (type === 'number') {{
+      av = Number(a.dataset[sortKey] || 0);
+      bv = Number(b.dataset[sortKey] || 0);
+    }} else {{
+      av = (a.dataset[sortKey] || '').toLowerCase();
+      bv = (b.dataset[sortKey] || '').toLowerCase();
+    }}
+    if (av < bv) return -1 * direction;
+    if (av > bv) return direction;
+    const score = Number(b.dataset.score || 0) - Number(a.dataset.score || 0);
+    if (score) return score;
+    return (a.dataset.run || '').localeCompare(b.dataset.run || '');
+  }});
+  rows.forEach((row) => tableBody.appendChild(row));
+  for (const th of document.querySelectorAll('th[data-sort]')) {{
+    th.removeAttribute('data-dir');
+    th.removeAttribute('aria-sort');
+  }}
+  if (header) {{
+    header.dataset.dir = sortDir;
+    header.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
+  }}
+  updateRanks();
+}}
+
+for (const header of document.querySelectorAll('th[data-sort]')) {{
+  header.addEventListener('click', () => {{
+    const key = header.dataset.sort;
+    if (key === sortKey) {{
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    }} else {{
+      sortKey = key;
+      sortDir = header.dataset.defaultDir || 'asc';
+    }}
+    try {{
+      localStorage.setItem(SORT_STATE_KEY, JSON.stringify({{key: sortKey, dir: sortDir}}));
+    }} catch (error) {{}}
+    sortRows();
+    applyView();
+  }});
+}}
+
+search?.addEventListener('input', applyView);
+providerFilter?.addEventListener('change', () => {{
+  saveFilters();
+  applyView();
 }});
+reasoningFilter?.addEventListener('change', () => {{
+  saveFilters();
+  applyView();
+}});
+
+sortRows();
+applyView();
+
 if (new URLSearchParams(location.search).get('live') === '1') {{
   setTimeout(() => location.reload(), 30000);
 }}
