@@ -73,7 +73,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`spritebench static server: http://${host}:${port} -> ${root}`);
+  console.log(`opencode-bench static server: http://${host}:${port} -> ${root}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

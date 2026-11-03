@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""spritebench: one-command build-and-play benchmark for OpenCode models.
+"""opencode-bench: one-command build-and-play benchmark for OpenCode models.
 
 Usage:
     ./bench.py models
@@ -50,9 +50,9 @@ RUNS_DIR = ROOT / "runs"
 RESULTS_PATH = ROOT / "results.csv"
 REPORT_PATH = ROOT / "report.md"
 
-DEFAULT_IMAGE = os.environ.get("SPRITEBENCH_IMAGE", "spritebench:latest")
-DEFAULT_ENGINE = os.environ.get("SPRITEBENCH_ENGINE", "docker")
-OPENCODE = os.environ.get("SPRITEBENCH_OPENCODE", "opencode")
+DEFAULT_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "opencode-bench:latest")
+DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
+OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
 
 EXPECTED = {"P0": 5, "P1": 9, "P2": 6}
 WEIGHT = {"P0": 3, "P1": 2, "P2": 1}
@@ -383,10 +383,10 @@ def copy_seed(destination: Path) -> None:
 
 
 def agent_command(args: argparse.Namespace) -> str:
-    model_ref = '"$SPRITEBENCH_MODEL"'
+    model_ref = '"$OPENCODE_BENCH_MODEL"'
     if args.variant:
         # OpenCode 2 encodes the variant in the model reference, not a flag.
-        model_ref = '"${SPRITEBENCH_MODEL}#${SPRITEBENCH_VARIANT}"'
+        model_ref = '"${OPENCODE_BENCH_MODEL}#${OPENCODE_BENCH_VARIANT}"'
     parts = [
         f"exec opencode run --format json --auto --model {model_ref}",
     ]
@@ -425,7 +425,7 @@ def start_agent(
     env_names: set[str],
     args: argparse.Namespace,
 ) -> dict:
-    name = f"spritebench-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
+    name = f"opencode-bench-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
     log_path = run_dir / "agent.log"
     command = [
         args.engine,
@@ -445,10 +445,10 @@ def start_agent(
         "-e",
         "XDG_CONFIG_HOME=/home/agent/.config",
         "-e",
-        f"SPRITEBENCH_MODEL={model}",
+        f"OPENCODE_BENCH_MODEL={model}",
     ]
     if args.variant:
-        command += ["-e", f"SPRITEBENCH_VARIANT={args.variant}"]
+        command += ["-e", f"OPENCODE_BENCH_VARIANT={args.variant}"]
     for key in sorted(env_names):
         command += ["-e", key]
     command += ["-w", "/work", args.image, "bash", "-lc", agent_command(args)]
@@ -584,11 +584,11 @@ def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         "-v",
         f"{workdir / 'dist'}:/app:ro",
         "-v",
-        f"{TESTS_DIR}:/opt/spritebench/tests:ro",
+        f"{TESTS_DIR}:/opt/opencode-bench/tests:ro",
         "-v",
         f"{run_dir}:/out",
         "-w",
-        "/opt/spritebench",
+        "/opt/opencode-bench",
         "-e",
         "BASE_URL=http://127.0.0.1:4173",
         "-e",
@@ -598,7 +598,7 @@ def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         image,
         "bash",
         "-lc",
-        "npx playwright test --config /opt/spritebench/tests/playwright.config.ts",
+        "npx playwright test --config /opt/opencode-bench/tests/playwright.config.ts",
     ]
     proc = run_command(command, log_path=run_dir / "test.log", dry_run=dry_run)
     if dry_run:
@@ -1270,7 +1270,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     except (OSError, IndexError):
         pass
 
-    model_match = re.search(r"SPRITEBENCH_MODEL=([^\s]+)", first)
+    # Old run logs still carry the pre-rename environment variable.
+    model_match = re.search(r"(?:OPENCODE_BENCH|SPRITEBENCH)_MODEL=([^\s]+)", first)
     name_match = re.search(r"--name\s+(\S+)", first)
     model = model_match.group(1) if model_match else "?"
     container = name_match.group(1) if name_match else None
@@ -1706,13 +1707,13 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>spritebench leaderboard</title>
+<title>opencode-bench leaderboard</title>
 <style>{css}</style>
 </head>
 <body>
 <header>
   <div>
-    <h1>spritebench leaderboard</h1>
+    <h1>opencode-bench leaderboard</h1>
     <p class="sub">Build-and-play benchmark · updated {escaped(updated)}</p>
   </div>
   <div class="cards">{cards_html}</div>
@@ -1744,8 +1745,8 @@ const search = document.getElementById('filter');
 const providerFilter = document.getElementById('filter-provider');
 const reasoningFilter = document.getElementById('filter-reasoning');
 const tableBody = document.querySelector('tbody');
-const SORT_STATE_KEY = 'spritebench-sort-state';
-const FILTER_KEY = 'spritebench-filters';
+const SORT_STATE_KEY = 'opencode-bench-sort-state';
+const FILTER_KEY = 'opencode-bench-filters';
 let sortKey = 'score';
 let sortDir = 'desc';
 try {{
@@ -1927,7 +1928,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         by_model.setdefault(row["model"], []).append(row)
 
     lines = [
-        "# spritebench report",
+        "# opencode-bench report",
         "",
         "| model | thinking | runs | quality med | wall med | compactions med | minor med | eligible |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
@@ -1978,7 +1979,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def make_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="spritebench")
+    parser = argparse.ArgumentParser(description="opencode-bench")
     parser.add_argument("--engine", default=DEFAULT_ENGINE, help="docker or podman")
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1987,12 +1988,12 @@ def make_parser() -> argparse.ArgumentParser:
     build.add_argument("--dry-run", action="store_true")
     build.add_argument(
         "--playwright-image",
-        default=os.environ.get("SPRITEBENCH_PLAYWRIGHT_IMAGE", ""),
+        default=os.environ.get("OPENCODE_BENCH_PLAYWRIGHT_IMAGE", ""),
         help="override the Playwright base image tag",
     )
     build.add_argument(
         "--opencode-version",
-        default=os.environ.get("SPRITEBENCH_OPENCODE_VERSION", ""),
+        default=os.environ.get("OPENCODE_BENCH_OPENCODE_VERSION", ""),
         help="override the OpenCode 2 version installed in the image",
     )
     build.set_defaults(func=cmd_build)

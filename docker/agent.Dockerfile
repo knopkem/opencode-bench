@@ -29,19 +29,19 @@ RUN CHROME="$(find /ms-playwright -path '*/chrome-linux*/chrome' -type f | head 
  && ln -sf /usr/local/bin/google-chrome /usr/local/bin/chromium
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/google-chrome
 
-WORKDIR /opt/spritebench
+WORKDIR /opt/opencode-bench
 
 # Seed dependencies, including @playwright/test. Browsers come from the base
 # image; --ignore-scripts avoids re-downloading them.
 COPY tasks/spriteforge-lite/seed/package.json tasks/spriteforge-lite/seed/package-lock.json ./
 RUN npm ci --ignore-scripts
 
-COPY docker/serve.mjs /opt/spritebench/serve.mjs
-COPY docker/entrypoint.sh /usr/local/bin/spritebench-entrypoint
-RUN chmod +x /usr/local/bin/spritebench-entrypoint
+COPY docker/serve.mjs /opt/opencode-bench/serve.mjs
+COPY docker/entrypoint.sh /usr/local/bin/opencode-bench-entrypoint
+RUN chmod +x /usr/local/bin/opencode-bench-entrypoint
 
 RUN mkdir -p /home/agent /home/agent/.config /work
 
 WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/spritebench-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/opencode-bench-entrypoint"]
 CMD ["bash"]
