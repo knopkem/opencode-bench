@@ -43,8 +43,10 @@ exits and is never visible to the model.
 ./bench.py status                # newest run, container, live engine status
 ./bench.py preview               # serve the newest built app
 ./bench.py preview --run RUN_ID  # serve a specific run
-./bench.py leaderboard --serve   # serve the all-runs leaderboard
+./bench.py leaderboard           # serve + open the all-runs leaderboard
+./bench.py leaderboard --write   # write leaderboard.html only
 ./bench.py rescore --run RUN_ID  # re-run build+tests on an existing workdir
+./bench.py backfill --all        # recompute effort/token metrics on existing runs
 ./bench.py report                # table plus failed test names
 ```
 
@@ -126,7 +128,7 @@ still run sequentially, so two shells on different providers can run their
   --variant all --keep-going
 
 # any shell, after or during
-./bench.py leaderboard --serve --open
+./bench.py leaderboard
 ```
 
 Do not run two shells against the same provider/model at the same time: they
@@ -213,6 +215,54 @@ count survives after the agent container exits.
 `reasoning_effort` and `compactions`. Console/report displays format wall time
 as `HH:MM:SS`.
 
+Each run also records `steps` (assistant steps in `agent.log`),
+`files_changed` (files added, removed or rewritten relative to the seed, ignoring
+build artefacts) and `outcome`, which separates a clean finish from a silent
+early exit:
+
+| outcome | meaning |
+|---|---|
+| `complete` | `COMPLETION.md` was written |
+| `gave_up` | exited on its own without `COMPLETION.md` and changed no files |
+| `incomplete` | exited on its own without `COMPLETION.md`, but did change files |
+| `timeout` | the hard timeout fired |
+| `stalled` | the idle watchdog fired |
+| `error` | the agent process exited non-zero |
+
+`watchdog: exit` alone is not a success signal: an agent that stops after two
+steps looks identical to one that finished.
+
+### Effort and token metrics
+
+Each run also breaks wall time into four source buckets plus overhead, using the
+timestamps in `opencode-data/opencode.db`:
+
+| field | meaning |
+|---|---|
+| `ttft_s` | request start → first model token (prefill/queue) |
+| `think_s` | explicit reasoning before the first output/tool block |
+| `output_s` | model writing code, text and tool-call arguments |
+| `tool_s` | shell/build/test/Playwright/file-write execution |
+| `other_s` | startup, gaps, compaction calls and completion grace |
+
+Tokens come from `agent.log` (`step_finish.part.tokens`) plus compaction rows in
+the session DB: `input_tokens`, `output_tokens`, `reasoning_tokens`,
+`cache_read_tokens`, `cache_write_tokens`, `compaction_tokens` and
+`total_tokens`. Derived fields include `think_share`, `tool_share`,
+`gen_tokens_per_s`, `tokens_per_step` and `cache_hit_rate`.
+
+Reasoning-token counts are provider-reported. A run can show a large `think_s`
+with `reasoning_tokens = 0`; in that case the **time split is authoritative** and
+the token count only means the provider did not report reasoning usage. The
+leaderboard uses time-based shares for cross-provider comparisons and labels the
+token breakdown as reported. `gen_tokens_per_s` is hardware-dependent for local
+models.
+
+`./bench.py backfill --all` recomputes these fields from existing artifacts
+(`agent.log` and `opencode.db`) without Docker or the OpenCode CLI. It updates
+`score.json`, `report.md`, `results.csv` and the leaderboard. Use
+`--run RUN_ID` for one run or `--dry-run` to preview.
+
 `./bench.py preview` serves the newest built `dist/` on
 `http://127.0.0.1:4173/`. With parallel runs, pass `--run RUN_ID` to choose a
 specific run. `./bench.py status` shows the newest run by `agent.log` mtime,
@@ -227,12 +277,13 @@ automatically after every scored or rescored run and is the recommended
 cross-run view when several shells are active.
 
 ```bash
-./bench.py leaderboard              # write leaderboard.html
-./bench.py leaderboard --open       # write it and open it in the browser
-./bench.py leaderboard --serve      # serve http://127.0.0.1:4174/?live=1
+./bench.py leaderboard              # serve http://127.0.0.1:4174/?live=1 and open it
+./bench.py leaderboard --write      # write leaderboard.html only
+./bench.py leaderboard --port 8080  # serve and open on another port
 ```
 
-The served page refreshes every 30 seconds; add `--open` to launch the browser.
+The default command serves the page and opens it in the browser. It refreshes
+every 30 seconds. Use `--write` for scripting or when you only need the file.
 It reads a locked snapshot of `results.csv`, so it is safe to leave running
 while parallel shells finish. The server only serves the leaderboard page, not
 the project tree, so hidden tests and reference code are not exposed.
@@ -245,10 +296,20 @@ speed = fastest wall / run wall
 compactions = 1 / (1 + count)
 ```
 
-Quality carries the most weight, then wall time, then compactions. Ties break
-on quality, wall time, compactions and run ID. The page also shows the raw
-quality, P0/P1/P2 counts, `HH:MM:SS` wall time, compaction count and eligibility
-for each run.
+Quality carries the most weight, then wall time, then compactions. Runs that
+fail eligibility stay on the board but keep only 75% of their score, so they
+rank below quality runs instead of being hidden. Ties break on quality, wall
+time, compactions and run ID. The page also shows the raw quality, P0/P1/P2
+counts, `HH:MM:SS` wall time, compaction count and eligibility for each run.
+
+Each row has one **Effort** column: a stacked bar (TTFT, thinking, model output,
+tool execution, other), coloured percentages underneath, then total tokens and
+generation tok/s. The colour legend is above the table; hover the effort cell
+for the full breakdown with per-bucket tokens, or click it for the larger detail
+dialog with step distribution, cache hit rate and cost. A collapsible **Model medians** table
+below the main table aggregates tokens and effort by model/variant. Missing
+metrics render as `—`. The token breakdown is provider-reported, so a thinking
+phase with zero reasoning tokens is annotated rather than shown as no thinking.
 
 The leaderboard has **Provider** and **Reasoning** filter drop-downs. It opens
 sorted by **Score**, highest first. Click any sortable column header to sort by
@@ -284,8 +345,10 @@ quality.
 4 hours hard and 30 minutes without output. They are safety valves, not scoring
 caps.
 
-The perf-proxy hook (`agent_think_s`, `tool_s`, token/TTFT, prefill/decode) is
-not wired yet. `wall_s`, quality, build and test results are.
+The effort breakdown (`ttft_s`, `think_s`, `output_s`, `tool_s`), token totals
+and throughput are derived from `agent.log` and the persisted OpenCode session
+DB. The older perf-proxy idea is optional; it is not required for these metrics.
+`wall_s`, quality, build and test results remain the scoring inputs.
 
 ## Isolation
 
@@ -329,5 +392,6 @@ leaderboard.html             generated all-runs leaderboard
 - The current hidden suite covers canvas/drawing, continuous pencil/eraser
   drags, palette, layers, frames, playback, persistence, PNG export, onion
   opacity, keyboard/focus behaviour, layout and edge cases.
-- `./bench.py leaderboard` builds a ranked all-runs page and can serve it on
-  `127.0.0.1:4174` for live overnight monitoring.
+- `./bench.py leaderboard` serves and opens a ranked all-runs page on
+  `127.0.0.1:4174` for live overnight monitoring; `--write` only writes the
+  HTML file.

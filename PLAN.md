@@ -19,8 +19,10 @@ The Dockerfile passes `docker build --check`. The full image build was not
 completed on this machine: the Playwright base-image pull was too slow on this
 network. The first real step is `./bench.py build` then `./bench.py check`.
 
-The perf proxy (agent think/tool time, token and TTFT columns) is not wired in
-v0; `wall_s`, quality, build and test results are.
+The effort breakdown (model TTFT, thinking, output, tool execution) and token
+columns are derived from `agent.log` and the persisted OpenCode session DB. The
+perf proxy remains optional; `wall_s`, quality, build and test results remain
+the scoring inputs.
 
 The question this answers is not "which model is best?" It is:
 
@@ -344,10 +346,15 @@ opencode-bench/
 | `quality` | weighted pass rate |
 | `major_issues`, `minor_issues` | failed P1/P2 tests |
 | `completion`, `agent_ok`, `self_test_runs` | agent log |
+| `ttft_s`, `think_s`, `output_s`, `tool_s`, `other_s` | OpenCode session DB timestamps |
+| `input_tokens`, `output_tokens`, `reasoning_tokens`, cache | `step_finish` in `agent.log` |
+| `gen_tokens_per_s`, `tokens_per_step`, shares | derived |
 | `report`, `score.json` | run artifacts |
 
-The perf proxy (model think/tool time, tokens, TTFT, prefill/decode) is
-designed but not wired in v0. `wall_s`, quality, build and test results are.
+Effort/token metrics are persisted in `score.json` and `results.csv` and can be
+recomputed for existing runs with `./bench.py backfill --all`. They are
+diagnostic, not part of the score. Reasoning tokens are provider-reported; use
+the time split for cross-provider comparisons.
 
 ### Agent self-testing is part of the task
 
@@ -375,10 +382,11 @@ app; it cannot read the acceptance tests.
 subtract it; that would reward a model for shipping blind. But record the
 breakdown so you can see what the time means:
 
-- `agent_think_s` — sum of model request durations from the proxy;
-- `tool_s` — `wall_s - agent_think_s` (browser, build, edits, test runs);
-- `time_to_first_build` — first successful `npm run build`;
-- `time_to_completion` — `COMPLETION.md` or process exit.
+- `ttft_s` / `think_s` / `output_s` — request prefill, reasoning, and model
+  code/text generation, from session message and content-block timestamps;
+- `tool_s` — build, test, browser, shell and edit execution (not model coding);
+- `other_s` — startup, gaps, compaction calls and completion grace;
+- `time_to_first_build` / `time_to_completion` — optional future additions.
 
 A model that spends ten minutes debugging and still fails loses on both quality
 and time. A model that spends ten minutes debugging and passes has a real
@@ -506,7 +514,8 @@ The only interface is:
 ./bench.py run --model provider/model --goal balanced
 ./bench.py status
 ./bench.py report
-./bench.py leaderboard --serve
+./bench.py leaderboard
+./bench.py leaderboard --write  # write leaderboard.html without serving
 ```
 
 `./bench.py models` prints provider counts from the local `opencode models`
@@ -639,10 +648,13 @@ implementer and the higher-quality one for the planner." That is the point.
 
 For a single cross-run view, `./bench.py leaderboard` renders all runs from
 `results.csv` into `leaderboard.html`. It ranks runs by a transparent score:
-80% quality, 15% relative speed, 5% compactions (`1 / (1 + count)`). The page
-shows the raw metrics too, so the weighted rank never hides the quality/time
-tradeoff. `--serve` hosts it on `127.0.0.1:4174`; the page can auto-refresh for
-overnight monitoring. Only the generated page is served, not the project tree.
+80% quality, 15% relative speed, 5% compactions (`1 / (1 + count)`). Runs that
+fail eligibility keep 75% of that score, so they stay visible but rank below
+quality runs. The page shows the raw metrics too, so the weighted rank never
+hides the quality/time tradeoff. By default it serves and opens the page on
+`127.0.0.1:4174`; `--write` only writes the HTML file. The page can auto-refresh
+for overnight monitoring. Only the generated page is served, not the project
+tree.
 
 ## 7. Experiment design
 
