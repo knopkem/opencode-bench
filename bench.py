@@ -72,7 +72,7 @@ LEADERBOARD_WEIGHTS = {"quality": 0.80, "wall": 0.15, "compactions": 0.05}
 # score, so a low-quality or broken run drops below quality runs instead of
 # outranking them on raw speed. Tune this to make the penalty larger or smaller.
 LEADERBOARD_INELIGIBLE_FACTOR = 0.75
-METRICS_VERSION = 1
+METRICS_VERSION = 2
 #: Time and token fields derived from `agent.log` and `opencode-data/opencode.db`.
 EFFORT_FIELDS = [
     "span_s",
@@ -96,6 +96,8 @@ EFFORT_FIELDS = [
     "cache_write_tokens",
     "compaction_tokens",
     "total_tokens",
+    "max_request_tokens",
+    "mean_request_tokens",
     "cost_usd",
     "think_share",
     "output_share",
@@ -547,6 +549,8 @@ def read_agent_usage(log_path: Path) -> dict:
         "reasoning_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "max_request_tokens": None,
+        "mean_request_tokens": None,
         "cost_usd": 0.0,
         "step_median_s": None,
         "step_p90_s": None,
@@ -559,6 +563,7 @@ def read_agent_usage(log_path: Path) -> dict:
 
     starts: dict[str, int] = {}
     durations: list[float] = []
+    request_tokens: list[int] = []
     for line in lines:
         line = line.strip()
         if not line.startswith("{"):
@@ -589,12 +594,20 @@ def read_agent_usage(log_path: Path) -> dict:
             usage["reasoning_tokens"] += int(tokens.get("reasoning") or 0)
             usage["cache_read_tokens"] += int(cash.get("read") or 0)
             usage["cache_write_tokens"] += int(cash.get("write") or 0)
+            request_tokens.append(
+                int(tokens.get("input") or 0)
+                + int(cash.get("read") or 0)
+                + int(cash.get("write") or 0)
+            )
             try:
                 usage["cost_usd"] += float(part.get("cost") or 0)
             except (TypeError, ValueError):
                 pass
 
     usage["available"] = True
+    if request_tokens:
+        usage["max_request_tokens"] = max(request_tokens)
+        usage["mean_request_tokens"] = sum(request_tokens) / len(request_tokens)
     if durations:
         usage["step_median_s"] = statistics.median(durations)
         usage["step_p90_s"] = percentile(durations, 0.9)
@@ -642,6 +655,8 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
         "db_cache_read_tokens": 0,
         "db_cache_write_tokens": 0,
         "assistant_steps": 0,
+        "max_request_tokens": None,
+        "mean_request_tokens": None,
     }
     database = data_dir / "opencode.db"
     if not database.exists():
@@ -678,6 +693,7 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
         total_think = 0.0
         total_output = 0.0
         tool_totals = {"shell": 0.0, "write": 0.0, "read": 0.0, "other": 0.0}
+        request_tokens: list[int] = []
 
         for message_type, _seq, row_created, raw in rows:
             try:
@@ -719,6 +735,11 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
             result["db_reasoning_tokens"] += _json_int(tokens.get("reasoning"))
             result["db_cache_read_tokens"] += _json_int(cash.get("read"))
             result["db_cache_write_tokens"] += _json_int(cash.get("write"))
+            request_tokens.append(
+                _json_int(tokens.get("input"))
+                + _json_int(cash.get("read"))
+                + _json_int(cash.get("write"))
+            )
 
             if not created or not completed:
                 continue
@@ -791,6 +812,9 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
         result["tool_write_s"] = tool_totals["write"]
         result["tool_read_s"] = tool_totals["read"]
         result["tool_other_s"] = tool_totals["other"]
+        if request_tokens:
+            result["max_request_tokens"] = max(request_tokens)
+            result["mean_request_tokens"] = sum(request_tokens) / len(request_tokens)
         result["available"] = True
         return result
     finally:
@@ -826,6 +850,12 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
         cost_usd = 0.0
         steps = 0
 
+    max_request_tokens = usage.get("max_request_tokens")
+    mean_request_tokens = usage.get("mean_request_tokens")
+    if max_request_tokens is None and db_available:
+        max_request_tokens = session.get("max_request_tokens")
+        mean_request_tokens = session.get("mean_request_tokens")
+
     compaction_tokens = int(session.get("compaction_tokens") or 0) if db_available else 0
     if db_available:
         cost_usd += float(session.get("compaction_cost_usd") or 0)
@@ -847,6 +877,8 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
         "cache_write_tokens": cache_write_tokens,
         "compaction_tokens": compaction_tokens,
         "total_tokens": total_tokens,
+        "max_request_tokens": max_request_tokens,
+        "mean_request_tokens": mean_request_tokens,
         "cost_usd": round(cost_usd, 6),
         "step_median_s": usage.get("step_median_s"),
         "step_p90_s": usage.get("step_p90_s"),
@@ -1306,7 +1338,9 @@ def render_effort_lines(meta: dict) -> list[str]:
     gen_text = f"{generation:.1f} tok/s" if generation is not None else "—"
     lines += [
         "",
-        f"- tokens: {format_tokens(meta.get('input_tokens'))} in, "
+        f"- request context: peak {format_tokens(meta.get('max_request_tokens'))}, "
+        f"mean {format_tokens(meta.get('mean_request_tokens'))} prompt tokens per request",
+        f"- cumulative tokens: {format_tokens(meta.get('input_tokens'))} in, "
         f"{format_tokens(meta.get('output_tokens'))} out, "
         f"{format_tokens(meta.get('reasoning_tokens'))} reasoning (reported), "
         f"{format_tokens(meta.get('cache_read_tokens'))} cache read, "
@@ -1490,6 +1524,7 @@ def print_summary(meta: dict, score: dict) -> None:
         f" · {format_tokens(meta.get('output_tokens'))} out"
         f" · {format_tokens(meta.get('reasoning_tokens'))} reason"
         f" · {format_tokens(meta.get('cache_read_tokens'))} cache"
+        f" · peak {format_tokens(meta.get('max_request_tokens'))} req tok"
         f" · {gen_text} tok/s"
     )
     print(f"  report {meta['report']}")
@@ -2065,6 +2100,8 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 f"  source {old_source} -> {meta.get('metrics_source')}\n"
                 f"  think  {format_percent(old_think)} -> "
                 f"{format_percent(meta.get('think_share'))}\n"
+                f"  request {format_tokens(meta.get('max_request_tokens'))} peak / "
+                f"{format_tokens(meta.get('mean_request_tokens'))} mean tok\n"
                 f"  tokens {format_tokens(meta.get('total_tokens'))} "
                 f"({format_tokens(meta.get('reasoning_tokens'))} reasoning)\n"
                 f"  generation {format_tokens(meta.get('gen_tokens_per_s'))} tok/s"
@@ -2080,7 +2117,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             f"{run_id}  think {format_percent(meta.get('think_share'))}"
             f"  out {format_percent(meta.get('output_share'))}"
             f"  tools {format_percent(meta.get('tool_share'))}"
-            f"  tokens {format_tokens(meta.get('total_tokens'))}"
+            f"  req {format_tokens(meta.get('max_request_tokens'))} peak"
             f"  {format_tokens(meta.get('gen_tokens_per_s'))} tok/s"
         )
 
@@ -2301,6 +2338,8 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
                 "tool_s": metric_value(row, "tool_s"),
                 "other_s": metric_value(row, "other_s"),
                 "tokens": metric_value(row, "total_tokens"),
+                "max_request_tokens": metric_value(row, "max_request_tokens"),
+                "mean_request_tokens": metric_value(row, "mean_request_tokens"),
                 "reasoning_tokens": metric_value(row, "reasoning_tokens"),
                 "toks": metric_value(row, "gen_tokens_per_s"),
             }
@@ -2409,8 +2448,8 @@ def _render_effort_cell(entry: dict, escaped) -> str:
         if share is not None
     )
     meta_parts = []
-    if entry.get("tokens") is not None:
-        meta_parts.append(f"{format_tokens(entry['tokens'])} tok")
+    if entry.get("max_request_tokens") is not None:
+        meta_parts.append(f"peak {format_tokens(entry['max_request_tokens'])} req tok")
     if entry.get("toks") is not None:
         meta_parts.append(f"{float(entry['toks']):.0f} tok/s")
     meta = (
@@ -2452,7 +2491,7 @@ def _render_model_medians(entries: list[dict], escaped) -> str:
         think = median_or_none(values(items, "think_share"))
         output = median_or_none(values(items, "output_share"))
         tool = median_or_none(values(items, "tool_share"))
-        tokens = median_or_none(values(items, "tokens"))
+        tokens = median_or_none(values(items, "max_request_tokens"))
         reason = median_or_none(values(items, "reasoning_tokens"))
         toks = median_or_none(values(items, "toks"))
         rows_html.append(
@@ -2476,7 +2515,7 @@ def _render_model_medians(entries: list[dict], escaped) -> str:
         '<div class="table-wrap"><table class="medians-table"><thead><tr>'
         "<th>Model</th><th>Variant</th><th>Thinking</th><th>Runs</th>"
         "<th>Quality med</th><th>Wall med</th><th>Think% med</th>"
-        "<th>Out% med</th><th>Tool% med</th><th>Tokens med</th>"
+        "<th>Out% med</th><th>Tool% med</th><th>Peak req tok med</th>"
         "<th>Reason tok med</th><th>tok/s med</th>"
         "</tr></thead><tbody>"
         + "".join(rows_html)
@@ -2597,6 +2636,8 @@ def _write_leaderboard_unlocked() -> Path:
             f' data-counts="{counts_rank}" data-wall="{entry["wall"]:.6f}"'
             f' data-thinkpct="{_data_attr(think_share * 100 if think_share is not None else None)}"'
             f' data-tokens="{_data_attr(tokens_total)}"'
+            f' data-tokens-max="{_data_attr(row.get("max_request_tokens"))}"'
+            f' data-tokens-mean="{_data_attr(row.get("mean_request_tokens"))}"'
             f' data-toks="{_data_attr(toks)}"'
             f' data-agent="{_data_attr(row.get("agent_s"))}"'
             f' data-ttft="{_data_attr(row.get("ttft_s"))}"'
@@ -2833,11 +2874,13 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
     <span><i style="background:var(--other)"></i>startup / gaps</span>
   </div>
   <p style="margin:8px 0 0">Effort is derived from <code>opencode.db</code> timings,
-  not from a model proxy. Token counts are provider-reported; a thinking phase
-  with <b>0 reasoning tokens</b> means the provider did not report them, not that
-  the model did not think. Hover the effort cell for the full breakdown,
-  including tokens per bucket (tool execution has no model tokens; tool output
-  enters the next prompt). tok/s is hardware-dependent.</p>
+  not from a model proxy. Request tokens are the per-request prompt size
+  (input + cache reads/writes); peak and mean are shown rather than cumulative
+  run totals, which can exceed the context window. Token counts are
+  provider-reported; a thinking phase with <b>0 reasoning tokens</b> means the
+  provider did not report them, not that the model did not think. Hover the
+  effort cell for the breakdown, or click for step distribution, cache hit rate
+  and cost. tok/s is hardware-dependent.</p>
 </div>
 <div class="toolbar">
   <input id="filter" type="search" placeholder="Filter model, variant, thinking or run id">
@@ -3043,14 +3086,9 @@ function effortBodyHtml(row) {{
       ['Tool execution', fmtSec(data.tool)],
       ['Other', fmtSec(data.other)]
     ])}}</dl></div>
-    <div><h3>Tokens</h3><dl>${{detailList([
-      ['Total', fmtTok(data.tokens)],
-      ['Input', fmtTok(data.tokensIn)],
-      ['Output', fmtTok(data.tokensOut)],
-      ['Reasoning (reported)', fmtTok(data.tokensReason)],
-      ['Cache read', fmtTok(data.tokensCache)],
-      ['Cache write', fmtTok(data.tokensCacheWrite)],
-      ['Compaction', fmtTok(data.tokensCompaction)]
+    <div><h3>Request tokens</h3><dl>${{detailList([
+      ['Peak request', fmtTok(data.tokensMax)],
+      ['Mean request', fmtTok(data.tokensMean)]
     ])}}</dl></div>
     <div><h3>Steps</h3><dl>${{detailList([
       ['Steps', fmtNum(data.steps)],
@@ -3075,14 +3113,13 @@ function effortTipHtml(row) {{
   const data = row.dataset;
   const wall = Number(data.wall || 0);
   const share = (value) => wall > 0 ? `${{Math.round(Number(value || 0) / wall * 100)}}%` : '—';
-  const promptTokens = Number(data.tokensIn || 0) + Number(data.tokensCache || 0) + Number(data.tokensCacheWrite || 0);
   const reasoning = Number(data.tokensReason || 0);
   const thinkTokens = reasoning
     ? `${{fmtTok(reasoning)}} reasoning`
     : (Number(data.think || 0) > 0 ? 'not reported' : '—');
   const compaction = Number(data.tokensCompaction || 0);
   const rows = [
-    ['ttft', 'TTFT', data.ttft, `${{fmtTok(promptTokens)}} prompt tok`],
+    ['ttft', 'TTFT', data.ttft, '—'],
     ['think', 'Thinking', data.think, thinkTokens],
     ['out', 'Output', data.output, `${{fmtTok(data.tokensOut)}} output tok`],
     ['tool', 'Tools', data.tool, 'no model tokens'],
@@ -3099,7 +3136,8 @@ function effortTipHtml(row) {{
     : '';
   return `<div class="tip-title">Effort · ${{fmtSec(data.wall)}}</div>`
     + `<table class="tip-table">${{rowsHtml}}</table>`
-    + `<div class="tip-footer">${{fmtTok(data.tokens)}} tok · ${{fmtNum(data.toks, 1)}} tok/s`
+    + `<div class="tip-footer">peak ${{fmtTok(data.tokensMax)}} / mean ${{fmtTok(data.tokensMean)}} req tok`
+    + ` · ${{fmtNum(data.toks, 1)}} tok/s`
     + ` · ${{fmtNum(data.steps)}} steps · ${{fmtPct(data.cacheRate)}} cache</div>`
     + caveat;
 }}
@@ -3262,7 +3300,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines = [
         "# opencode-bench report",
         "",
-        "| model | thinking | runs | quality med | wall med | think% med | tokens med | tok/s med | compactions med | minor med | eligible |",
+        "| model | thinking | runs | quality med | wall med | think% med | req tok peak med | tok/s med | compactions med | minor med | eligible |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for model, items in sorted(by_model.items()):
@@ -3279,7 +3317,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             }
         )
         think = _metric_median(items, "think_share")
-        tokens = _metric_median(items, "total_tokens")
+        tokens = _metric_median(items, "max_request_tokens")
         toks = _metric_median(items, "gen_tokens_per_s")
         toks_text = f"{toks:.0f}" if toks is not None else "—"
         lines.append(
@@ -3301,7 +3339,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         "",
         "## Effort by variant",
         "",
-        "| model | variant | thinking | runs | wall med | think% med | out% med | tool% med | tokens med | tokens mean | reason tok med | tok/s med |",
+        "| model | variant | thinking | runs | wall med | think% med | out% med | tool% med | req tok peak med | req tok mean | reason tok med | tok/s med |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for (model, variant, thinking), items in sorted(by_variant.items()):
@@ -3314,17 +3352,20 @@ def cmd_report(args: argparse.Namespace) -> int:
             f"{format_percent(_metric_median(items, 'think_share'))} | "
             f"{format_percent(_metric_median(items, 'output_share'))} | "
             f"{format_percent(_metric_median(items, 'tool_share'))} | "
-            f"{format_tokens(_metric_median(items, 'total_tokens'))} | "
-            f"{format_tokens(_metric_mean(items, 'total_tokens'))} | "
+            f"{format_tokens(_metric_median(items, 'max_request_tokens'))} | "
+            f"{format_tokens(_metric_mean(items, 'mean_request_tokens'))} | "
             f"{format_tokens(_metric_median(items, 'reasoning_tokens'))} | "
             f"{toks_text} |"
         )
 
     lines += [
         "",
-        "Tokens include cache reads/writes and compaction rows; see `results.csv` "
-        "for `input_tokens`, `output_tokens`, `reasoning_tokens` and cache columns. "
-        "Reasoning tokens are provider-reported.",
+        "Request tokens are the per-request prompt size (input + cache reads/writes); "
+        "peak is the largest single request. Cumulative token fields in "
+        "`results.csv` include cache reads/writes and can exceed the context window; "
+        "they are not context pressure. Reasoning tokens are provider-reported. "
+        "See `results.csv` for `input_tokens`, `output_tokens`, `reasoning_tokens`, "
+        "`cache_read_tokens` and `cache_write_tokens`.",
         "",
         "Full rows: `results.csv`. Per-run artifacts: `runs/<run_id>/`.",
         "",

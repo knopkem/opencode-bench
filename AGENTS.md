@@ -52,6 +52,19 @@ check: `python3 -m py_compile bench.py`.
 - Hidden tests and the reference are mounted only after the agent exits. Never
   copy either into the seed, `PROMPT.md`, the image, or an agent workdir.
 
+## Effort metrics
+
+- `ttft_s`, `think_s`, `output_s`, `tool_s` and `other_s` are **sums across all
+  assistant requests**, not per-request values. `ttft_s / steps` is the average
+  time to first token; shares are relative to `wall_s`.
+- Token fields are cumulative across assistant steps and include cache reads and
+  writes. `total_tokens` can therefore exceed the model's context window without
+  any compaction. Compaction depends on one request's context, not the run total.
+  Use `max_request_tokens` / `mean_request_tokens` for per-request context size.
+- `backfill` recomputes these fields from `agent.log` and
+  `opencode-data/opencode.db`; it cannot reconstruct timing for runs whose DB
+  was not persisted (`metrics_source=log`).
+
 ## Seed / prompt / image coupling
 
 - Root `PROMPT.md` is copied into every run as `PROMPT.md`; the seed has its own

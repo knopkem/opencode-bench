@@ -239,17 +239,24 @@ timestamps in `opencode-data/opencode.db`:
 
 | field | meaning |
 |---|---|
-| `ttft_s` | request start → first model token (prefill/queue) |
+| `ttft_s` | sum over all assistant requests of request start → first model token (prefill/queue); divide by `steps` for the per-request average |
 | `think_s` | explicit reasoning before the first output/tool block |
 | `output_s` | model writing code, text and tool-call arguments |
 | `tool_s` | shell/build/test/Playwright/file-write execution |
 | `other_s` | startup, gaps, compaction calls and completion grace |
+| `max_request_tokens` | largest per-request prompt size (input + cache reads/writes) |
+| `mean_request_tokens` | mean per-request prompt size |
 
 Tokens come from `agent.log` (`step_finish.part.tokens`) plus compaction rows in
 the session DB: `input_tokens`, `output_tokens`, `reasoning_tokens`,
 `cache_read_tokens`, `cache_write_tokens`, `compaction_tokens` and
-`total_tokens`. Derived fields include `think_share`, `tool_share`,
-`gen_tokens_per_s`, `tokens_per_step` and `cache_hit_rate`.
+`total_tokens`. These token fields are **cumulative across assistant steps** and
+include cache reads/writes, so `total_tokens` can exceed the model's context
+window even when no compaction occurred. The context limit applies to one
+request, not to the run total. `max_request_tokens` and `mean_request_tokens`
+report the per-request prompt size (input + cache reads/writes), which is the
+relevant context-pressure metric. Derived fields include `think_share`,
+`tool_share`, `gen_tokens_per_s`, `tokens_per_step` and `cache_hit_rate`.
 
 Reasoning-token counts are provider-reported. A run can show a large `think_s`
 with `reasoning_tokens = 0`; in that case the **time split is authoritative** and
@@ -303,13 +310,14 @@ time, compactions and run ID. The page also shows the raw quality, P0/P1/P2
 counts, `HH:MM:SS` wall time, compaction count and eligibility for each run.
 
 Each row has one **Effort** column: a stacked bar (TTFT, thinking, model output,
-tool execution, other), coloured percentages underneath, then total tokens and
-generation tok/s. The colour legend is above the table; hover the effort cell
-for the full breakdown with per-bucket tokens, or click it for the larger detail
-dialog with step distribution, cache hit rate and cost. A collapsible **Model medians** table
-below the main table aggregates tokens and effort by model/variant. Missing
-metrics render as `—`. The token breakdown is provider-reported, so a thinking
-phase with zero reasoning tokens is annotated rather than shown as no thinking.
+tool execution, other), coloured percentages underneath, then peak request
+tokens and generation tok/s. The colour legend is above the table; hover the
+effort cell for the full breakdown with per-bucket time and peak/mean request
+tokens, or click it for the larger detail dialog with step distribution, cache
+hit rate and cost. A collapsible **Model medians** table below the main table
+aggregates tokens and effort by model/variant. Missing metrics render as `—`.
+The token breakdown is provider-reported, so a thinking phase with zero
+reasoning tokens is annotated rather than shown as no thinking.
 
 The leaderboard has **Provider** and **Reasoning** filter drop-downs. It opens
 sorted by **Score**, highest first. Click any sortable column header to sort by
@@ -345,9 +353,10 @@ quality.
 4 hours hard and 30 minutes without output. They are safety valves, not scoring
 caps.
 
-The effort breakdown (`ttft_s`, `think_s`, `output_s`, `tool_s`), token totals
-and throughput are derived from `agent.log` and the persisted OpenCode session
-DB. The older perf-proxy idea is optional; it is not required for these metrics.
+The effort breakdown (`ttft_s`, `think_s`, `output_s`, `tool_s`), request-token
+and cumulative token metrics, and throughput are derived from `agent.log` and
+the persisted OpenCode session DB. The older perf-proxy idea is optional; it is
+not required for these metrics.
 `wall_s`, quality, build and test results remain the scoring inputs.
 
 ## Isolation
