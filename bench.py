@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import hashlib
 import html
 import io
 import json
@@ -67,6 +68,46 @@ REASONING_ORDER = {
 }
 LEADERBOARD_PATH = ROOT / "leaderboard.html"
 LEADERBOARD_WEIGHTS = {"quality": 0.80, "wall": 0.15, "compactions": 0.05}
+# Ineligible runs stay on the leaderboard but keep only this fraction of their
+# score, so a low-quality or broken run drops below quality runs instead of
+# outranking them on raw speed. Tune this to make the penalty larger or smaller.
+LEADERBOARD_INELIGIBLE_FACTOR = 0.75
+METRICS_VERSION = 1
+#: Time and token fields derived from `agent.log` and `opencode-data/opencode.db`.
+EFFORT_FIELDS = [
+    "span_s",
+    "agent_s",
+    "ttft_s",
+    "think_s",
+    "output_s",
+    "tool_s",
+    "other_s",
+    "tool_shell_s",
+    "tool_write_s",
+    "tool_read_s",
+    "tool_other_s",
+    "step_median_s",
+    "step_p90_s",
+    "step_max_s",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "compaction_tokens",
+    "total_tokens",
+    "cost_usd",
+    "think_share",
+    "output_share",
+    "tool_share",
+    "ttft_share",
+    "other_share",
+    "gen_tokens_per_s",
+    "tokens_per_step",
+    "cache_hit_rate",
+    "metrics_source",
+    "metrics_version",
+]
 CSV_FIELDS = [
     "run_id",
     "timestamp",
@@ -94,6 +135,10 @@ CSV_FIELDS = [
     "compactions",
     "watchdog",
     "completion",
+    "outcome",
+    "steps",
+    *EFFORT_FIELDS,
+    "files_changed",
     "agent_ok",
     "self_test_runs",
     "report",
@@ -117,6 +162,70 @@ def format_duration(seconds: float | str) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_optional_duration(seconds: object) -> str:
+    if seconds is None or seconds == "":
+        return "—"
+    try:
+        return format_duration(float(seconds))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def format_tokens(value: object) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not number:
+        return "0"
+    for unit, size in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if abs(number) >= size:
+            text = f"{number / size:.1f}".rstrip("0").rstrip(".")
+            return f"{text}{unit}"
+    return f"{number:.0f}"
+
+
+def format_percent(value: object) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+
+def metric_value(row: dict, key: str) -> float | None:
+    """Read an optional numeric metric from a CSV row or score metadata."""
+    value = row.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
+def median_or_none(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
+
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -415,6 +524,482 @@ def count_compactions(data_dir: Path) -> int:
         return 0
 
 
+#: Build artefacts and caches that never count as agent edits.
+WORKDIR_ARTEFACTS = {
+    "node_modules",
+    ".git",
+    "dist",
+    "test-results",
+    "playwright-report",
+    "coverage",
+    ".vite",
+    ".cache",
+}
+
+
+def read_agent_usage(log_path: Path) -> dict:
+    """Token usage and step timings from an `opencode run --format json` log."""
+    usage = {
+        "available": False,
+        "steps": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_usd": 0.0,
+        "step_median_s": None,
+        "step_p90_s": None,
+        "step_max_s": None,
+    }
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return usage
+
+    starts: dict[str, int] = {}
+    durations: list[float] = []
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        part = event.get("part") or {}
+        if event_type == "step_start":
+            message_id = str(part.get("messageID") or part.get("id") or "")
+            if message_id:
+                starts[message_id] = int(event.get("timestamp") or 0)
+        elif event_type == "step_finish":
+            usage["steps"] += 1
+            message_id = str(part.get("messageID") or "")
+            started = starts.pop(message_id, None)
+            finished = int(event.get("timestamp") or 0)
+            if started and finished and finished >= started:
+                durations.append((finished - started) / 1000.0)
+            tokens = part.get("tokens") or {}
+            cash = tokens.get("cache") or {}
+            usage["input_tokens"] += int(tokens.get("input") or 0)
+            usage["output_tokens"] += int(tokens.get("output") or 0)
+            usage["reasoning_tokens"] += int(tokens.get("reasoning") or 0)
+            usage["cache_read_tokens"] += int(cash.get("read") or 0)
+            usage["cache_write_tokens"] += int(cash.get("write") or 0)
+            try:
+                usage["cost_usd"] += float(part.get("cost") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    usage["available"] = True
+    if durations:
+        usage["step_median_s"] = statistics.median(durations)
+        usage["step_p90_s"] = percentile(durations, 0.9)
+        usage["step_max_s"] = max(durations)
+    return usage
+
+
+def count_agent_steps(log_path: Path) -> int:
+    """Count assistant steps in an `opencode run --format json` log."""
+    return int(read_agent_usage(log_path).get("steps") or 0)
+
+
+def _json_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
+    """Time-split metrics from the OpenCode SQLite session database.
+
+    The database records each assistant message with `created`, `streamed` and
+    `completed` timestamps, plus per-content-block timings. Reasoning and tool
+    blocks are children of the same message, so this separates thinking from
+    tool execution without a model proxy.
+    """
+    result = {
+        "available": False,
+        "span_s": None,
+        "agent_s": None,
+        "ttft_s": None,
+        "think_s": None,
+        "output_s": None,
+        "tool_s": None,
+        "tool_shell_s": None,
+        "tool_write_s": None,
+        "tool_read_s": None,
+        "tool_other_s": None,
+        "compaction_tokens": 0,
+        "compaction_cost_usd": 0.0,
+        "db_input_tokens": 0,
+        "db_output_tokens": 0,
+        "db_reasoning_tokens": 0,
+        "db_cache_read_tokens": 0,
+        "db_cache_write_tokens": 0,
+        "assistant_steps": 0,
+    }
+    database = data_dir / "opencode.db"
+    if not database.exists():
+        return result
+
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return result
+
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "select name from sqlite_master where type = 'table'"
+            )
+        }
+        if "session_message" not in tables:
+            connection.close()
+            return result
+        rows = connection.execute(
+            "select type, seq, time_created, data from session_message "
+            "order by time_created, seq"
+        ).fetchall()
+    except sqlite3.Error:
+        connection.close()
+        return result
+
+    try:
+        first_user: int | None = None
+        last_assistant: int | None = None
+        total_agent = 0.0
+        total_ttft = 0.0
+        total_think = 0.0
+        total_output = 0.0
+        tool_totals = {"shell": 0.0, "write": 0.0, "read": 0.0, "other": 0.0}
+
+        for message_type, _seq, row_created, raw in rows:
+            try:
+                data = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            times = data.get("time") or {}
+            created = int(times.get("created") or row_created or 0)
+            completed = int(times.get("completed") or 0)
+            streamed = int(times.get("streamed") or completed or 0)
+
+            if message_type == "user" and created:
+                first_user = created if first_user is None else min(first_user, created)
+                continue
+            if message_type == "compaction":
+                tokens = data.get("tokens") or {}
+                cash = tokens.get("cache") or {}
+                result["compaction_tokens"] += sum(
+                    _json_int(tokens.get(key))
+                    for key in ("input", "output", "reasoning")
+                )
+                result["compaction_tokens"] += _json_int(cash.get("read"))
+                result["compaction_tokens"] += _json_int(cash.get("write"))
+                try:
+                    result["compaction_cost_usd"] += float(data.get("cost") or 0)
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if message_type != "assistant":
+                continue
+
+            result["assistant_steps"] += 1
+            tokens = data.get("tokens") or {}
+            cash = tokens.get("cache") or {}
+            result["db_input_tokens"] += _json_int(tokens.get("input"))
+            result["db_output_tokens"] += _json_int(tokens.get("output"))
+            result["db_reasoning_tokens"] += _json_int(tokens.get("reasoning"))
+            result["db_cache_read_tokens"] += _json_int(cash.get("read"))
+            result["db_cache_write_tokens"] += _json_int(cash.get("write"))
+
+            if not created or not completed:
+                continue
+            if completed:
+                last_assistant = completed if last_assistant is None else max(
+                    last_assistant, completed
+                )
+            total_agent += max(0, completed - created) / 1000.0
+
+            timed: list[tuple[int, dict, dict]] = []
+            for block in data.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                block_time = block.get("time") or {}
+                start = int(block_time.get("created") or 0)
+                if start:
+                    timed.append((start, block_time, block))
+            if not timed:
+                continue
+            timed.sort(key=lambda item: item[0])
+
+            first_block = timed[0][0]
+            total_ttft += max(0, first_block - created) / 1000.0
+
+            reasoning = [item for item in timed if item[2].get("type") == "reasoning"]
+            if reasoning:
+                reasoning_start = min(item[0] for item in reasoning)
+                boundary = min(
+                    (
+                        item[0]
+                        for item in timed
+                        if item[2].get("type") != "reasoning"
+                        and item[0] >= reasoning_start
+                    ),
+                    default=streamed or reasoning_start,
+                )
+                boundary = max(reasoning_start, min(boundary, streamed or boundary))
+                total_think += max(0, boundary - reasoning_start) / 1000.0
+                if streamed:
+                    total_output += max(0, streamed - boundary) / 1000.0
+            elif streamed:
+                total_output += max(0, streamed - first_block) / 1000.0
+
+            for _start, block_time, block in timed:
+                if block.get("type") != "tool":
+                    continue
+                ran = int(block_time.get("ran") or 0)
+                finished = int(block_time.get("completed") or ran or 0)
+                if not ran or not finished or finished < ran:
+                    continue
+                duration = (finished - ran) / 1000.0
+                name = str(block.get("name") or "other")
+                if name == "shell":
+                    tool_totals["shell"] += duration
+                elif name in ("write", "edit", "patch"):
+                    tool_totals["write"] += duration
+                elif name in ("read", "glob", "grep", "list"):
+                    tool_totals["read"] += duration
+                else:
+                    tool_totals["other"] += duration
+
+        if first_user and last_assistant and last_assistant >= first_user:
+            result["span_s"] = (last_assistant - first_user) / 1000.0
+        result["agent_s"] = total_agent
+        result["ttft_s"] = total_ttft
+        result["think_s"] = total_think
+        result["output_s"] = total_output
+        result["tool_s"] = sum(tool_totals.values())
+        result["tool_shell_s"] = tool_totals["shell"]
+        result["tool_write_s"] = tool_totals["write"]
+        result["tool_read_s"] = tool_totals["read"]
+        result["tool_other_s"] = tool_totals["other"]
+        result["available"] = True
+        return result
+    finally:
+        connection.close()
+
+
+def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
+    """Merge log token usage and session timings into persisted metric fields."""
+    usage = read_agent_usage(log_path)
+    session = read_session_metrics(data_dir, wall_s)
+    log_available = bool(usage.get("available"))
+    db_available = bool(session.get("available"))
+
+    if log_available:
+        input_tokens = int(usage["input_tokens"])
+        output_tokens = int(usage["output_tokens"])
+        reasoning_tokens = int(usage["reasoning_tokens"])
+        cache_read_tokens = int(usage["cache_read_tokens"])
+        cache_write_tokens = int(usage["cache_write_tokens"])
+        cost_usd = float(usage["cost_usd"])
+        steps = int(usage["steps"])
+    elif db_available:
+        input_tokens = int(session["db_input_tokens"])
+        output_tokens = int(session["db_output_tokens"])
+        reasoning_tokens = int(session["db_reasoning_tokens"])
+        cache_read_tokens = int(session["db_cache_read_tokens"])
+        cache_write_tokens = int(session["db_cache_write_tokens"])
+        cost_usd = float(session["compaction_cost_usd"])
+        steps = int(session["assistant_steps"])
+    else:
+        input_tokens = output_tokens = reasoning_tokens = 0
+        cache_read_tokens = cache_write_tokens = 0
+        cost_usd = 0.0
+        steps = 0
+
+    compaction_tokens = int(session.get("compaction_tokens") or 0) if db_available else 0
+    if db_available:
+        cost_usd += float(session.get("compaction_cost_usd") or 0)
+    total_tokens = (
+        input_tokens
+        + output_tokens
+        + reasoning_tokens
+        + cache_read_tokens
+        + cache_write_tokens
+        + compaction_tokens
+    )
+
+    metrics: dict[str, object] = {
+        "steps": steps,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "compaction_tokens": compaction_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": round(cost_usd, 6),
+        "step_median_s": usage.get("step_median_s"),
+        "step_p90_s": usage.get("step_p90_s"),
+        "step_max_s": usage.get("step_max_s"),
+        "metrics_source": "db+log" if db_available and log_available else (
+            "db" if db_available else ("log" if log_available else "none")
+        ),
+        "metrics_version": METRICS_VERSION,
+    }
+
+    if db_available:
+        for key in (
+            "span_s",
+            "agent_s",
+            "ttft_s",
+            "think_s",
+            "output_s",
+            "tool_s",
+            "tool_shell_s",
+            "tool_write_s",
+            "tool_read_s",
+            "tool_other_s",
+        ):
+            metrics[key] = session.get(key)
+        buckets = [
+            metrics.get("ttft_s"),
+            metrics.get("think_s"),
+            metrics.get("output_s"),
+            metrics.get("tool_s"),
+        ]
+        known = [float(value) for value in buckets if value is not None]
+        accounted = sum(known)
+        # Message timestamps can overlap slightly when turns are queued; the
+        # harness wall time remains the hard total. Scale the buckets so they
+        # cannot exceed it.
+        if wall_s and accounted > float(wall_s):
+            factor = float(wall_s) / accounted
+            for key in ("ttft_s", "think_s", "output_s", "tool_s"):
+                value = metrics.get(key)
+                if value is not None:
+                    metrics[key] = float(value) * factor
+            accounted = float(wall_s)
+        other = max(0.0, float(wall_s) - accounted) if wall_s else None
+        metrics["other_s"] = other
+
+        def share(value: object) -> float | None:
+            if value is None or not wall_s:
+                return None
+            return max(0.0, min(1.0, float(value) / float(wall_s)))
+
+        metrics["ttft_share"] = share(metrics.get("ttft_s"))
+        metrics["think_share"] = share(metrics.get("think_s"))
+        metrics["output_share"] = share(metrics.get("output_s"))
+        metrics["tool_share"] = share(metrics.get("tool_s"))
+        metrics["other_share"] = share(other)
+        generation_s = float(metrics.get("think_s") or 0) + float(
+            metrics.get("output_s") or 0
+        )
+        if generation_s > 0:
+            metrics["gen_tokens_per_s"] = (
+                output_tokens + reasoning_tokens
+            ) / generation_s
+        else:
+            metrics["gen_tokens_per_s"] = None
+    else:
+        for key in (
+            "span_s",
+            "agent_s",
+            "ttft_s",
+            "think_s",
+            "output_s",
+            "tool_s",
+            "tool_shell_s",
+            "tool_write_s",
+            "tool_read_s",
+            "tool_other_s",
+            "other_s",
+            "ttft_share",
+            "think_share",
+            "output_share",
+            "tool_share",
+            "other_share",
+            "gen_tokens_per_s",
+        ):
+            metrics[key] = None
+
+    metrics["tokens_per_step"] = (
+        (input_tokens + output_tokens + reasoning_tokens) / steps if steps else None
+    )
+    cache_total = input_tokens + cache_read_tokens
+    metrics["cache_hit_rate"] = (
+        cache_read_tokens / cache_total if cache_total else None
+    )
+    return metrics
+
+
+
+def workdir_manifest(root: Path) -> dict[str, str]:
+    """Map relative path -> content hash for the seed and the generated app."""
+    manifest: dict[str, str] = {}
+    if not root.is_dir():
+        return manifest
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in WORKDIR_ARTEFACTS)
+        base = Path(directory)
+        for filename in sorted(filenames):
+            path = base / filename
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                digest = hashlib.sha1(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            manifest[path.relative_to(root).as_posix()] = digest
+    return manifest
+
+
+def count_changed_files(workdir: Path) -> int:
+    """Files the agent added, removed or rewrote relative to the seed."""
+    baseline = workdir_manifest(SEED_DIR)
+    if PROMPT_PATH.exists():
+        # copy_seed() overwrites any seed copy with the benchmark prompt.
+        baseline["PROMPT.md"] = hashlib.sha1(PROMPT_PATH.read_bytes()).hexdigest()
+    current = workdir_manifest(workdir)
+    return sum(
+        1 for name in baseline.keys() | current.keys() if baseline.get(name) != current.get(name)
+    )
+
+
+def classify_outcome(
+    *, watchdog: str, completion: bool, files_changed: int, agent_ok: bool
+) -> str:
+    """How the agent finished, independent of the hidden test score.
+
+    `watchdog: exit` only means the process ended by itself: an agent that
+    stops after two steps looks identical to a successful one unless the diff
+    and the completion file are checked.
+    """
+    if watchdog == "dry-run":
+        return "dry-run"
+    if completion:
+        return "complete"
+    if watchdog == "hard":
+        return "timeout"
+    if watchdog == "idle":
+        return "stalled"
+    if not agent_ok:
+        return "error"
+    if files_changed == 0:
+        return "gave_up"
+    return "incomplete"
+
+
 def start_agent(
     model: str,
     config_dir: Path,
@@ -679,6 +1264,82 @@ def score_run(tests: dict[str, bool], build: dict, *, goal: str) -> dict:
     }
 
 
+def render_effort_lines(meta: dict) -> list[str]:
+    """Markdown block for the per-run effort and token breakdown."""
+    lines = ["## Effort", ""]
+    has_timing = meta.get("metrics_source") in ("db+log", "db") and meta.get(
+        "think_s"
+    ) is not None
+    if has_timing:
+        buckets = [
+            ("TTFT / prefill", "ttft_s", "ttft_share"),
+            ("Thinking", "think_s", "think_share"),
+            ("Model output", "output_s", "output_share"),
+            ("Tool execution", "tool_s", "tool_share"),
+            ("Other", "other_s", "other_share"),
+        ]
+        lines += ["| bucket | time | share |", "|---|---:|---:|"]
+        for label, time_key, share_key in buckets:
+            lines.append(
+                f"| {label} | {format_optional_duration(meta.get(time_key))} | "
+                f"{format_percent(meta.get(share_key))} |"
+            )
+        lines += [
+            "",
+            f"- tools: shell {format_optional_duration(meta.get('tool_shell_s'))}, "
+            f"write/edit {format_optional_duration(meta.get('tool_write_s'))}, "
+            f"read {format_optional_duration(meta.get('tool_read_s'))}, "
+            f"other {format_optional_duration(meta.get('tool_other_s'))}",
+            f"- steps: {meta.get('steps', 0)} "
+            f"(median {format_optional_duration(meta.get('step_median_s'))}, "
+            f"p90 {format_optional_duration(meta.get('step_p90_s'))}, "
+            f"max {format_optional_duration(meta.get('step_max_s'))})",
+        ]
+    else:
+        source = meta.get("metrics_source", "none")
+        lines.append(
+            "No OpenCode session timing data for this run "
+            f"(`metrics_source={source}`); only token totals are available."
+        )
+
+    generation = metric_value(meta, "gen_tokens_per_s")
+    gen_text = f"{generation:.1f} tok/s" if generation is not None else "—"
+    lines += [
+        "",
+        f"- tokens: {format_tokens(meta.get('input_tokens'))} in, "
+        f"{format_tokens(meta.get('output_tokens'))} out, "
+        f"{format_tokens(meta.get('reasoning_tokens'))} reasoning (reported), "
+        f"{format_tokens(meta.get('cache_read_tokens'))} cache read, "
+        f"{format_tokens(meta.get('cache_write_tokens'))} cache write, "
+        f"{format_tokens(meta.get('compaction_tokens'))} compaction",
+        f"- total tokens: {format_tokens(meta.get('total_tokens'))}; "
+        f"generation: {gen_text}",
+        f"- cache hit rate: {format_percent(meta.get('cache_hit_rate'))}; "
+        f"cost: {meta.get('cost_usd', 0)}",
+        "",
+    ]
+    if meta.get("reasoning_tokens") in (0, "0", 0.0) and meta.get("think_s"):
+        lines += [
+            "> The provider reported zero reasoning tokens, but the session log "
+            "shows a thinking phase. Treat the time split as authoritative and "
+            "reasoning tokens as provider-reported only.",
+            "",
+        ]
+    output_s = metric_value(meta, "output_s")
+    if (
+        output_s is not None
+        and output_s < 1
+        and (metric_value(meta, "output_tokens") or 0) > 1000
+    ):
+        lines += [
+            "> No separate timestamped output block was recorded; output tokens "
+            "may have been emitted inside the reasoning stream, so the output "
+            "time is a lower bound.",
+            "",
+        ]
+    return lines
+
+
 def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
     lines = [
         f"# {meta['run_id']}",
@@ -693,6 +1354,9 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- compactions: {meta.get('compactions', 0)}",
         f"- watchdog: {meta['watchdog']}",
         f"- completion file: {meta['completion']}",
+        f"- outcome: {meta.get('outcome', 'unknown')}",
+        f"- steps: {meta.get('steps', 0)}",
+        f"- files changed: {meta.get('files_changed', 0)}",
         f"- agent exit ok: {meta['agent_ok']}",
         f"- build: {'ok' if meta['build_ok'] else 'failed'}",
         f"- typecheck: {'ok' if meta['typecheck_ok'] else 'failed'}",
@@ -700,6 +1364,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- fatal/major/minor: {score['fatal']}/{score['major']}/{score['minor']}",
         f"- eligible: {score['eligible']}",
         "",
+        *render_effort_lines(meta),
         "## Tests",
         "",
         "| tier | test | result |",
@@ -804,6 +1469,28 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   compactions {meta.get('compactions', 0)}"
         f"   watchdog {meta['watchdog']}"
         f"   self-tests {meta['self_test_runs']}"
+    )
+    print(
+        f"  outcome {meta.get('outcome', 'unknown')}"
+        f"   steps {meta.get('steps', 0)}"
+        f"   files changed {meta.get('files_changed', 0)}"
+    )
+    if meta.get("think_share") is not None:
+        print(
+            f"  effort  think {format_percent(meta.get('think_share'))}"
+            f" · output {format_percent(meta.get('output_share'))}"
+            f" · tools {format_percent(meta.get('tool_share'))}"
+            f" · ttft {format_percent(meta.get('ttft_share'))}"
+            f" · other {format_percent(meta.get('other_share'))}"
+        )
+    generation = metric_value(meta, "gen_tokens_per_s")
+    gen_text = f"{generation:.1f}" if generation is not None else "—"
+    print(
+        f"  tokens  {format_tokens(meta.get('input_tokens'))} in"
+        f" · {format_tokens(meta.get('output_tokens'))} out"
+        f" · {format_tokens(meta.get('reasoning_tokens'))} reason"
+        f" · {format_tokens(meta.get('cache_read_tokens'))} cache"
+        f" · {gen_text} tok/s"
     )
     print(f"  report {meta['report']}")
 
@@ -1000,6 +1687,15 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         env_names=env_names,
         args=run_args,
     )
+    steps = count_agent_steps(run_dir / "agent.log")
+    metrics = compute_metrics(run_dir / "agent.log", data_dir, float(agent["wall_s"]))
+    files_changed = count_changed_files(workdir)
+    outcome = classify_outcome(
+        watchdog=agent["watchdog"],
+        completion=agent["completion"],
+        files_changed=files_changed,
+        agent_ok=agent["agent_ok"],
+    )
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
     if build["dist"]:
         tests = run_tests(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
@@ -1031,6 +1727,10 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "compactions": count_compactions(data_dir),
         "watchdog": agent["watchdog"],
         "completion": agent["completion"],
+        "outcome": outcome,
+        "steps": steps,
+        **metrics,
+        "files_changed": files_changed,
         "agent_ok": agent["agent_ok"],
         "self_test_runs": agent["self_test_runs"],
         "build_ok": build["build_ok"],
@@ -1210,6 +1910,20 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     if (run_dir / "opencode-data").exists():
         meta["compactions"] = count_compactions(run_dir / "opencode-data")
     workdir = run_dir / "workdir"
+    metrics = compute_metrics(
+        run_dir / "agent.log",
+        run_dir / "opencode-data",
+        float(meta.get("wall_s") or 0),
+    )
+    meta.update(metrics)
+    meta["steps"] = metrics["steps"]
+    meta["files_changed"] = count_changed_files(workdir)
+    meta["outcome"] = classify_outcome(
+        watchdog=meta.get("watchdog", "exit"),
+        completion=bool(meta.get("completion")),
+        files_changed=meta["files_changed"],
+        agent_ok=bool(meta.get("agent_ok")),
+    )
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
     if not build["dist"]:
         eprint("error: build produced no dist/index.html")
@@ -1250,6 +1964,132 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         eprint(f"warning: could not update leaderboard: {exc}")
     print_summary(meta, score)
     print("  rescored with the current hidden suite")
+    return 0
+
+
+def refresh_run_report_metrics(run_dir: Path, meta: dict) -> None:
+    """Replace or insert the Effort section in an existing per-run report."""
+    path = run_dir / "report.md"
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8", errors="replace")
+    block = "\n".join(render_effort_lines(meta)).rstrip()
+    pattern = re.compile(r"\n## Effort\n.*?(?=\n## |\Z)", re.S)
+    if pattern.search(text):
+        text = pattern.sub("\n" + block + "\n", text, count=1)
+    elif "\n## Tests\n" in text:
+        text = text.replace("\n## Tests\n", "\n" + block + "\n\n## Tests\n", 1)
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    atomic_write_text(path, text)
+
+
+def _backfill_row(meta: dict, existing: dict) -> dict:
+    row = dict(existing)
+    row.update(meta)
+    row["major_issues"] = meta.get("major", 0)
+    row["minor_issues"] = meta.get("minor", 0)
+    counts = meta.get("counts") or {}
+    for tier in ("P0", "P1", "P2"):
+        tier_counts = counts.get(tier) or {}
+        row[f"{tier.lower()}_pass"] = tier_counts.get("pass", row.get(f"{tier.lower()}_pass", ""))
+        row[f"{tier.lower()}_total"] = tier_counts.get("total", row.get(f"{tier.lower()}_total", ""))
+    return row
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    if args.run:
+        run_dirs = [RUNS_DIR / args.run]
+    elif args.all:
+        run_dirs = (
+            sorted(path for path in RUNS_DIR.iterdir() if (path / "score.json").exists())
+            if RUNS_DIR.exists()
+            else []
+        )
+    else:
+        candidates = (
+            [
+                path
+                for path in RUNS_DIR.iterdir()
+                if path.is_dir() and (path / "agent.log").exists()
+            ]
+            if RUNS_DIR.exists()
+            else []
+        )
+        run_dirs = (
+            [max(candidates, key=lambda path: (path / "agent.log").stat().st_mtime)]
+            if candidates
+            else []
+        )
+    if not run_dirs:
+        eprint("error: no runs found")
+        return 1
+
+    rows = {} if args.dry_run else {
+        row.get("run_id"): row for row in load_result_rows()
+    }
+    changed = 0
+    for run_dir in run_dirs:
+        score_path = run_dir / "score.json"
+        if not run_dir.is_dir() or not score_path.exists():
+            eprint(f"warning: skipping {run_dir.name}: score.json missing")
+            continue
+        try:
+            meta = json.loads(score_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            eprint(f"warning: skipping {run_dir.name}: {exc}")
+            continue
+        run_id = str(meta.get("run_id") or run_dir.name)
+        metrics = compute_metrics(
+            run_dir / "agent.log",
+            run_dir / "opencode-data",
+            float(meta.get("wall_s") or 0),
+        )
+        old_source = meta.get("metrics_source", "none")
+        old_think = metric_value(meta, "think_share")
+        meta.update(metrics)
+        if meta.get("files_changed") in (None, ""):
+            workdir = run_dir / "workdir"
+            if workdir.is_dir():
+                meta["files_changed"] = count_changed_files(workdir)
+        if not meta.get("outcome"):
+            meta["outcome"] = classify_outcome(
+                watchdog=str(meta.get("watchdog") or "exit"),
+                completion=bool(meta.get("completion")),
+                files_changed=int(meta.get("files_changed") or 0),
+                agent_ok=bool(meta.get("agent_ok")),
+            )
+        if args.dry_run:
+            print(
+                f"{run_id}\n"
+                f"  source {old_source} -> {meta.get('metrics_source')}\n"
+                f"  think  {format_percent(old_think)} -> "
+                f"{format_percent(meta.get('think_share'))}\n"
+                f"  tokens {format_tokens(meta.get('total_tokens'))} "
+                f"({format_tokens(meta.get('reasoning_tokens'))} reasoning)\n"
+                f"  generation {format_tokens(meta.get('gen_tokens_per_s'))} tok/s"
+            )
+            continue
+
+        atomic_write_text(score_path, json.dumps(meta, indent=2) + "\n")
+        refresh_run_report_metrics(run_dir, meta)
+        rewrite_result(run_id, _backfill_row(meta, rows.get(run_id, {})))
+        rows[run_id] = _backfill_row(meta, rows.get(run_id, {}))
+        changed += 1
+        print(
+            f"{run_id}  think {format_percent(meta.get('think_share'))}"
+            f"  out {format_percent(meta.get('output_share'))}"
+            f"  tools {format_percent(meta.get('tool_share'))}"
+            f"  tokens {format_tokens(meta.get('total_tokens'))}"
+            f"  {format_tokens(meta.get('gen_tokens_per_s'))} tok/s"
+        )
+
+    if not args.dry_run:
+        try:
+            write_leaderboard()
+        except Exception as exc:  # noqa: BLE001 - metrics are already saved
+            eprint(f"warning: could not update leaderboard: {exc}")
+        print(f"backfilled {changed} run(s)")
     return 0
 
 
@@ -1300,6 +2140,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 f"score      quality={meta.get('quality', 0):.2f} "
                 f"eligible={meta.get('eligible')} wall={format_duration(meta.get('wall_s', 0))} "
                 f"compactions={meta.get('compactions', 0)} "
+                f"outcome={meta.get('outcome', '?')} steps={meta.get('steps', 0)} "
                 f"thinking={thinking}" + (f" ({effort})" if effort else "")
             )
         except json.JSONDecodeError:
@@ -1432,11 +2273,13 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
         compactions = compaction_count(row)
         speed = fastest / wall if wall > 0 and fastest > 0 else 0.0
         compaction_score = 1.0 / (1.0 + compactions) if compactions is not None else 0.0
-        score = 100.0 * (
+        eligible = str(row.get("eligible", "")).lower() == "true"
+        raw_score = 100.0 * (
             weights["quality"] * quality
             + weights["wall"] * speed
             + weights["compactions"] * compaction_score
         )
+        score = raw_score * (1.0 if eligible else LEADERBOARD_INELIGIBLE_FACTOR)
         entries.append(
             {
                 "row": row,
@@ -1444,8 +2287,22 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
                 "wall": wall,
                 "compactions": compactions,
                 "speed": speed,
+                "raw_score": raw_score,
                 "score": score,
-                "eligible": str(row.get("eligible", "")).lower() == "true",
+                "eligible": eligible,
+                "think_share": metric_value(row, "think_share"),
+                "output_share": metric_value(row, "output_share"),
+                "tool_share": metric_value(row, "tool_share"),
+                "ttft_share": metric_value(row, "ttft_share"),
+                "other_share": metric_value(row, "other_share"),
+                "think_s": metric_value(row, "think_s"),
+                "ttft_s": metric_value(row, "ttft_s"),
+                "output_s": metric_value(row, "output_s"),
+                "tool_s": metric_value(row, "tool_s"),
+                "other_s": metric_value(row, "other_s"),
+                "tokens": metric_value(row, "total_tokens"),
+                "reasoning_tokens": metric_value(row, "reasoning_tokens"),
+                "toks": metric_value(row, "gen_tokens_per_s"),
             }
         )
     entries.sort(
@@ -1509,6 +2366,124 @@ def provider_label(row: dict) -> str:
     )
 
 
+def _data_attr(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        return f"{float(value):.6f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _render_effort_cell(entry: dict, escaped) -> str:
+    shares = [
+        ("ttft", entry.get("ttft_share"), entry.get("ttft_s")),
+        ("think", entry.get("think_share"), entry.get("think_s")),
+        ("out", entry.get("output_share"), entry.get("output_s")),
+        ("tool", entry.get("tool_share"), entry.get("tool_s")),
+        ("other", entry.get("other_share"), entry.get("other_s")),
+    ]
+    if all(share is None for _, share, _ in shares):
+        return '<span class="muted">—</span>'
+    values = [max(0.0, float(share or 0)) for _, share, _ in shares]
+    total = sum(values)
+    if total <= 0:
+        return '<span class="muted">—</span>'
+    segments = "".join(
+        f'<span class="seg {name}" style="width:{value / total * 100:.2f}%"></span>'
+        for (name, _, _), value in zip(shares, values)
+    )
+    labels = ["TTFT", "thinking", "output", "tools", "other"]
+    parts = []
+    for label, (_, share, seconds) in zip(labels, shares):
+        if share is None:
+            continue
+        parts.append(
+            f"{label} {format_optional_duration(seconds)} ({format_percent(share)})"
+        )
+    title = escaped(" · ".join(parts))
+    row = entry["row"]
+    percentages = "".join(
+        f'<span class="pct {name}">{format_percent(share)}</span>'
+        for label, (name, share, _) in zip(labels, shares)
+        if share is not None
+    )
+    meta_parts = []
+    if entry.get("tokens") is not None:
+        meta_parts.append(f"{format_tokens(entry['tokens'])} tok")
+    if entry.get("toks") is not None:
+        meta_parts.append(f"{float(entry['toks']):.0f} tok/s")
+    meta = (
+        f'<span class="effort-meta">{" · ".join(meta_parts)}</span>'
+        if meta_parts
+        else ""
+    )
+    run_id = escaped(str(row.get("run_id", "")))
+    return (
+        f'<button type="button" class="detail-btn" aria-label="Effort details for {run_id}">'
+        f'<span class="split" role="img" aria-label="{title}">{segments}</span>'
+        f'<span class="effort-pcts">{percentages}</span>'
+        f"{meta}"
+        "</button>"
+    )
+
+
+def _render_model_medians(entries: list[dict], escaped) -> str:
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for entry in entries:
+        row = entry["row"]
+        key = (
+            str(row.get("model", "")),
+            str(row.get("variant") or "default"),
+            thinking_label(row),
+        )
+        groups.setdefault(key, []).append(entry)
+    if not groups:
+        return ""
+
+    def values(items: list[dict], key: str) -> list[float]:
+        return [float(item[key]) for item in items if item.get(key) is not None]
+
+    rows_html = []
+    for (model, variant, thinking), items in sorted(groups.items()):
+        runs = len(items)
+        quality = median_or_none([item["quality"] for item in items])
+        wall = median_or_none([item["wall"] for item in items])
+        think = median_or_none(values(items, "think_share"))
+        output = median_or_none(values(items, "output_share"))
+        tool = median_or_none(values(items, "tool_share"))
+        tokens = median_or_none(values(items, "tokens"))
+        reason = median_or_none(values(items, "reasoning_tokens"))
+        toks = median_or_none(values(items, "toks"))
+        rows_html.append(
+            "<tr>"
+            f"<td>{escaped(model)}</td>"
+            f"<td>{escaped(variant)}</td>"
+            f"<td>{escaped(thinking)}</td>"
+            f'<td class="num">{runs}</td>'
+            f'<td class="num">{quality:.2f}</td>'
+            f'<td class="num">{format_optional_duration(wall)}</td>'
+            f'<td class="num">{format_percent(think)}</td>'
+            f'<td class="num">{format_percent(output)}</td>'
+            f'<td class="num">{format_percent(tool)}</td>'
+            f'<td class="num">{format_tokens(tokens)}</td>'
+            f'<td class="num">{format_tokens(reason)}</td>'
+            f'<td class="num">{format_tokens(toks)}</td>'
+            "</tr>"
+        )
+    return (
+        '<details class="medians"><summary>Model medians (all runs)</summary>'
+        '<div class="table-wrap"><table class="medians-table"><thead><tr>'
+        "<th>Model</th><th>Variant</th><th>Thinking</th><th>Runs</th>"
+        "<th>Quality med</th><th>Wall med</th><th>Think% med</th>"
+        "<th>Out% med</th><th>Tool% med</th><th>Tokens med</th>"
+        "<th>Reason tok med</th><th>tok/s med</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows_html)
+        + "</tbody></table></div></details>"
+    )
+
+
 def write_leaderboard() -> Path:
     with results_lock():
         return _write_leaderboard_unlocked()
@@ -1533,6 +2508,14 @@ def _write_leaderboard_unlocked() -> Path:
         for value in reasoning_values
     )
 
+    think_values = [
+        float(entry["think_share"])
+        for entry in entries
+        if entry.get("think_share") is not None
+    ]
+    toks_values = [
+        float(entry["toks"]) for entry in entries if entry.get("toks") is not None
+    ]
     cards = [
         ("Runs", str(len(entries))),
         ("Eligible", str(sum(1 for entry in entries if entry["eligible"]))),
@@ -1543,6 +2526,14 @@ def _write_leaderboard_unlocked() -> Path:
         (
             "Fastest",
             format_duration(min((entry["wall"] for entry in entries), default=0.0)),
+        ),
+        (
+            "Median think",
+            format_percent(median_or_none(think_values)) if think_values else "—",
+        ),
+        (
+            "Median tok/s",
+            f"{median_or_none(toks_values):.0f}" if toks_values else "—",
         ),
     ]
     cards_html = "".join(
@@ -1572,6 +2563,11 @@ def _write_leaderboard_unlocked() -> Path:
         p2_pass = int(row.get("p2_pass") or 0)
         counts_rank = p0_pass * 100 + p1_pass * 10 + p2_pass
         compactions = "—" if entry["compactions"] is None else str(entry["compactions"])
+        score_note = (
+            ""
+            if eligible
+            else f' title="raw score {entry["raw_score"]:.1f}; ineligible score ×{LEADERBOARD_INELIGIBLE_FACTOR:g}"'
+        )
         counts = " · ".join(
             f'{escaped(str(row.get(f"p{tier}_pass") or "0"))}/{escaped(str(row.get(f"p{tier}_total") or "0"))}'
             for tier in (0, 1, 2)
@@ -1587,6 +2583,10 @@ def _write_leaderboard_unlocked() -> Path:
                 ]
             ).lower()
         )
+        think_share = entry.get("think_share")
+        tokens_total = entry.get("tokens")
+        toks = entry.get("toks")
+        effort_cell = _render_effort_cell(entry, escaped)
         rank_rows.append(
             f'<tr class="{"ineligible" if not eligible else ""}" data-search="{search}"'
             f' data-provider="{escaped(provider)}" data-reasoning="{escaped(reasoning)}"'
@@ -1595,11 +2595,35 @@ def _write_leaderboard_unlocked() -> Path:
             f' data-variant="{escaped(str(row.get("variant") or "default"))}"'
             f' data-thinking="{effort_rank}" data-quality="{quality:.6f}"'
             f' data-counts="{counts_rank}" data-wall="{entry["wall"]:.6f}"'
+            f' data-thinkpct="{_data_attr(think_share * 100 if think_share is not None else None)}"'
+            f' data-tokens="{_data_attr(tokens_total)}"'
+            f' data-toks="{_data_attr(toks)}"'
+            f' data-agent="{_data_attr(row.get("agent_s"))}"'
+            f' data-ttft="{_data_attr(row.get("ttft_s"))}"'
+            f' data-think="{_data_attr(row.get("think_s"))}"'
+            f' data-output="{_data_attr(row.get("output_s"))}"'
+            f' data-tool="{_data_attr(row.get("tool_s"))}"'
+            f' data-other="{_data_attr(row.get("other_s"))}"'
+            f' data-tokens-in="{_data_attr(row.get("input_tokens"))}"'
+            f' data-tokens-out="{_data_attr(row.get("output_tokens"))}"'
+            f' data-tokens-reason="{_data_attr(row.get("reasoning_tokens"))}"'
+            f' data-tokens-cache="{_data_attr(row.get("cache_read_tokens"))}"'
+            f' data-tokens-cache-write="{_data_attr(row.get("cache_write_tokens"))}"'
+            f' data-tokens-compaction="{_data_attr(row.get("compaction_tokens"))}"'
+            f' data-step-median="{_data_attr(row.get("step_median_s"))}"'
+            f' data-step-p90="{_data_attr(row.get("step_p90_s"))}"'
+            f' data-step-max="{_data_attr(row.get("step_max_s"))}"'
+            f' data-steps="{_data_attr(row.get("steps"))}"'
+            f' data-files="{_data_attr(row.get("files_changed"))}"'
+            f' data-tokens-step="{_data_attr(row.get("tokens_per_step"))}"'
+            f' data-cache-rate="{_data_attr(row.get("cache_hit_rate"))}"'
+            f' data-cost="{_data_attr(row.get("cost_usd"))}"'
+            f' data-source="{escaped(str(row.get("metrics_source") or ""))}"'
             f' data-compactions="{entry["compactions"] if entry["compactions"] is not None else 0}"'
             f' data-eligible="{1 if eligible else 0}"'
             f' data-score="{entry["score"]:.6f}" data-run="{run_id}">'
             f'<td class="rank">{rank}</td>'
-            f'<td><div class="score"><span class="bar" style="width:{min(100.0, entry["score"]):.1f}%"></span>'
+            f'<td><div class="score"{score_note}><span class="bar" style="width:{max(0.0, min(100.0, entry["score"])):.1f}%"></span>'
             f'<b>{entry["score"]:.1f}</b></div></td>'
             f'<td class="model"><div>{model}</div><div class="runid">{run_id}</div></td>'
             f'<td class="started" title="{escaped(started_full)}">{started}</td>'
@@ -1608,6 +2632,7 @@ def _write_leaderboard_unlocked() -> Path:
             f'<td><span class="quality {quality_class}">{quality:.2f}</span></td>'
             f'<td class="counts">{counts}</td>'
             f'<td class="wall">{format_duration(entry["wall"])}</td>'
+            f'<td class="effort">{effort_cell}</td>'
             f'<td class="num">{compactions}</td>'
             f'<td>{"yes" if eligible else "no"}</td>'
             f"</tr>"
@@ -1628,19 +2653,22 @@ def _write_leaderboard_unlocked() -> Path:
             '<th data-sort="quality" data-type="number" data-default-dir="desc">Quality</th>'
             '<th data-sort="counts" data-type="number" data-default-dir="desc">P0 · P1 · P2</th>'
             '<th data-sort="wall" data-type="number" data-default-dir="asc">Wall</th>'
+            '<th>Effort</th>'
             '<th data-sort="compactions" data-type="number" data-default-dir="asc">Compactions</th>'
             '<th data-sort="eligible" data-type="number" data-default-dir="desc">Eligible</th>'
             "</tr></thead><tbody>"
             + "".join(rank_rows)
             + "</tbody></table></div>"
         )
+        table += _render_model_medians(entries, escaped)
 
     updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     weights = LEADERBOARD_WEIGHTS
     css = """
 :root { color-scheme: dark; --bg:#0f1117; --panel:#171a23; --line:#272c3a;
         --text:#e7ebf5; --muted:#8b93a7; --accent:#4a90d9; --good:#3ecf8e;
-        --warn:#f0b429; --bad:#ef5b5b; }
+        --warn:#f0b429; --bad:#ef5b5b; --ttft:#5b6478; --think:#8b7cf6;
+        --out:#3ecf8e; --tool:#f0b429; --other:#3a4050; }
 * { box-sizing: border-box; }
 body { margin:0; padding:32px; background:var(--bg); color:var(--text);
        font:15px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -1666,7 +2694,7 @@ select { background:var(--panel); border:1px solid var(--line); color:var(--text
 button { background:var(--accent); border:0; color:#fff; border-radius:8px; padding:9px 14px;
          font:inherit; cursor:pointer; }
 .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; }
-table { width:100%; border-collapse:collapse; min-width:1150px; }
+table { width:100%; border-collapse:collapse; min-width:1350px; }
 thead th { position:sticky; top:0; background:#1b1f2b; color:var(--muted); font-size:12px;
            text-transform:uppercase; letter-spacing:.05em; text-align:left; padding:12px 14px;
            border-bottom:1px solid var(--line); white-space:nowrap; }
@@ -1698,6 +2726,76 @@ tbody tr:nth-child(3) .rank { color:#b07d4f; }
 .quality.mid { background:rgba(240,180,41,.15); color:var(--warn); }
 .quality.low { background:rgba(239,91,91,.15); color:var(--bad); }
 .empty { color:var(--muted); }
+.muted { color:var(--muted); }
+.detail-btn { background:transparent; border:0; padding:0; color:inherit; text-align:left;
+              cursor:pointer; }
+.detail-btn:hover .split { filter:brightness(1.18); }
+.split { display:flex; width:140px; height:10px; border-radius:999px; overflow:hidden;
+         background:#222736; }
+.seg { display:block; height:100%; }
+.seg.ttft { background:var(--ttft); }
+.seg.think { background:var(--think); }
+.seg.out { background:var(--out); }
+.seg.tool { background:var(--tool); }
+.seg.other { background:var(--other); }
+.effort { min-width:170px; }
+.effort-pcts { display:flex; gap:7px; margin-top:4px; font-size:11px;
+               font-variant-numeric:tabular-nums; }
+.pct { cursor:help; }
+.pct.ttft { color:#9aa4b8; }
+.pct.think { color:#b8adff; }
+.pct.out { color:#7ee2b5; }
+.pct.tool { color:#ffd166; }
+.pct.other { color:#8b93a7; }
+.effort-meta { display:block; margin-top:2px; color:var(--muted); font-size:11px;
+               white-space:nowrap; font-variant-numeric:tabular-nums; }
+.medians { margin-top:18px; background:var(--panel); border:1px solid var(--line);
+           border-radius:12px; padding:10px 14px; }
+.medians summary { cursor:pointer; color:var(--muted); font-weight:600; }
+.medians .table-wrap { margin-top:10px; border:0; }
+.medians-table { min-width:1000px; }
+.legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; font-size:12px;
+          color:var(--muted); }
+.legend i { display:inline-block; width:10px; height:10px; border-radius:3px;
+            margin-right:5px; vertical-align:-1px; }
+dialog.effort-dialog { background:var(--panel); color:var(--text); border:1px solid var(--line);
+                       border-radius:14px; padding:0; max-width:640px; width:calc(100% - 32px); }
+dialog.effort-dialog::backdrop { background:rgba(0,0,0,.55); }
+.effort-dialog header { display:flex; justify-content:space-between; align-items:center;
+                        padding:16px 20px; border-bottom:1px solid var(--line);
+                        margin:0; gap:12px; flex-wrap:nowrap; }
+.effort-dialog h2 { margin:0; font-size:18px; min-width:0; overflow-wrap:anywhere; }
+.effort-dialog header form { margin:0; flex:0 0 auto; }
+.effort-dialog .close { background:transparent; color:var(--muted); padding:2px 8px;
+                        font-size:22px; line-height:1; }
+.effort-dialog .body { padding:16px 20px 20px; display:grid;
+                       grid-template-columns:1fr 1fr; gap:16px 24px; font-size:14px; }
+.effort-dialog h3 { margin:0 0 6px; color:var(--muted); font-size:12px;
+                    text-transform:uppercase; letter-spacing:.06em; }
+.effort-dialog dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:4px 12px; }
+.effort-dialog dt { color:var(--muted); }
+.effort-dialog dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
+.effort-note { grid-column:1/-1; color:var(--warn); font-size:12px; }
+.hover-tip { position:fixed; z-index:1000; max-width:300px; padding:7px 10px;
+             background:#1b1f2b; color:var(--text); border:1px solid var(--line);
+             border-radius:7px; box-shadow:0 8px 24px rgba(0,0,0,.35);
+             font-size:12px; line-height:1.4; pointer-events:none; }
+.hover-tip.effort-tip { max-width:440px; padding:10px 12px; }
+.tip-title { font-weight:600; margin-bottom:6px; }
+.tip-table { border-collapse:collapse; width:100%; min-width:0; font-size:12px; }
+.tip-table td { padding:2px 7px 2px 0; white-space:nowrap; vertical-align:middle; }
+.tip-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
+.tip-table .tip-tokens { color:var(--muted); }
+.tip-table .dot { display:inline-block; width:8px; height:8px; border-radius:2px;
+                  margin-right:6px; vertical-align:0; }
+.dot.ttft { background:var(--ttft); }
+.dot.think { background:var(--think); }
+.dot.out { background:var(--out); }
+.dot.tool { background:var(--tool); }
+.dot.other { background:var(--other); }
+.tip-footer { margin-top:6px; padding-top:6px; border-top:1px solid var(--line);
+              color:var(--muted); font-variant-numeric:tabular-nums; }
+.tip-note { margin-top:4px; color:var(--warn); }
 footer { color:var(--muted); margin-top:18px; font-size:13px; }
 code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
 @media (max-width:700px) { body { padding:18px; } h1 { font-size:22px; } }
@@ -1721,10 +2819,25 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 <div class="formula">
   <b>Score = {weights["quality"]:.0%} quality + {weights["wall"]:.0%} speed + {weights["compactions"]:.0%} compactions.</b>
   Speed is relative to the fastest run (<code>fastest wall / run wall</code>);
-  compactions score as <code>1 / (1 + count)</code>. The default sort is score,
-  highest first. Click a column header to sort by it and click again to reverse.
-  Use the Provider and Reasoning filters to narrow the table. Missing compaction
-  data counts as zero.
+  compactions score as <code>1 / (1 + count)</code>. Runs that fail eligibility
+  keep {LEADERBOARD_INELIGIBLE_FACTOR:.0%} of their score, so they fall below
+  quality runs (dimmed; hover the score for the raw value). The default sort is
+  score, highest first. Click a column header to sort by it and click again to
+  reverse. Use the Provider and Reasoning filters to narrow the table. Missing
+  compaction data counts as zero.
+  <div class="legend">
+    <span><i style="background:var(--ttft)"></i>TTFT / prefill</span>
+    <span><i style="background:var(--think)"></i>thinking</span>
+    <span><i style="background:var(--out)"></i>model output / code</span>
+    <span><i style="background:var(--tool)"></i>tool execution</span>
+    <span><i style="background:var(--other)"></i>startup / gaps</span>
+  </div>
+  <p style="margin:8px 0 0">Effort is derived from <code>opencode.db</code> timings,
+  not from a model proxy. Token counts are provider-reported; a thinking phase
+  with <b>0 reasoning tokens</b> means the provider did not report them, not that
+  the model did not think. Hover the effort cell for the full breakdown,
+  including tokens per bucket (tool execution has no model tokens; tool output
+  enters the next prompt). tok/s is hardware-dependent.</p>
 </div>
 <div class="toolbar">
   <input id="filter" type="search" placeholder="Filter model, variant, thinking or run id">
@@ -1735,10 +2848,19 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
   <button type="button" onclick="location.reload()">Refresh</button>
 </div>
 {table}
+<dialog id="effort-dialog" class="effort-dialog">
+  <header>
+    <h2 id="effort-title">Effort details</h2>
+    <form method="dialog"><button class="close" aria-label="Close">×</button></form>
+  </header>
+  <div class="body" id="effort-body"></div>
+</dialog>
+<div id="hover-tip" class="hover-tip" hidden></div>
 <footer>
-  Generated by <code>./bench.py leaderboard</code>. Serve live with
-  <code>./bench.py leaderboard --serve</code>; add <code>?live=1</code> for auto-refresh.
-  Raw data: <code>results.csv</code>.
+  Generated by <code>./bench.py leaderboard</code>. That command serves the page
+  and opens it in the browser; use <code>--write</code> to write the file only.
+  Raw data: <code>results.csv</code>. Effort/token fields can be rebuilt from
+  existing run artifacts with <code>./bench.py backfill --all</code>.
 </footer>
 <script>
 const search = document.getElementById('filter');
@@ -1770,6 +2892,7 @@ function saveFilters() {{
 }}
 
 function updateRanks() {{
+  if (!tableBody) return;
   let rank = 0;
   for (const row of tableBody.querySelectorAll('tr')) {{
     const cell = row.querySelector('.rank');
@@ -1783,6 +2906,7 @@ function updateRanks() {{
 }}
 
 function applyView() {{
+  if (!tableBody) return;
   const needle = (search?.value || '').trim().toLowerCase();
   const provider = providerFilter?.value || '';
   const reasoning = reasoningFilter?.value || '';
@@ -1796,6 +2920,7 @@ function applyView() {{
 }}
 
 function sortRows() {{
+  if (!tableBody) return;
   const header = document.querySelector(`th[data-sort="${{sortKey}}"]`);
   const type = header?.dataset.type || 'text';
   const direction = sortDir === 'asc' ? 1 : -1;
@@ -1803,12 +2928,22 @@ function sortRows() {{
   rows.sort((a, b) => {{
     let av;
     let bv;
+    let aMissing = false;
+    let bMissing = false;
     if (type === 'number') {{
-      av = Number(a.dataset[sortKey] || 0);
-      bv = Number(b.dataset[sortKey] || 0);
+      const rawA = a.dataset[sortKey];
+      const rawB = b.dataset[sortKey];
+      aMissing = rawA === undefined || rawA === '';
+      bMissing = rawB === undefined || rawB === '';
+      av = aMissing ? 0 : Number(rawA);
+      bv = bMissing ? 0 : Number(rawB);
     }} else {{
       av = (a.dataset[sortKey] || '').toLowerCase();
       bv = (b.dataset[sortKey] || '').toLowerCase();
+    }}
+    if (type === 'number') {{
+      if (aMissing && !bMissing) return 1;
+      if (bMissing && !aMissing) return -1;
     }}
     if (av < bv) return -1 * direction;
     if (av > bv) return direction;
@@ -1844,6 +2979,188 @@ for (const header of document.querySelectorAll('th[data-sort]')) {{
     applyView();
   }});
 }}
+
+const effortDialog = document.getElementById('effort-dialog');
+const effortBody = document.getElementById('effort-body');
+const effortTitle = document.getElementById('effort-title');
+
+function fmtSec(value) {{
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  const total = Math.max(0, Math.round(number));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return `${{String(hours).padStart(2, '0')}}:${{String(minutes).padStart(2, '0')}}:${{String(seconds).padStart(2, '0')}}`;
+}}
+
+function fmtPct(value) {{
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  return `${{(number * 100).toFixed(0)}}%`;
+}}
+
+function fmtTok(value) {{
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  if (number >= 1e9) return `${{(number / 1e9).toFixed(1).replace(/\\.0$/, '')}}B`;
+  if (number >= 1e6) return `${{(number / 1e6).toFixed(1).replace(/\\.0$/, '')}}M`;
+  if (number >= 1e3) return `${{(number / 1e3).toFixed(1).replace(/\\.0$/, '')}}k`;
+  return String(Math.round(number));
+}}
+
+function fmtNum(value, digits = 0) {{
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  return number.toFixed(digits);
+}}
+
+function esc(value) {{
+  return String(value).replace(/[&<>"']/g, (character) => ({{
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }}[character]));
+}}
+
+function detailList(items) {{
+  return items.map(([label, value]) => `<dt>${{esc(label)}}</dt><dd>${{value}}</dd>`).join('');
+}}
+
+function effortBodyHtml(row) {{
+  const data = row.dataset;
+  const note = Number(data.tokensReason || 0) === 0 && Number(data.think || 0) > 60
+    ? '<p class="effort-note">Provider reported zero reasoning tokens; the time split still shows the thinking phase.</p>'
+    : '';
+  const outputNote = Number(data.output || 0) < 1 && Number(data.tokensOut || 0) > 1000
+    ? '<p class="effort-note">No separate timestamped output block was recorded; output tokens may be inside the reasoning stream, so output time is a lower bound.</p>'
+    : '';
+  return `
+    <div><h3>Time</h3><dl>${{detailList([
+      ['Wall', fmtSec(data.wall)],
+      ['Agent turns', fmtSec(data.agent)],
+      ['TTFT / prefill', fmtSec(data.ttft)],
+      ['Thinking', fmtSec(data.think)],
+      ['Model output', fmtSec(data.output)],
+      ['Tool execution', fmtSec(data.tool)],
+      ['Other', fmtSec(data.other)]
+    ])}}</dl></div>
+    <div><h3>Tokens</h3><dl>${{detailList([
+      ['Total', fmtTok(data.tokens)],
+      ['Input', fmtTok(data.tokensIn)],
+      ['Output', fmtTok(data.tokensOut)],
+      ['Reasoning (reported)', fmtTok(data.tokensReason)],
+      ['Cache read', fmtTok(data.tokensCache)],
+      ['Cache write', fmtTok(data.tokensCacheWrite)],
+      ['Compaction', fmtTok(data.tokensCompaction)]
+    ])}}</dl></div>
+    <div><h3>Steps</h3><dl>${{detailList([
+      ['Steps', fmtNum(data.steps)],
+      ['Files changed', fmtNum(data.files)],
+      ['Median step', fmtSec(data.stepMedian)],
+      ['p90 step', fmtSec(data.stepP90)],
+      ['Max step', fmtSec(data.stepMax)]
+    ])}}</dl></div>
+    <div><h3>Rates</h3><dl>${{detailList([
+      ['Generation tok/s', fmtNum(data.toks, 1)],
+      ['Tokens / step', fmtTok(data.tokensStep)],
+      ['Cache hit rate', fmtPct(data.cacheRate)],
+      ['Cost', fmtNum(data.cost, 4)]
+    ])}}</dl></div>
+    ${{note}}
+    ${{outputNote}}
+    <p class="effort-note">Source: ${{esc(data.source || 'none')}}. tok/s is output+reasoning over think+output time; hardware-dependent.</p>
+  `;
+}}
+
+function effortTipHtml(row) {{
+  const data = row.dataset;
+  const wall = Number(data.wall || 0);
+  const share = (value) => wall > 0 ? `${{Math.round(Number(value || 0) / wall * 100)}}%` : '—';
+  const promptTokens = Number(data.tokensIn || 0) + Number(data.tokensCache || 0) + Number(data.tokensCacheWrite || 0);
+  const reasoning = Number(data.tokensReason || 0);
+  const thinkTokens = reasoning
+    ? `${{fmtTok(reasoning)}} reasoning`
+    : (Number(data.think || 0) > 0 ? 'not reported' : '—');
+  const compaction = Number(data.tokensCompaction || 0);
+  const rows = [
+    ['ttft', 'TTFT', data.ttft, `${{fmtTok(promptTokens)}} prompt tok`],
+    ['think', 'Thinking', data.think, thinkTokens],
+    ['out', 'Output', data.output, `${{fmtTok(data.tokensOut)}} output tok`],
+    ['tool', 'Tools', data.tool, 'no model tokens'],
+    ['other', 'Other', data.other, compaction ? `${{fmtTok(compaction)}} compaction tok` : 'no model tokens']
+  ];
+  const rowsHtml = rows.map(([kind, label, seconds, tokens]) => (
+    `<tr><td><i class="dot ${{kind}}"></i>${{esc(label)}}</td>`
+    + `<td class="num">${{fmtSec(seconds)}}</td>`
+    + `<td class="num">${{share(seconds)}}</td>`
+    + `<td class="tip-tokens">${{tokens}}</td></tr>`
+  )).join('');
+  const caveat = reasoning === 0 && Number(data.think || 0) > 60 && Number(data.tokensOut || 0) > 1000
+    ? '<div class="tip-note">Output tokens may include unreported reasoning.</div>'
+    : '';
+  return `<div class="tip-title">Effort · ${{fmtSec(data.wall)}}</div>`
+    + `<table class="tip-table">${{rowsHtml}}</table>`
+    + `<div class="tip-footer">${{fmtTok(data.tokens)}} tok · ${{fmtNum(data.toks, 1)}} tok/s`
+    + ` · ${{fmtNum(data.steps)}} steps · ${{fmtPct(data.cacheRate)}} cache</div>`
+    + caveat;
+}}
+
+function showEffort(row) {{
+  if (hoverTip) hoverTip.hidden = true;
+  effortTitle.textContent = `Effort · ${{row.dataset.run || 'run'}}`;
+  effortBody.innerHTML = effortBodyHtml(row);
+  if (typeof effortDialog.showModal === 'function') {{
+    effortDialog.showModal();
+  }} else {{
+    effortDialog.setAttribute('open', '');
+  }}
+}}
+
+for (const button of document.querySelectorAll('.detail-btn')) {{
+  button.addEventListener('click', () => {{
+    const row = button.closest('tr');
+    if (row) showEffort(row);
+  }});
+}}
+
+effortDialog?.addEventListener('click', (event) => {{
+  if (event.target === effortDialog) effortDialog.close();
+}});
+
+const hoverTip = document.getElementById('hover-tip');
+function placeHoverTip(event, target) {{
+  const tipRect = hoverTip.getBoundingClientRect();
+  let clientX;
+  let clientY;
+  if (event && typeof event.clientX === 'number' && event.clientX) {{
+    clientX = event.clientX;
+    clientY = event.clientY;
+  }} else {{
+    const rect = target.getBoundingClientRect();
+    clientX = rect.left + rect.width / 2;
+    clientY = rect.top;
+  }}
+  let x = clientX + 12;
+  let y = clientY + 16;
+  if (x + tipRect.width > window.innerWidth - 8) x = clientX - tipRect.width - 12;
+  if (y + tipRect.height > window.innerHeight - 8) y = clientY - tipRect.height - 16;
+  hoverTip.style.left = `${{Math.max(8, x)}}px`;
+  hoverTip.style.top = `${{Math.max(8, y)}}px`;
+}}
+function showEffortTip(row, event, target) {{
+  hoverTip.className = 'hover-tip effort-tip';
+  hoverTip.innerHTML = effortTipHtml(row);
+  hoverTip.hidden = false;
+  placeHoverTip(event, target);
+}}
+for (const button of document.querySelectorAll('.detail-btn')) {{
+  button.addEventListener('mouseenter', (event) => {{
+    const row = button.closest('tr');
+    if (row) showEffortTip(row, event, button);
+  }});
+  button.addEventListener('mousemove', (event) => placeHoverTip(event, button));
+  button.addEventListener('mouseleave', () => {{ hoverTip.hidden = true; }});
+}}
+window.addEventListener('scroll', () => {{ hoverTip.hidden = true; }}, true);
 
 search?.addEventListener('input', applyView);
 providerFilter?.addEventListener('change', () => {{
@@ -1894,9 +3211,7 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
 def cmd_leaderboard(args: argparse.Namespace) -> int:
     path = write_leaderboard()
     print(f"leaderboard {path}")
-    if not args.serve:
-        if args.open:
-            webbrowser.open(path.as_uri())
+    if args.write:
         return 0
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), LeaderboardHandler)
@@ -1906,8 +3221,7 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
     url = f"http://127.0.0.1:{args.port}/?live=1"
     print(f"serving {url}")
     print("Ctrl+C to stop")
-    if args.open:
-        webbrowser.open(url)
+    webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1915,6 +3229,24 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
     finally:
         server.server_close()
     return 0
+
+
+def _metric_list(items: list[dict], key: str) -> list[float]:
+    values: list[float] = []
+    for item in items:
+        value = metric_value(item, key)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _metric_median(items: list[dict], key: str) -> float | None:
+    return median_or_none(_metric_list(items, key))
+
+
+def _metric_mean(items: list[dict], key: str) -> float | None:
+    values = _metric_list(items, key)
+    return statistics.mean(values) if values else None
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -1930,8 +3262,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines = [
         "# opencode-bench report",
         "",
-        "| model | thinking | runs | quality med | wall med | compactions med | minor med | eligible |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| model | thinking | runs | quality med | wall med | think% med | tokens med | tok/s med | compactions med | minor med | eligible |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for model, items in sorted(by_model.items()):
         quality = statistics.median(float(item["quality"]) for item in items)
@@ -1946,16 +3278,58 @@ def cmd_report(args: argparse.Namespace) -> int:
                 for item in items
             }
         )
+        think = _metric_median(items, "think_share")
+        tokens = _metric_median(items, "total_tokens")
+        toks = _metric_median(items, "gen_tokens_per_s")
+        toks_text = f"{toks:.0f}" if toks is not None else "—"
         lines.append(
             f"| {model} | {', '.join(labels)} | {len(items)} | {quality:.2f} | "
-            f"{format_duration(wall)} | {compactions:.0f} | {minor:.0f} | "
-            f"{'yes' if eligible else 'no'} |"
+            f"{format_duration(wall)} | {format_percent(think)} | "
+            f"{format_tokens(tokens)} | {toks_text} | "
+            f"{compactions:.0f} | {minor:.0f} | {'yes' if eligible else 'no'} |"
         )
+
+    by_variant: dict[tuple[str, str, str], list[dict]] = {}
+    for row in rows:
+        key = (
+            str(row.get("model", "")),
+            str(row.get("variant") or "default"),
+            thinking_label(row),
+        )
+        by_variant.setdefault(key, []).append(row)
     lines += [
+        "",
+        "## Effort by variant",
+        "",
+        "| model | variant | thinking | runs | wall med | think% med | out% med | tool% med | tokens med | tokens mean | reason tok med | tok/s med |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for (model, variant, thinking), items in sorted(by_variant.items()):
+        wall = statistics.median(float(item["wall_s"]) for item in items)
+        toks = _metric_median(items, "gen_tokens_per_s")
+        toks_text = f"{toks:.0f}" if toks is not None else "—"
+        lines.append(
+            f"| {model} | {variant} | {thinking} | {len(items)} | "
+            f"{format_duration(wall)} | "
+            f"{format_percent(_metric_median(items, 'think_share'))} | "
+            f"{format_percent(_metric_median(items, 'output_share'))} | "
+            f"{format_percent(_metric_median(items, 'tool_share'))} | "
+            f"{format_tokens(_metric_median(items, 'total_tokens'))} | "
+            f"{format_tokens(_metric_mean(items, 'total_tokens'))} | "
+            f"{format_tokens(_metric_median(items, 'reasoning_tokens'))} | "
+            f"{toks_text} |"
+        )
+
+    lines += [
+        "",
+        "Tokens include cache reads/writes and compaction rows; see `results.csv` "
+        "for `input_tokens`, `output_tokens`, `reasoning_tokens` and cache columns. "
+        "Reasoning tokens are provider-reported.",
         "",
         "Full rows: `results.csv`. Per-run artifacts: `runs/<run_id>/`.",
         "",
-        "Leaderboard: `leaderboard.html` (rebuild with `./bench.py leaderboard --serve`).",
+        "Leaderboard: `leaderboard.html` (serve and open with `./bench.py leaderboard`; "
+        "write only with `--write`).",
         "",
         "## Failures",
         "",
@@ -2038,17 +3412,26 @@ def make_parser() -> argparse.ArgumentParser:
     rescore.add_argument("--run", default=None, help="run directory name (default: latest)")
     rescore.set_defaults(func=cmd_rescore)
 
+    backfill = sub.add_parser(
+        "backfill", help="recompute effort/token metrics for existing runs"
+    )
+    backfill.add_argument("--run", default=None, help="run directory name (default: latest)")
+    backfill.add_argument("--all", action="store_true", help="backfill every run in runs/")
+    backfill.add_argument("--dry-run", action="store_true")
+    backfill.set_defaults(func=cmd_backfill)
+
     preview = sub.add_parser("preview", help="serve the latest built app")
     preview.add_argument("--run", default=None, help="run directory name (default: latest)")
     preview.add_argument("--port", type=int, default=4173)
     preview.set_defaults(func=cmd_preview)
 
     leaderboard = sub.add_parser(
-        "leaderboard", help="render and optionally serve the all-runs leaderboard"
+        "leaderboard", help="serve and open the all-runs leaderboard"
     )
-    leaderboard.add_argument("--serve", action="store_true", help="serve it on localhost")
+    leaderboard.add_argument(
+        "--write", action="store_true", help="write leaderboard.html without serving"
+    )
     leaderboard.add_argument("--port", type=int, default=4174)
-    leaderboard.add_argument("--open", action="store_true", help="open it in the browser")
     leaderboard.set_defaults(func=cmd_leaderboard)
 
     status = sub.add_parser("status", help="show the latest run and live engine status")
