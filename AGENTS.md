@@ -70,7 +70,9 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 
 - The public page is built from **open** issues labeled `benchmark-result` that
   do **not** have `hidden`. Issues are the source of truth; the workflow does
-  not commit generated files.
+  not commit generated files. The workflow also runs on `opened` and adds
+  `benchmark-result` when an unlabeled body validates, so submissions created
+  outside the issue form are not silently dropped.
 - The submission format is exactly one fenced `json` block with
   `"schema": "opencode-bench/result@1"`. `submissions/schema.json` documents it;
   `validate_submission()` is the authoritative check.
