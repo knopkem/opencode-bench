@@ -2956,6 +2956,58 @@ def _submission_block(submission: dict) -> str:
     return "```json\n" + json.dumps(submission, indent=2) + "\n```\n"
 
 
+def find_submission_issue(issues: list[dict], run_id: str) -> dict | None:
+    """Return the open issue that should receive an update for ``run_id``."""
+    matches: list[dict] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        data, _ = extract_result_block(issue.get("body"))
+        if isinstance(data, dict) and data.get("run_id") == run_id:
+            matches.append(issue)
+    if not matches:
+        return None
+    # Mirror the site: skip hidden duplicates when a visible one exists, then
+    # prefer verified, then the newest issue.
+    return max(
+        matches,
+        key=lambda issue: (
+            HIDDEN_LABEL not in _issue_labels(issue),
+            VERIFIED_LABEL in _issue_labels(issue),
+            str(issue.get("createdAt") or issue.get("created_at") or ""),
+            int(issue.get("number") or 0),
+        ),
+    )
+
+
+def _gh_open_issues(repo: str) -> list[dict]:
+    result = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title,body,url,labels,createdAt",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "gh issue list failed")
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"cannot parse gh issue list output: {exc}") from exc
+    return payload if isinstance(payload, list) else []
+
+
 def submission_template() -> dict:
     return {
         "schema": SUBMISSION_SCHEMA,
@@ -4407,6 +4459,13 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
+    if (args.new or args.issue is not None) and not args.gh:
+        eprint("error: --new and --issue require --gh")
+        return 2
+    if args.new and args.issue is not None:
+        eprint("error: pass only one of --new or --issue")
+        return 2
+
     if args.template:
         print(_submission_block(submission_template()).rstrip())
         return 0
@@ -4456,6 +4515,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
         return 2
     normalized = normalize_submission(data)
     block = _submission_block(normalized)
+    run = normalized.get("run") or {}
+    run_id = str(normalized.get("run_id") or "")
+    if all(
+        run.get(field) is None
+        for field in ("ttft_s", "think_s", "output_s", "tool_s", "total_tokens")
+    ):
+        eprint(
+            "note: this result has no effort/token metrics; "
+            f"run ./bench.py backfill --run {run_id} first if the run artifacts are still available"
+        )
     if not args.gh:
         print(block, end="")
         return 0
@@ -4465,17 +4534,26 @@ def cmd_submit(args: argparse.Namespace) -> int:
         eprint("error: cannot infer GitHub repository; pass --repo OWNER/REPO")
         return 1
     model = str((normalized.get("model") or {}).get("ref") or "")
-    run = normalized.get("run") or {}
     title = (
         f"[Result] {model} — {float(run.get('quality') or 0):.2f} — "
         f"{format_duration(run.get('wall_s') or 0)}"
     )
+    issue_number = args.issue
+    if issue_number is None and not args.new:
+        try:
+            issues = _gh_open_issues(repo)
+        except RuntimeError as exc:
+            eprint(f"error: {exc}")
+            return 1
+        existing = find_submission_issue(issues, run_id)
+        if existing is not None:
+            issue_number = int(existing.get("number"))
     try:
         with tempfile.TemporaryDirectory() as temp:
             body_path = Path(temp) / "issue.md"
             body_path.write_text(block, encoding="utf-8")
-            result = subprocess.run(
-                [
+            if issue_number is None:
+                command = [
                     "gh",
                     "issue",
                     "create",
@@ -4487,7 +4565,24 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     str(body_path),
                     "--label",
                     BENCHMARK_LABEL,
-                ],
+                ]
+            else:
+                command = [
+                    "gh",
+                    "issue",
+                    "edit",
+                    str(issue_number),
+                    "--repo",
+                    repo,
+                    "--title",
+                    title,
+                    "--body-file",
+                    str(body_path),
+                    "--add-label",
+                    BENCHMARK_LABEL,
+                ]
+            result = subprocess.run(
+                command,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -4496,9 +4591,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
         eprint(f"error: gh is not available: {exc}")
         return 1
     if result.returncode != 0:
-        eprint(result.stderr.strip() or "error: gh issue create failed")
+        action = "edit" if issue_number is not None else "create"
+        eprint(result.stderr.strip() or f"error: gh issue {action} failed")
         return result.returncode
-    print(result.stdout.strip())
+    if issue_number is not None:
+        print(result.stdout.strip() or f"updated issue #{issue_number}")
+    else:
+        print(result.stdout.strip())
     return 0
 
 
@@ -4893,7 +4992,21 @@ def make_parser() -> argparse.ArgumentParser:
         "--print", action="store_true", help="print the JSON block (default)"
     )
     submit.add_argument(
-        "--gh", action="store_true", help="create the labeled GitHub issue"
+        "--gh",
+        action="store_true",
+        help="create, or update the existing issue for this run_id",
+    )
+    submit.add_argument(
+        "--new",
+        action="store_true",
+        help="with --gh, always create a new issue instead of updating",
+    )
+    submit.add_argument(
+        "--issue",
+        type=int,
+        default=None,
+        metavar="N",
+        help="with --gh, update this issue number",
     )
     submit.add_argument("--repo", default=None, help="GitHub OWNER/REPO")
     submit.add_argument(

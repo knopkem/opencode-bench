@@ -233,6 +233,38 @@ class CommunitySubmissionTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(data["run_id"], self.example["run_id"])
 
+    def test_find_submission_issue_by_run_id(self) -> None:
+        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
+        other = json.loads(json.dumps(issue))
+        other["number"] = 2
+        other["body"] = other["body"].replace(
+            self.example["run_id"], "20260101T000000Z-other-model-r1"
+        )
+        found = bench.find_submission_issue([other, issue], self.example["run_id"])
+        self.assertEqual(found["number"], issue["number"])
+        self.assertIsNone(bench.find_submission_issue([other], self.example["run_id"]))
+
+    def test_find_submission_issue_prefers_visible_newest(self) -> None:
+        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
+        hidden = json.loads(json.dumps(issue))
+        hidden["number"] = 99
+        hidden["labels"].append({"name": "hidden"})
+        newer = json.loads(json.dumps(issue))
+        newer["number"] = 10
+        found = bench.find_submission_issue([issue, hidden, newer], self.example["run_id"])
+        self.assertEqual(found["number"], 10)
+
+    def test_find_submission_issue_prefers_verified(self) -> None:
+        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
+        verified = json.loads(json.dumps(issue))
+        verified["number"] = 3
+        verified["labels"].append({"name": "verified"})
+        newer = json.loads(json.dumps(issue))
+        newer["number"] = 10
+        newer["createdAt"] = "2026-11-05T10:00:00Z"
+        found = bench.find_submission_issue([newer, verified], self.example["run_id"])
+        self.assertEqual(found["number"], 3)
+
     def test_bad_counts_rejected(self) -> None:
         bad = json.loads(json.dumps(self.example))
         bad["run"]["counts"]["P0"]["pass"] = 4

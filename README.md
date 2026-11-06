@@ -52,7 +52,7 @@ exits and is never visible to the model.
 ./bench.py backfill --all        # recompute effort/token metrics on existing runs
 ./bench.py report                # table plus failed test names
 ./bench.py submit --run RUN_ID --print  # JSON block for the issue form
-./bench.py submit --run RUN_ID --gh     # create the labeled issue
+./bench.py submit --run RUN_ID --gh     # create or update the labeled issue
 ./bench.py site --issues issues.json --output docs  # build the public page
 ./bench.py moderate --issue N --hide    # hide a community result
 python3 -m unittest discover -s tests   # metric/scoring regression tests
@@ -317,10 +317,16 @@ automatically and labeled before the page is built.
 
 ```bash
 ./bench.py run --model provider/model
+./bench.py backfill --run RUN_ID        # fill effort/token metrics from the run DB
 ./bench.py submit --run RUN_ID --print   # paste into the issue form
-# or create the issue directly:
+# or create/update the issue directly:
 ./bench.py submit --run RUN_ID --gh
 ```
+
+`submit --gh` is idempotent per `run_id`: if an open issue already contains
+that run, it edits the issue body and title instead of creating a duplicate.
+This is the normal way to refresh a submission after `backfill` or `rescore`.
+Pass `--new` to force a new issue or `--issue N` to target one explicitly.
 
 The issue form is at
 [New result](https://github.com/knopkem/opencode-bench/issues/new?template=benchmark-result.yml).
