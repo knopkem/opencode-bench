@@ -6,6 +6,11 @@ Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
 
 ## Implementation status
 
+- Next phase: the v4 hardening pass (atomic same-bucket batch, full-disk
+  fault family, generated histories against an independent state model,
+  realistic mutant campaign) is fully specified in `HARD-TASK-V4-PLAN.md`.
+  It is **not implemented**; every v3 number below remains in force until
+  that document's status line changes.
 - Frozen suite: `locker-v3`, 12 families, 51 subcases (P0 8 / P1 30 / P2 13),
   fixture seed `20261106`.
 - Frozen limits: 134,217,728-byte stream fixture; 100,663,296-byte server

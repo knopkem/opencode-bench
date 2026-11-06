@@ -4,6 +4,10 @@ This branch (`hard_task`) holds the **Locker** hard-task benchmark. SpriteForge
 and its community leaderboard remain the `main`-branch suite; do not wire Locker
 submissions or CI until the task is calibrated.
 
+`HARD-TASK-V4-PLAN.md` is the step-by-step build sheet for the planned
+`locker-v4` hardening (batch, faults, histories, mutants). It is not
+implemented; the `locker-v3` invariants below apply until it is.
+
 ## Repository shape
 
 - `bench.py` is the whole harness: run orchestration, Docker mounts, scoring,
