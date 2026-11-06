@@ -22,6 +22,8 @@ from datetime import timedelta
 from typing import Callable
 
 import helpers as h
+import history_check
+import history_gen
 from helpers import CaseFailure, Response, check, fail
 from oracles import effective_listing
 
@@ -2900,6 +2902,42 @@ def _run_fault_case(
 
 
 # ---------------------------------------------------------------------------
+# WP6: p1.histories
+
+
+def _gen_seed(limits: Limits) -> int:
+    return int(limits.get("generator_seed", limits["fixture_seed"]))
+
+
+def _history(server: h.Server, limits: Limits, case_id: str) -> None:
+    history_check.run_sequential(
+        server, history_gen.generate(case_id, _gen_seed(limits)), limits
+    )
+
+
+def p1_histories_objects(server: h.Server, limits: Limits) -> None:
+    _history(server, limits, "objects")
+
+
+def p1_histories_multipart(server: h.Server, limits: Limits) -> None:
+    _history(server, limits, "multipart")
+
+
+def p1_histories_listing(server: h.Server, limits: Limits) -> None:
+    _history(server, limits, "listing")
+
+
+def p1_histories_restart(server: h.Server, limits: Limits) -> None:
+    _history(server, limits, "restart")
+
+
+def p1_histories_concurrent(server: h.Server, limits: Limits) -> None:
+    history_check.run_concurrent(
+        server, history_gen.generate("concurrent", _gen_seed(limits)), limits
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry and execution
 
 
@@ -2989,8 +3027,11 @@ CASE_FUNCS: dict[str, dict[str, CaseFunc]] = {
         "concurrent-batches": p1_batch_concurrent_batches,
     },
     "p1.histories": {
-        case: _not_implemented
-        for case in ("objects", "multipart", "listing", "restart", "concurrent")
+        "objects": p1_histories_objects,
+        "multipart": p1_histories_multipart,
+        "listing": p1_histories_listing,
+        "restart": p1_histories_restart,
+        "concurrent": p1_histories_concurrent,
     },
     "p2.batch": {
         "kill-during-swap": p2_batch_kill_during_swap,

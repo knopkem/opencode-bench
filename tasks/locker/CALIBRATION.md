@@ -273,3 +273,32 @@ server.
 prompt clarifications: none.
 
 open questions: none.
+
+### WP6 Histories
+
+commands run:
+
+```bash
+python3 tasks/locker/tests/history_sweep.py --binary <reference> --seeds 200
+# 10x in the pinned image
+docker run ... run.py --binary /bin-under-test/locker --family p1.histories \
+  --output /out/hist-$i.json
+```
+
+results: `p1.histories` 5/5 in 10/10 Docker runs, 0.7–0.8 s of case time per
+suite (well under 20 s). 200-seed sweep: 1000/1000 histories passed, zero
+model/reference disagreements. Seed binary: 0/5 (objects/listing/restart/
+concurrent diverge on batch/range/conditional/listing semantics; multipart is
+501).
+
+deviations from HARD-TASK-V4-PLAN.md: `history_check.py` is self-contained for
+batch/completion XML instead of importing `test_runner` (avoids a circular
+import). Every generator prepends the two `create_bucket` ops; for `listing`
+that leaves 22 mutation ops + 16 listing ops inside the fixed 40, preserving the
+first-24/last-16 phase split. HEAD error responses skip the error-XML body check
+as the prompt requires. The sweep tool starts a fresh server per case.
+
+prompt clarifications: none; the prompt already states whole-second HTTP dates,
+HEAD bodies, and the batch/listing rules the model encodes.
+
+open questions: none.
