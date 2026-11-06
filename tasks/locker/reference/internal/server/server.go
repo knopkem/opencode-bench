@@ -193,11 +193,26 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, bucket strin
 		writeError(w, r, http.StatusBadRequest, "InvalidArgument", err.Error())
 		return
 	}
+	ackFirst := s.fault == "ack-before-publish" || s.fault == "ack-before-publish-amp"
+	if ackFirst {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if s.fault == "ack-before-publish-amp" {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 	if err := s.store.Batch(bucket, ops); err != nil {
-		writeStoreError(w, r, err)
+		if !ackFirst {
+			writeStoreError(w, r, err)
+		}
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	if !ackFirst {
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket string) {

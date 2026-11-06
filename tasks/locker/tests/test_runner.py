@@ -2760,6 +2760,22 @@ def check_failed_cleanly(status: int | None, detail: str, label: str) -> None:
     )
 
 
+def put_expect(
+    port: int,
+    bucket: str,
+    key: str,
+    body: bytes,
+    content_type: str,
+    label: str,
+) -> Response:
+    """A required successful PUT; a transport failure is a case failure."""
+    try:
+        response = h.put_object(port, bucket, key, body, content_type)
+    except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+        fail(f"{label}: write failed at the transport level ({type(exc).__name__}: {exc})")
+    return expect(response, 200, label)
+
+
 def p2_faults_put_preserves_old(binary: str, limits: Limits) -> None:
     server = _scratch_server(binary, limits)
     try:
@@ -2784,7 +2800,7 @@ def p2_faults_put_preserves_old(binary: str, limits: Limits) -> None:
         check(contents == [("k", 1048576, etag)], f"listing after failed write: {contents}")
 
         expect(h.request(port, "GET", "/health"), 200, "health after failed write")
-        expect(h.put_object(port, "fx", "other", b"ok", "text/plain"), 200, "unrelated write")
+        put_expect(port, "fx", "other", b"ok", "text/plain", "unrelated write")
 
         server.restart()
         port = server.port
@@ -2815,10 +2831,8 @@ def p2_faults_space_released(binary: str, limits: Limits) -> None:
                 )
                 check_failed_cleanly(status, detail, f"round {round_index} attempt {attempt}")
                 expect(h.get_object(port, "fx", "big"), 404, f"big after failed write {attempt}")
-            response = expect(
-                h.put_object(port, "fx", fill_key, small, "application/octet-stream"),
-                200,
-                f"8 MiB PUT {fill_key}",
+            response = put_expect(
+                port, "fx", fill_key, small, "application/octet-stream", f"8 MiB PUT {fill_key}"
             )
             check(response.header("etag") == small_etag, f"{fill_key} ETag mismatch")
             got = expect(h.get_object(port, "fx", fill_key), 200, f"GET {fill_key}")
@@ -2865,9 +2879,8 @@ def p2_faults_multipart_staging(binary: str, limits: Limits) -> None:
         )
 
         small = _fault_body(8 * 1024 * 1024, seed=19)
-        expect(
-            h.put_object(port, "fx", "after", small, "application/octet-stream"),
-            200,
+        put_expect(
+            port, "fx", "after", small, "application/octet-stream",
             "8 MiB write after failed part",
         )
         server.restart()

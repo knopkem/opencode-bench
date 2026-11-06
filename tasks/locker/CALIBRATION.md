@@ -302,3 +302,35 @@ prompt clarifications: none; the prompt already states whole-second HTTP dates,
 HEAD bodies, and the batch/listing rules the model encodes.
 
 open questions: none.
+
+### WP7 Mutants
+
+commands run:
+
+```bash
+docker run ... bash -lc 'go vet ./... && go test ./... && go build ...'
+docker run ... --tmpfs /scratch:rw,size=33554432 ... \
+  python3 -B negative_controls.py --binary /bin-under-test/locker \
+  --scratch /scratch --repeat 10
+docker run ... run.py --binary ... --scratch /scratch --output /out/results.json
+```
+
+results: all 13 controls detected naturally 10/10; both amplified variants
+(`ack-before-publish-amp`, `metadata-before-blob-amp`) 10/10; 0 missed, 0 errors,
+0 skipped; exit 0. `go vet`/`go test` pass with the switches present and unset.
+Full hidden suite remains 69/69 (`test_ok`, non-diagnostic).
+
+deviations from HARD-TASK-V4-PLAN.md: `metadata-before-blob` is implemented in
+`PutObject` (where the blob rename happens) rather than in `commitObject`, with
+the same detectors. `stale-snapshot-clone` yields once between the two lock
+windows to widen the natural schedule. `ack-before-publish` sends
+`Content-Length: 0` with the early 200 so a client can observe the ack before
+publication. The control runner always measures an amplified variant when one is
+defined (not only after a natural miss) so `NEGATIVE_CONTROLS.md` can report both
+rates. `Open` now rejects unknown `LOCKER_FAULT` names, as the plan assumed, and
+a Go test covers the accepted list. Fault cases turn transport errors on required
+small writes into `CaseFailure` so `leak-temp-on-error` is a clean detection.
+
+prompt clarifications: none.
+
+open questions: none.

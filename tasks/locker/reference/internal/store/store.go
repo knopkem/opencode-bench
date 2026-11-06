@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -93,6 +94,10 @@ type CompletionPart struct {
 // Open loads an existing store or initializes a genuinely new directory.
 func Open(root string) (*Store, error) {
 	root = filepath.Clean(root)
+	fault := os.Getenv("LOCKER_FAULT")
+	if !knownFault(fault) {
+		return nil, fmt.Errorf("unknown LOCKER_FAULT %q", fault)
+	}
 	s := &Store{
 		root:         root,
 		manifestPath: filepath.Join(root, "manifest.json"),
@@ -100,7 +105,7 @@ func Open(root string) (*Store, error) {
 		stageDir:     filepath.Join(root, "staging"),
 		multipartDir: filepath.Join(root, "multipart"),
 		uploads:      map[string]*Upload{},
-		fault:        os.Getenv("LOCKER_FAULT"),
+		fault:        fault,
 	}
 
 	data, err := os.ReadFile(s.manifestPath)
@@ -326,31 +331,43 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, declared int64, co
 	digest := md5.New()
 	ew := &errWriter{w: temp}
 	size, err := io.Copy(io.MultiWriter(ew, digest), body)
+	ignoreWrite := s.fault == "ignore-write-error"
+	if ignoreWrite {
+		err = nil
+		ew.err = nil
+	}
 	if ew.err != nil {
+		if s.fault == "leak-temp-on-error" {
+			cleanup = false
+		}
 		return Object{}, ew.err
 	}
 	if err != nil {
 		return Object{}, ErrIncomplete
 	}
-	if declared >= 0 && size != declared {
+	if declared >= 0 && size != declared && !ignoreWrite {
 		return Object{}, ErrIncomplete
 	}
-	if err := temp.Sync(); err != nil {
-		return Object{}, err
+	if syncErr := temp.Sync(); syncErr != nil && !ignoreWrite {
+		return Object{}, syncErr
 	}
-	if err := temp.Close(); err != nil {
-		return Object{}, err
+	if closeErr := temp.Close(); closeErr != nil && !ignoreWrite {
+		return Object{}, closeErr
 	}
 	name, err := randomName()
 	if err != nil {
 		return Object{}, err
 	}
-	if err := os.Rename(tempName, filepath.Join(s.blobDir, name)); err != nil {
-		return Object{}, err
-	}
-	cleanup = false
-	if err := syncDir(s.blobDir); err != nil {
-		return Object{}, err
+	blobPath := filepath.Join(s.blobDir, name)
+	metadataFirst := s.fault == "metadata-before-blob" || s.fault == "metadata-before-blob-amp"
+	if !metadataFirst {
+		if err := os.Rename(tempName, blobPath); err != nil {
+			return Object{}, err
+		}
+		cleanup = false
+		if err := syncDir(s.blobDir); err != nil {
+			return Object{}, err
+		}
 	}
 	object := Object{
 		Blob:        name,
@@ -363,6 +380,22 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, declared int64, co
 		// Deliberately publish metadata that does not describe the blob.
 		object.Size = size / 2
 	}
+	if metadataFirst {
+		if err := s.commitObject(bucket, key, object); err != nil {
+			return Object{}, err
+		}
+		if s.fault == "metadata-before-blob-amp" {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if err := os.Rename(tempName, blobPath); err != nil {
+			return Object{}, err
+		}
+		cleanup = false
+		if err := syncDir(s.blobDir); err != nil {
+			return Object{}, err
+		}
+		return object, nil
+	}
 	if err := s.commitObject(bucket, key, object); err != nil {
 		return Object{}, err
 	}
@@ -373,16 +406,51 @@ func (s *Store) commitObject(bucketName, key string, object Object) error {
 	if s.fault == "lost-writes" && strings.HasSuffix(key, "7") {
 		return nil
 	}
+	if s.fault == "stale-snapshot-clone" {
+		return s.commitObjectStale(bucketName, key, object)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bucket, ok := s.snapshot.Buckets[bucketName]
 	if !ok {
 		return ErrNoSuchBucket
 	}
+	replaced := bucket.Objects[key]
 	buckets := cloneBuckets(s.snapshot.Buckets)
 	updated := cloneBucket(bucket)
 	updated.Objects[key] = object
 	buckets[bucketName] = updated
+	next := Manifest{Buckets: buckets}
+	if err := s.saveLocked(&next); err != nil {
+		return err
+	}
+	s.snapshot = next
+	if s.fault == "share-no-refcount" && replaced.Blob != "" && replaced.Blob != object.Blob {
+		os.Remove(filepath.Join(s.blobDir, replaced.Blob))
+	}
+	return nil
+}
+
+// commitObjectStale is an author-only mutant: it clones the bucket before
+// taking the write lock, so a concurrent commit between the two lock windows
+// is lost.
+func (s *Store) commitObjectStale(bucketName, key string, object Object) error {
+	s.mu.Lock()
+	bucket, ok := s.snapshot.Buckets[bucketName]
+	if !ok {
+		s.mu.Unlock()
+		return ErrNoSuchBucket
+	}
+	stale := cloneBucket(bucket)
+	s.mu.Unlock()
+
+	runtime.Gosched()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stale.Objects[key] = object
+	buckets := cloneBuckets(s.snapshot.Buckets)
+	buckets[bucketName] = stale
 	next := Manifest{Buckets: buckets}
 	if err := s.saveLocked(&next); err != nil {
 		return err
@@ -437,6 +505,7 @@ func (s *Store) DeleteObject(bucketName, key string) error {
 	if _, ok := bucket.Objects[key]; !ok {
 		return nil
 	}
+	removed := bucket.Objects[key]
 	buckets := cloneBuckets(s.snapshot.Buckets)
 	updated := cloneBucket(bucket)
 	delete(updated.Objects, key)
@@ -446,6 +515,9 @@ func (s *Store) DeleteObject(bucketName, key string) error {
 		return err
 	}
 	s.snapshot = next
+	if s.fault == "share-no-refcount" && removed.Blob != "" {
+		os.Remove(filepath.Join(s.blobDir, removed.Blob))
+	}
 	return nil
 }
 
@@ -463,6 +535,9 @@ type BatchOp struct {
 // Batch applies ops in order to a working copy of the bucket and publishes
 // the result as a single manifest replacement, or changes nothing.
 func (s *Store) Batch(bucketName string, ops []BatchOp) error {
+	if s.fault == "precondition-at-parse" {
+		return s.batchCheckThenAct(bucketName, ops)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bucket, ok := s.snapshot.Buckets[bucketName]
@@ -471,6 +546,7 @@ func (s *Store) Batch(bucketName string, ops []BatchOp) error {
 	}
 	working := cloneBucket(bucket) // shallow copy of the Objects map
 	now := time.Now().UTC()
+	perOp := s.fault == "per-op-commit"
 	for _, op := range ops {
 		switch op.Kind {
 		case "copy", "rename":
@@ -489,6 +565,85 @@ func (s *Store) Batch(bucketName string, ops []BatchOp) error {
 			if op.IfMatch != "" && (!ok || !ifMatchOK(op.IfMatch, cur.ETag)) {
 				return ErrPrecondition
 			}
+			delete(working.Objects, op.Key)
+		default:
+			return ErrInvalid
+		}
+		if perOp {
+			buckets := cloneBuckets(s.snapshot.Buckets)
+			buckets[bucketName] = cloneBucket(working)
+			next := Manifest{Buckets: buckets}
+			if err := s.saveLocked(&next); err != nil {
+				return err
+			}
+			s.snapshot = next
+		}
+	}
+	if perOp {
+		return nil
+	}
+	buckets := cloneBuckets(s.snapshot.Buckets)
+	buckets[bucketName] = working
+	next := Manifest{Buckets: buckets}
+	if err := s.saveLocked(&next); err != nil {
+		return err
+	}
+	s.snapshot = next
+	return nil
+}
+
+// batchCheckThenAct is an author-only mutant: it evaluates every precondition
+// against the committed state, drops the lock, then applies the operations
+// without re-checking them.
+func (s *Store) batchCheckThenAct(bucketName string, ops []BatchOp) error {
+	s.mu.Lock()
+	bucket, ok := s.snapshot.Buckets[bucketName]
+	if !ok {
+		s.mu.Unlock()
+		return ErrNoSuchBucket
+	}
+	committed := cloneBucket(bucket)
+	s.mu.Unlock()
+
+	for _, op := range ops {
+		switch op.Kind {
+		case "copy", "rename":
+			src, ok := committed.Objects[op.Source]
+			if !ok || !ifMatchOK(op.IfMatch, src.ETag) {
+				return ErrPrecondition
+			}
+		case "delete":
+			cur, ok := committed.Objects[op.Key]
+			if op.IfMatch != "" && (!ok || !ifMatchOK(op.IfMatch, cur.ETag)) {
+				return ErrPrecondition
+			}
+		default:
+			return ErrInvalid
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bucket, ok = s.snapshot.Buckets[bucketName]
+	if !ok {
+		return ErrNoSuchBucket
+	}
+	working := cloneBucket(bucket)
+	now := time.Now().UTC()
+	for _, op := range ops {
+		switch op.Kind {
+		case "copy", "rename":
+			src, ok := working.Objects[op.Source]
+			if !ok {
+				continue
+			}
+			dst := src
+			dst.ModTime = now
+			working.Objects[op.Target] = dst
+			if op.Kind == "rename" {
+				delete(working.Objects, op.Source)
+			}
+		case "delete":
 			delete(working.Objects, op.Key)
 		default:
 			return ErrInvalid
@@ -565,10 +720,20 @@ func (s *Store) UploadPart(bucket, key, id string, number int, body io.Reader, d
 			os.Remove(tempName)
 		}
 	}()
+	if s.fault == "phantom-part" {
+		upload.mu.Lock()
+		if !upload.Dead {
+			upload.Parts[number] = Part{Blob: tempName, ETag: quotedMD5("phantom"), Size: 0}
+		}
+		upload.mu.Unlock()
+	}
 	digest := md5.New()
 	ew := &errWriter{w: temp}
 	size, err := io.Copy(io.MultiWriter(ew, digest), body)
 	if ew.err != nil {
+		if s.fault == "leak-temp-on-error" {
+			cleanup = false
+		}
 		return "", ew.err
 	}
 	if err != nil || (declared >= 0 && size != declared) {
@@ -814,6 +979,29 @@ func (e *errWriter) Write(p []byte) (int, error) {
 		e.err = err
 	}
 	return n, err
+}
+
+func knownFault(name string) bool {
+	switch name {
+	case "",
+		"split-publication",
+		"lost-writes",
+		"global-lock",
+		"validate-after-replace",
+		"per-op-commit",
+		"precondition-at-parse",
+		"share-no-refcount",
+		"ack-before-publish",
+		"ack-before-publish-amp",
+		"leak-temp-on-error",
+		"ignore-write-error",
+		"phantom-part",
+		"stale-snapshot-clone",
+		"metadata-before-blob",
+		"metadata-before-blob-amp":
+		return true
+	}
+	return false
 }
 
 func normalizeETag(value string) string {

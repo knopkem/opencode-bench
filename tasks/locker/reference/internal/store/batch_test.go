@@ -158,3 +158,37 @@ func TestErrWriterRecordsStorageError(t *testing.T) {
 		t.Fatal("errWriter did not record the storage error")
 	}
 }
+
+func TestOpenRejectsUnknownFault(t *testing.T) {
+	t.Setenv("LOCKER_FAULT", "unknown-name")
+	if _, err := Open(t.TempDir()); err == nil {
+		t.Fatal("Open accepted an unknown LOCKER_FAULT")
+	}
+}
+
+func TestOpenAcceptsKnownFaults(t *testing.T) {
+	for _, name := range []string{
+		"split-publication",
+		"lost-writes",
+		"global-lock",
+		"validate-after-replace",
+		"per-op-commit",
+		"precondition-at-parse",
+		"share-no-refcount",
+		"ack-before-publish",
+		"ack-before-publish-amp",
+		"leak-temp-on-error",
+		"ignore-write-error",
+		"phantom-part",
+		"stale-snapshot-clone",
+		"metadata-before-blob",
+		"metadata-before-blob-amp",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("LOCKER_FAULT", name)
+			if _, err := Open(t.TempDir()); err != nil {
+				t.Fatalf("Open rejected %q: %v", name, err)
+			}
+		})
+	}
+}
