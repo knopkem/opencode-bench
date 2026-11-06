@@ -7,6 +7,7 @@ with `"schema": "opencode-bench/result@1"`.
 ## Preferred: let the harness write it
 
 ```bash
+./bench.py backfill --run RUN_ID   # fill effort/token metrics if the artifacts remain
 ./bench.py submit --run RUN_ID --print
 # paste the output into the issue form, or:
 ./bench.py submit --run RUN_ID --gh
@@ -14,6 +15,9 @@ with `"schema": "opencode-bench/result@1"`.
 
 `submit` reads `runs/<run_id>/score.json`, strips local artifact paths, computes
 the score hash and validates the block before printing or creating the issue.
+`--gh` updates the existing open issue for the same `run_id` instead of
+posting a duplicate; use `--new` to force a new issue or `--issue N` to target
+one explicitly.
 
 ## LLM / agent instructions
 

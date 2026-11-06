@@ -83,6 +83,9 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - CI owns `submitter`, `issue`, `issue_url`, `submitted_at` and
   `evidence.level`. `verified` is a manual maintainer badge, not a replay.
   Any issue edit clears `verified`; maintainers re-add it after review.
+- `submit --gh` is idempotent per `run_id`: it updates the existing open issue
+  instead of creating a duplicate. `--new` forces a new issue and `--issue N`
+  targets one explicitly.
 - `hidden` is the reversible moderation switch. `needs-attention` is automatic
   for validation failures. Do not auto-remove `hidden`.
 - `bench.py site` / `submit` are stdlib-only and must not require Docker or the
