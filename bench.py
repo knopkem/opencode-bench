@@ -72,7 +72,22 @@ LEADERBOARD_WEIGHTS = {"quality": 0.80, "wall": 0.15, "compactions": 0.05}
 # score, so a low-quality or broken run drops below quality runs instead of
 # outranking them on raw speed. Tune this to make the penalty larger or smaller.
 LEADERBOARD_INELIGIBLE_FACTOR = 0.75
-METRICS_VERSION = 2
+METRICS_VERSION = 3
+#: Shell commands that belong to self-testing rather than building.
+SELF_TEST_RE = re.compile(
+    r"(?:playwright\s+test|test:e2e|npm\s+(?:run\s+)?test|vitest|npx\s+playwright)",
+    re.IGNORECASE,
+)
+#: Build/typecheck commands, tracked separately from self-testing.
+BUILD_TOOL_RE = re.compile(
+    r"(?:npm\s+run\s+build|vite\s+build|(?:npx\s+)?tsc\b|npm\s+run\s+typecheck)",
+    re.IGNORECASE,
+)
+#: Dev-server commands; useful context but not part of the build clock.
+DEV_TOOL_RE = re.compile(
+    r"(?:npm\s+run\s+dev|vite(?:\s+--host)?|npm\s+run\s+preview|vite\s+preview)",
+    re.IGNORECASE,
+)
 #: Time and token fields derived from `agent.log` and `opencode-data/opencode.db`.
 EFFORT_FIELDS = [
     "span_s",
@@ -86,6 +101,15 @@ EFFORT_FIELDS = [
     "tool_write_s",
     "tool_read_s",
     "tool_other_s",
+    "self_test_s",
+    "self_test_runs",
+    "self_test_failures",
+    "build_tool_s",
+    "dev_tool_s",
+    "wall_ex_self_test_s",
+    "self_test_share",
+    "retries",
+    "retry_s",
     "step_median_s",
     "step_p90_s",
     "step_max_s",
@@ -105,6 +129,7 @@ EFFORT_FIELDS = [
     "ttft_share",
     "other_share",
     "gen_tokens_per_s",
+    "gen_tokens_per_s_median",
     "tokens_per_step",
     "cache_hit_rate",
     "metrics_source",
@@ -115,6 +140,7 @@ CSV_FIELDS = [
     "timestamp",
     "model",
     "provider",
+    "hardware",
     "rep",
     "goal",
     "variant",
@@ -142,7 +168,6 @@ CSV_FIELDS = [
     *EFFORT_FIELDS,
     "files_changed",
     "agent_ok",
-    "self_test_runs",
     "report",
 ]
 
@@ -555,6 +580,8 @@ def read_agent_usage(log_path: Path) -> dict:
         "step_median_s": None,
         "step_p90_s": None,
         "step_max_s": None,
+        "gen_tokens_per_s_median": None,
+        "self_test_runs": 0,
     }
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -563,6 +590,7 @@ def read_agent_usage(log_path: Path) -> dict:
 
     starts: dict[str, int] = {}
     durations: list[float] = []
+    step_rates: list[float] = []
     request_tokens: list[int] = []
     for line in lines:
         line = line.strip()
@@ -580,15 +608,32 @@ def read_agent_usage(log_path: Path) -> dict:
             message_id = str(part.get("messageID") or part.get("id") or "")
             if message_id:
                 starts[message_id] = int(event.get("timestamp") or 0)
+        elif event_type == "tool_use":
+            state = part.get("state") or {}
+            command = str((state.get("input") or {}).get("command") or "")
+            tool = str(part.get("tool") or "")
+            lower_tool = tool.lower()
+            if (tool == "shell" and SELF_TEST_RE.search(command)) or any(
+                marker in lower_tool
+                for marker in ("browser", "chrome", "playwright")
+            ):
+                usage["self_test_runs"] += 1
         elif event_type == "step_finish":
             usage["steps"] += 1
             message_id = str(part.get("messageID") or "")
             started = starts.pop(message_id, None)
             finished = int(event.get("timestamp") or 0)
-            if started and finished and finished >= started:
-                durations.append((finished - started) / 1000.0)
+            duration = None
+            if started is not None and finished and finished >= started:
+                duration = (finished - started) / 1000.0
+                durations.append(duration)
             tokens = part.get("tokens") or {}
             cash = tokens.get("cache") or {}
+            generated = int(tokens.get("output") or 0) + int(
+                tokens.get("reasoning") or 0
+            )
+            if duration and duration > 0 and generated > 0:
+                step_rates.append(generated / duration)
             usage["input_tokens"] += int(tokens.get("input") or 0)
             usage["output_tokens"] += int(tokens.get("output") or 0)
             usage["reasoning_tokens"] += int(tokens.get("reasoning") or 0)
@@ -612,6 +657,8 @@ def read_agent_usage(log_path: Path) -> dict:
         usage["step_median_s"] = statistics.median(durations)
         usage["step_p90_s"] = percentile(durations, 0.9)
         usage["step_max_s"] = max(durations)
+    if step_rates:
+        usage["gen_tokens_per_s_median"] = statistics.median(step_rates)
     return usage
 
 
@@ -647,6 +694,13 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
         "tool_write_s": None,
         "tool_read_s": None,
         "tool_other_s": None,
+        "self_test_s": 0.0,
+        "self_test_runs": 0,
+        "self_test_failures": 0,
+        "build_tool_s": 0.0,
+        "dev_tool_s": 0.0,
+        "retries": 0,
+        "retry_s": 0.0,
         "compaction_tokens": 0,
         "compaction_cost_usd": 0.0,
         "db_input_tokens": 0,
@@ -727,6 +781,24 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
             if message_type != "assistant":
                 continue
 
+            # Provider errors/retries are not model generation. They stay in
+            # the wall clock (and are reported as retry_s) but must not inflate
+            # think/output time or depress tok/s with zero-token attempts.
+            errored = bool(data.get("error")) or str(
+                data.get("finish") or ""
+            ).lower() == "error"
+            if errored:
+                if created and (completed or streamed):
+                    finished = completed or streamed
+                    result["retries"] += 1
+                    result["retry_s"] += max(0, finished - created) / 1000.0
+                    last_assistant = (
+                        finished
+                        if last_assistant is None
+                        else max(last_assistant, finished)
+                    )
+                continue
+
             result["assistant_steps"] += 1
             tokens = data.get("tokens") or {}
             cash = tokens.get("cache") or {}
@@ -792,6 +864,35 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
                     continue
                 duration = (finished - ran) / 1000.0
                 name = str(block.get("name") or "other")
+                state = block.get("state") or {}
+                command = str((state.get("input") or {}).get("command") or "")
+                output = " ".join(
+                    str(part.get("text") or "")
+                    for part in (state.get("content") or [])
+                    if isinstance(part, dict)
+                )
+                lower_name = name.lower()
+                test_tool = bool(
+                    (name == "shell" and SELF_TEST_RE.search(command))
+                    or any(
+                        marker in lower_name
+                        for marker in ("browser", "chrome", "playwright")
+                    )
+                )
+                if test_tool:
+                    result["self_test_s"] += duration
+                    result["self_test_runs"] += 1
+                    exit_code = (state.get("metadata") or {}).get("exit")
+                    failed = bool(
+                        re.search(r"\b[1-9]\d*\s+failed\b", output, re.IGNORECASE)
+                        or re.search(r"\bFAILED\b", output)
+                    )
+                    if failed or (exit_code not in (None, 0, "0")):
+                        result["self_test_failures"] += 1
+                elif name == "shell" and BUILD_TOOL_RE.search(command):
+                    result["build_tool_s"] += duration
+                elif name == "shell" and DEV_TOOL_RE.search(command):
+                    result["dev_tool_s"] += duration
                 if name == "shell":
                     tool_totals["shell"] += duration
                 elif name in ("write", "edit", "patch"):
@@ -883,6 +984,7 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
         "step_median_s": usage.get("step_median_s"),
         "step_p90_s": usage.get("step_p90_s"),
         "step_max_s": usage.get("step_max_s"),
+        "gen_tokens_per_s_median": usage.get("gen_tokens_per_s_median"),
         "metrics_source": "db+log" if db_available and log_available else (
             "db" if db_available else ("log" if log_available else "none")
         ),
@@ -901,6 +1003,13 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
             "tool_write_s",
             "tool_read_s",
             "tool_other_s",
+            "self_test_s",
+            "self_test_runs",
+            "self_test_failures",
+            "build_tool_s",
+            "dev_tool_s",
+            "retries",
+            "retry_s",
         ):
             metrics[key] = session.get(key)
         buckets = [
@@ -920,9 +1029,17 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
                 value = metrics.get(key)
                 if value is not None:
                     metrics[key] = float(value) * factor
+            # Self-test/build/dev are subsets of tool_s; scale them with it.
+            tool_total = float(metrics.get("tool_s") or 0)
+            for key in ("self_test_s", "build_tool_s", "dev_tool_s"):
+                value = metrics.get(key)
+                if value is not None:
+                    metrics[key] = min(float(value) * factor, tool_total)
             accounted = float(wall_s)
         other = max(0.0, float(wall_s) - accounted) if wall_s else None
         metrics["other_s"] = other
+        if other is not None and metrics.get("retry_s") is not None:
+            metrics["retry_s"] = min(float(metrics["retry_s"]), float(other))
 
         def share(value: object) -> float | None:
             if value is None or not wall_s:
@@ -934,6 +1051,10 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
         metrics["output_share"] = share(metrics.get("output_s"))
         metrics["tool_share"] = share(metrics.get("tool_s"))
         metrics["other_share"] = share(other)
+        metrics["self_test_share"] = share(metrics.get("self_test_s"))
+        metrics["wall_ex_self_test_s"] = max(
+            0.0, float(wall_s) - float(metrics.get("self_test_s") or 0)
+        ) if wall_s else None
         generation_s = float(metrics.get("think_s") or 0) + float(
             metrics.get("output_s") or 0
         )
@@ -956,14 +1077,26 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
             "tool_read_s",
             "tool_other_s",
             "other_s",
+            "self_test_s",
+            "self_test_runs",
+            "self_test_failures",
+            "build_tool_s",
+            "dev_tool_s",
+            "retries",
+            "retry_s",
             "ttft_share",
             "think_share",
             "output_share",
             "tool_share",
             "other_share",
+            "self_test_share",
             "gen_tokens_per_s",
         ):
             metrics[key] = None
+        metrics["wall_ex_self_test_s"] = float(wall_s) if wall_s else None
+        metrics["self_test_runs"] = (
+            int(usage.get("self_test_runs") or 0) if log_available else None
+        )
 
     metrics["tokens_per_step"] = (
         (input_tokens + output_tokens + reasoning_tokens) / steps if steps else None
@@ -1322,6 +1455,14 @@ def render_effort_lines(meta: dict) -> list[str]:
             f"write/edit {format_optional_duration(meta.get('tool_write_s'))}, "
             f"read {format_optional_duration(meta.get('tool_read_s'))}, "
             f"other {format_optional_duration(meta.get('tool_other_s'))}",
+            f"- self-test: {format_optional_duration(meta.get('self_test_s'))} "
+            f"({format_percent(meta.get('self_test_share'))}) · "
+            f"{meta.get('self_test_runs') or 0} runs · "
+            f"{meta.get('self_test_failures') or 0} failed · "
+            f"build/typecheck {format_optional_duration(meta.get('build_tool_s'))} · "
+            f"wall excl. self-test {format_optional_duration(meta.get('wall_ex_self_test_s'))}",
+            f"- retries: {meta.get('retries') or 0} · "
+            f"{format_optional_duration(meta.get('retry_s'))} provider error/retry time",
             f"- steps: {meta.get('steps', 0)} "
             f"(median {format_optional_duration(meta.get('step_median_s'))}, "
             f"p90 {format_optional_duration(meta.get('step_p90_s'))}, "
@@ -1335,7 +1476,10 @@ def render_effort_lines(meta: dict) -> list[str]:
         )
 
     generation = metric_value(meta, "gen_tokens_per_s")
+    generation_median = metric_value(meta, "gen_tokens_per_s_median")
     gen_text = f"{generation:.1f} tok/s" if generation is not None else "—"
+    if generation_median is not None:
+        gen_text += f" (median step {generation_median:.1f} tok/s)"
     lines += [
         "",
         f"- request context: peak {format_tokens(meta.get('max_request_tokens'))}, "
@@ -1380,6 +1524,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         f"- model: `{meta['model']}`",
         f"- provider: {meta['provider']}",
+        *([f"- hardware: {meta['hardware']}"] if meta.get("hardware") else []),
         f"- variant: {meta.get('variant', 'default')}",
         f"- thinking: {meta.get('thinking', 'unknown')}"
         + (f" ({meta['reasoning_effort']})" if meta.get("reasoning_effort") else ""),
@@ -1500,9 +1645,12 @@ def print_summary(meta: dict, score: dict) -> None:
     )
     print(
         f"  wall {format_duration(meta['wall_s'])}"
+        f"   work {format_optional_duration(meta.get('wall_ex_self_test_s'))}"
+        f"   self-test {format_optional_duration(meta.get('self_test_s'))}"
+        f" ({meta.get('self_test_runs') or 0} runs)"
+        f"   retries {meta.get('retries') or 0}"
         f"   compactions {meta.get('compactions', 0)}"
         f"   watchdog {meta['watchdog']}"
-        f"   self-tests {meta['self_test_runs']}"
     )
     print(
         f"  outcome {meta.get('outcome', 'unknown')}"
@@ -1518,7 +1666,10 @@ def print_summary(meta: dict, score: dict) -> None:
             f" · other {format_percent(meta.get('other_share'))}"
         )
     generation = metric_value(meta, "gen_tokens_per_s")
+    generation_median = metric_value(meta, "gen_tokens_per_s_median")
     gen_text = f"{generation:.1f}" if generation is not None else "—"
+    if generation_median is not None:
+        gen_text += f" (median {generation_median:.1f})"
     print(
         f"  tokens  {format_tokens(meta.get('input_tokens'))} in"
         f" · {format_tokens(meta.get('output_tokens'))} out"
@@ -1753,6 +1904,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "timestamp": timestamp,
         "model": model,
         "provider": provider_of(model),
+        "hardware": (getattr(args, "hardware", None) or "").strip()[:300],
         "rep": rep,
         "goal": args.goal,
         "variant": variant_label,
@@ -1767,7 +1919,11 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         **metrics,
         "files_changed": files_changed,
         "agent_ok": agent["agent_ok"],
-        "self_test_runs": agent["self_test_runs"],
+        "self_test_runs": (
+            metrics.get("self_test_runs")
+            if metrics.get("self_test_runs") is not None
+            else agent["self_test_runs"]
+        ),
         "build_ok": build["build_ok"],
         "typecheck_ok": build["typecheck_ok"],
         "test_ok": tests["test_ok"],
@@ -2104,7 +2260,11 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 f"{format_tokens(meta.get('mean_request_tokens'))} mean tok\n"
                 f"  tokens {format_tokens(meta.get('total_tokens'))} "
                 f"({format_tokens(meta.get('reasoning_tokens'))} reasoning)\n"
-                f"  generation {format_tokens(meta.get('gen_tokens_per_s'))} tok/s"
+                f"  generation {format_tokens(meta.get('gen_tokens_per_s'))} tok/s "
+                f"(median {format_tokens(meta.get('gen_tokens_per_s_median'))})\n"
+                f"  self-test {format_optional_duration(meta.get('self_test_s'))} "
+                f"({meta.get('self_test_runs') or 0} runs) · "
+                f"retries {meta.get('retries') or 0}"
             )
             continue
 
@@ -2119,6 +2279,9 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             f"  tools {format_percent(meta.get('tool_share'))}"
             f"  req {format_tokens(meta.get('max_request_tokens'))} peak"
             f"  {format_tokens(meta.get('gen_tokens_per_s'))} tok/s"
+            f"  med {format_tokens(meta.get('gen_tokens_per_s_median'))}"
+            f"  self-test {format_optional_duration(meta.get('self_test_s'))}"
+            f"  retries {meta.get('retries') or 0}"
         )
 
     if not args.dry_run:
@@ -2290,7 +2453,10 @@ def load_result_rows() -> list[dict]:
 
 
 def compaction_count(row: dict) -> int | None:
-    value = (row.get("compactions") or "").strip()
+    value = row.get("compactions")
+    if value is None:
+        return None
+    value = str(value).strip()
     if not value:
         return None
     try:
@@ -2300,33 +2466,85 @@ def compaction_count(row: dict) -> int | None:
 
 
 def leaderboard_entries(rows: list[dict]) -> list[dict]:
-    walls = [float(row["wall_s"]) for row in rows]
-    fastest = min(walls) if walls else 0.0
     weights = LEADERBOARD_WEIGHTS
-    entries: list[dict] = []
+    parsed: list[dict] = []
     for row in rows:
         quality = max(0.0, min(1.0, float(row["quality"])))
-        wall = max(0.0, float(row["wall_s"]))
-        compactions = compaction_count(row)
-        speed = fastest / wall if wall > 0 and fastest > 0 else 0.0
-        compaction_score = 1.0 / (1.0 + compactions) if compactions is not None else 0.0
-        eligible = str(row.get("eligible", "")).lower() == "true"
-        raw_score = 100.0 * (
-            weights["quality"] * quality
-            + weights["wall"] * speed
-            + weights["compactions"] * compaction_score
+        wall_total = max(0.0, float(row["wall_s"]))
+        wall_work_value = metric_value(row, "wall_ex_self_test_s")
+        wall_work = (
+            max(0.0, wall_work_value)
+            if wall_work_value is not None
+            else wall_total
         )
-        score = raw_score * (1.0 if eligible else LEADERBOARD_INELIGIBLE_FACTOR)
-        entries.append(
+        compactions = compaction_count(row)
+        eligible = str(row.get("eligible", "")).lower() == "true"
+        compaction_score = (
+            1.0 / (1.0 + compactions) if compactions is not None else 0.0
+        )
+        parsed.append(
             {
                 "row": row,
                 "quality": quality,
-                "wall": wall,
+                "wall_total": wall_total,
+                "wall_work": wall_work,
                 "compactions": compactions,
-                "speed": speed,
-                "raw_score": raw_score,
-                "score": score,
+                "compaction_score": compaction_score,
                 "eligible": eligible,
+            }
+        )
+
+    def fastest_for(key: str) -> float:
+        # Only eligible runs set the speed baseline. A fast failed run must not
+        # make every real run score the same, which was the old behaviour.
+        values = [
+            item[key] for item in parsed if item["eligible"] and item[key] > 0
+        ]
+        if not values:
+            values = [item[key] for item in parsed if item[key] > 0]
+        return min(values) if values else 0.0
+
+    fastest_total = fastest_for("wall_total")
+    fastest_work = fastest_for("wall_work")
+
+    def scored(item: dict, wall: float, fastest: float) -> tuple[float, float, float]:
+        speed = min(1.0, fastest / wall) if wall > 0 and fastest > 0 else 0.0
+        raw = 100.0 * (
+            weights["quality"] * item["quality"]
+            + weights["wall"] * speed
+            + weights["compactions"] * item["compaction_score"]
+        )
+        score = raw * (
+            1.0 if item["eligible"] else LEADERBOARD_INELIGIBLE_FACTOR
+        )
+        return speed, raw, score
+
+    entries: list[dict] = []
+    for item in parsed:
+        row = item["row"]
+        speed_total, raw_total, score_total = scored(
+            item, item["wall_total"], fastest_total
+        )
+        speed_work, raw_work, score_work = scored(
+            item, item["wall_work"], fastest_work
+        )
+        entries.append(
+            {
+                "row": row,
+                "quality": item["quality"],
+                "wall": item["wall_total"],
+                "wall_total": item["wall_total"],
+                "wall_work": item["wall_work"],
+                "compactions": item["compactions"],
+                "speed": speed_total,
+                "speed_total": speed_total,
+                "speed_work": speed_work,
+                "raw_score": raw_total,
+                "raw_score_work": raw_work,
+                "score": score_total,
+                "score_total": score_total,
+                "score_work": score_work,
+                "eligible": item["eligible"],
                 "think_share": metric_value(row, "think_share"),
                 "output_share": metric_value(row, "output_share"),
                 "tool_share": metric_value(row, "tool_share"),
@@ -2337,18 +2555,27 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
                 "output_s": metric_value(row, "output_s"),
                 "tool_s": metric_value(row, "tool_s"),
                 "other_s": metric_value(row, "other_s"),
+                "self_test_s": metric_value(row, "self_test_s"),
+                "self_test_share": metric_value(row, "self_test_share"),
+                "self_test_runs": metric_value(row, "self_test_runs"),
+                "self_test_failures": metric_value(row, "self_test_failures"),
+                "build_tool_s": metric_value(row, "build_tool_s"),
+                "retries": metric_value(row, "retries"),
+                "retry_s": metric_value(row, "retry_s"),
+                "hardware": str(row.get("hardware") or "").strip(),
                 "tokens": metric_value(row, "total_tokens"),
                 "max_request_tokens": metric_value(row, "max_request_tokens"),
                 "mean_request_tokens": metric_value(row, "mean_request_tokens"),
                 "reasoning_tokens": metric_value(row, "reasoning_tokens"),
                 "toks": metric_value(row, "gen_tokens_per_s"),
+                "toks_median": metric_value(row, "gen_tokens_per_s_median"),
             }
         )
     entries.sort(
         key=lambda entry: (
-            -entry["score"],
+            -entry["score_total"],
             -entry["quality"],
-            entry["wall"],
+            entry["wall_total"],
             entry["compactions"] is None,
             entry["compactions"] or 0,
             entry["row"]["run_id"],
@@ -2450,7 +2677,9 @@ def _render_effort_cell(entry: dict, escaped) -> str:
     meta_parts = []
     if entry.get("max_request_tokens") is not None:
         meta_parts.append(f"peak {format_tokens(entry['max_request_tokens'])} req tok")
-    if entry.get("toks") is not None:
+    if entry.get("toks_median") is not None:
+        meta_parts.append(f"{float(entry['toks_median']):.0f} tok/s med")
+    elif entry.get("toks") is not None:
         meta_parts.append(f"{float(entry['toks']):.0f} tok/s")
     meta = (
         f'<span class="effort-meta">{" · ".join(meta_parts)}</span>'
@@ -2488,12 +2717,22 @@ def _render_model_medians(entries: list[dict], escaped) -> str:
         runs = len(items)
         quality = median_or_none([item["quality"] for item in items])
         wall = median_or_none([item["wall"] for item in items])
+        work = median_or_none(values(items, "wall_work"))
         think = median_or_none(values(items, "think_share"))
         output = median_or_none(values(items, "output_share"))
         tool = median_or_none(values(items, "tool_share"))
+        selftest = median_or_none(values(items, "self_test_share"))
         tokens = median_or_none(values(items, "max_request_tokens"))
         reason = median_or_none(values(items, "reasoning_tokens"))
-        toks = median_or_none(values(items, "toks"))
+        toks = median_or_none(values(items, "toks_median"))
+        if toks is None:
+            toks = median_or_none(values(items, "toks"))
+        retries = median_or_none(values(items, "retries"))
+        retries_cell = (
+            f'<td class="num">{retries:.0f}</td>'
+            if retries is not None
+            else '<td class="num">—</td>'
+        )
         rows_html.append(
             "<tr>"
             f"<td>{escaped(model)}</td>"
@@ -2502,21 +2741,25 @@ def _render_model_medians(entries: list[dict], escaped) -> str:
             f'<td class="num">{runs}</td>'
             f'<td class="num">{quality:.2f}</td>'
             f'<td class="num">{format_optional_duration(wall)}</td>'
+            f'<td class="num">{format_optional_duration(work)}</td>'
             f'<td class="num">{format_percent(think)}</td>'
             f'<td class="num">{format_percent(output)}</td>'
             f'<td class="num">{format_percent(tool)}</td>'
+            f'<td class="num">{format_percent(selftest)}</td>'
             f'<td class="num">{format_tokens(tokens)}</td>'
             f'<td class="num">{format_tokens(reason)}</td>'
             f'<td class="num">{format_tokens(toks)}</td>'
+            f"{retries_cell}"
             "</tr>"
         )
     return (
         '<details class="medians"><summary>Model medians (all runs)</summary>'
         '<div class="table-wrap"><table class="medians-table"><thead><tr>'
         "<th>Model</th><th>Variant</th><th>Thinking</th><th>Runs</th>"
-        "<th>Quality med</th><th>Wall med</th><th>Think% med</th>"
-        "<th>Out% med</th><th>Tool% med</th><th>Peak req tok med</th>"
-        "<th>Reason tok med</th><th>tok/s med</th>"
+        "<th>Quality med</th><th>Wall med</th><th>Work med</th><th>Think% med</th>"
+        "<th>Out% med</th><th>Tool% med</th><th>Self-test% med</th>"
+        "<th>Peak req tok med</th><th>Reason tok med</th><th>tok/s med</th>"
+        "<th>Retries med</th>"
         "</tr></thead><tbody>"
         + "".join(rows_html)
         + "</tbody></table></div></details>"
@@ -2553,8 +2796,18 @@ def _write_leaderboard_unlocked() -> Path:
         if entry.get("think_share") is not None
     ]
     toks_values = [
-        float(entry["toks"]) for entry in entries if entry.get("toks") is not None
+        float(
+            entry["toks_median"]
+            if entry.get("toks_median") is not None
+            else entry["toks"]
+        )
+        for entry in entries
+        if entry.get("toks_median") is not None or entry.get("toks") is not None
     ]
+    fastest_eligible = min(
+        (entry["wall"] for entry in entries if entry["eligible"]), default=None
+    )
+    retries_total = sum(int(entry.get("retries") or 0) for entry in entries)
     cards = [
         ("Runs", str(len(entries))),
         ("Eligible", str(sum(1 for entry in entries if entry["eligible"]))),
@@ -2563,16 +2816,17 @@ def _write_leaderboard_unlocked() -> Path:
             f"{max((entry['quality'] for entry in entries), default=0.0):.2f}",
         ),
         (
-            "Fastest",
-            format_duration(min((entry["wall"] for entry in entries), default=0.0)),
-        ),
-        (
-            "Median think",
-            format_percent(median_or_none(think_values)) if think_values else "—",
+            "Fastest eligible",
+            format_duration(fastest_eligible) if fastest_eligible is not None else "—",
         ),
         (
             "Median tok/s",
             f"{median_or_none(toks_values):.0f}" if toks_values else "—",
+        ),
+        ("Retries", str(retries_total)),
+        (
+            "Median think",
+            format_percent(median_or_none(think_values)) if think_values else "—",
         ),
     ]
     cards_html = "".join(
@@ -2602,10 +2856,35 @@ def _write_leaderboard_unlocked() -> Path:
         p2_pass = int(row.get("p2_pass") or 0)
         counts_rank = p0_pass * 100 + p1_pass * 10 + p2_pass
         compactions = "—" if entry["compactions"] is None else str(entry["compactions"])
+        hardware = escaped(entry.get("hardware") or "")
+        hardware_line = (
+            f'<div class="hardware">{hardware}</div>' if hardware else ""
+        )
+        self_test_s = entry.get("self_test_s")
+        self_test_runs = int(entry.get("self_test_runs") or 0)
+        retries = int(entry.get("retries") or 0)
+        wall_sub_parts = [f"work {format_duration(entry['wall_work'])}"]
+        if self_test_s is not None:
+            wall_sub_parts.append(
+                f"test {format_optional_duration(self_test_s)} · {self_test_runs} runs"
+            )
+        if retries:
+            wall_sub_parts.append(f"{retries} retr{'y' if retries == 1 else 'ies'}")
+        wall_sub = " · ".join(wall_sub_parts)
+        wall_title = (
+            f"total {format_duration(entry['wall_total'])}; "
+            f"excluding self-test {format_duration(entry['wall_work'])}; "
+            f"self-test {format_optional_duration(self_test_s)}"
+            + (f"; provider retries {retries}" if retries else "")
+        )
         score_note = (
             ""
             if eligible
-            else f' title="raw score {entry["raw_score"]:.1f}; ineligible score ×{LEADERBOARD_INELIGIBLE_FACTOR:g}"'
+            else (
+                f' title="raw total {entry["raw_score"]:.1f}, raw work '
+                f'{entry["raw_score_work"]:.1f}; ineligible score '
+                f'×{LEADERBOARD_INELIGIBLE_FACTOR:g}"'
+            )
         )
         counts = " · ".join(
             f'{escaped(str(row.get(f"p{tier}_pass") or "0"))}/{escaped(str(row.get(f"p{tier}_total") or "0"))}'
@@ -2634,11 +2913,27 @@ def _write_leaderboard_unlocked() -> Path:
             f' data-variant="{escaped(str(row.get("variant") or "default"))}"'
             f' data-thinking="{effort_rank}" data-quality="{quality:.6f}"'
             f' data-counts="{counts_rank}" data-wall="{entry["wall"]:.6f}"'
+            f' data-wall-total="{entry["wall_total"]:.6f}"'
+            f' data-wall-work="{entry["wall_work"]:.6f}"'
+            f' data-score-total="{entry["score_total"]:.6f}"'
+            f' data-score-work="{entry["score_work"]:.6f}"'
+            f' data-speed-total="{entry["speed_total"]:.6f}"'
+            f' data-speed-work="{entry["speed_work"]:.6f}"'
+            f' data-raw-total="{entry["raw_score"]:.6f}"'
+            f' data-raw-work="{entry["raw_score_work"]:.6f}"'
+            f' data-self-test="{_data_attr(entry.get("self_test_s"))}"'
+            f' data-self-test-runs="{_data_attr(entry.get("self_test_runs"))}"'
+            f' data-self-test-failures="{_data_attr(entry.get("self_test_failures"))}"'
+            f' data-build-tool="{_data_attr(entry.get("build_tool_s"))}"'
+            f' data-retries="{_data_attr(entry.get("retries"))}"'
+            f' data-retry-s="{_data_attr(entry.get("retry_s"))}"'
+            f' data-hardware="{hardware}"'
             f' data-thinkpct="{_data_attr(think_share * 100 if think_share is not None else None)}"'
             f' data-tokens="{_data_attr(tokens_total)}"'
             f' data-tokens-max="{_data_attr(row.get("max_request_tokens"))}"'
             f' data-tokens-mean="{_data_attr(row.get("mean_request_tokens"))}"'
             f' data-toks="{_data_attr(toks)}"'
+            f' data-toks-med="{_data_attr(entry.get("toks_median"))}"'
             f' data-agent="{_data_attr(row.get("agent_s"))}"'
             f' data-ttft="{_data_attr(row.get("ttft_s"))}"'
             f' data-think="{_data_attr(row.get("think_s"))}"'
@@ -2666,13 +2961,14 @@ def _write_leaderboard_unlocked() -> Path:
             f'<td class="rank">{rank}</td>'
             f'<td><div class="score"{score_note}><span class="bar" style="width:{max(0.0, min(100.0, entry["score"])):.1f}%"></span>'
             f'<b>{entry["score"]:.1f}</b></div></td>'
-            f'<td class="model"><div>{model}</div><div class="runid">{run_id}</div></td>'
+            f'<td class="model"><div>{model}</div>{hardware_line}<div class="runid">{run_id}</div></td>'
             f'<td class="started" title="{escaped(started_full)}">{started}</td>'
             f'<td>{variant}</td>'
             f'<td>{thinking}</td>'
             f'<td><span class="quality {quality_class}">{quality:.2f}</span></td>'
             f'<td class="counts">{counts}</td>'
-            f'<td class="wall">{format_duration(entry["wall"])}</td>'
+            f'<td class="wall" title="{escaped(wall_title)}">{format_duration(entry["wall"])}'
+            f'<div class="wall-sub">{escaped(wall_sub)}</div></td>'
             f'<td class="effort">{effort_cell}</td>'
             f'<td class="num">{compactions}</td>'
             f'<td>{"yes" if eligible else "no"}</td>'
@@ -2693,7 +2989,7 @@ def _write_leaderboard_unlocked() -> Path:
             '<th data-sort="thinking" data-type="number" data-default-dir="desc">Thinking</th>'
             '<th data-sort="quality" data-type="number" data-default-dir="desc">Quality</th>'
             '<th data-sort="counts" data-type="number" data-default-dir="desc">P0 · P1 · P2</th>'
-            '<th data-sort="wall" data-type="number" data-default-dir="asc">Wall</th>'
+            '<th data-sort="wall" data-type="number" data-default-dir="asc">Wall / work</th>'
             '<th>Effort</th>'
             '<th data-sort="compactions" data-type="number" data-default-dir="asc">Compactions</th>'
             '<th data-sort="eligible" data-type="number" data-default-dir="desc">Eligible</th>'
@@ -2761,6 +3057,11 @@ tbody tr:nth-child(3) .rank { color:#b07d4f; }
          word-break:break-all; max-width:360px; }
 .started { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; }
 .counts, .wall, .num { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.wall-sub { color:var(--muted); font-size:11px; margin-top:2px; white-space:nowrap; }
+.hardware { color:var(--muted); font-size:11px; margin-top:2px; max-width:360px;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.retry-badge { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:999px;
+               background:rgba(240,180,41,.15); color:var(--warn); font-size:10px; }
 .quality { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:700;
            font-variant-numeric:tabular-nums; }
 .quality.high { background:rgba(62,207,142,.15); color:var(--good); }
@@ -2859,13 +3160,16 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 </header>
 <div class="formula">
   <b>Score = {weights["quality"]:.0%} quality + {weights["wall"]:.0%} speed + {weights["compactions"]:.0%} compactions.</b>
-  Speed is relative to the fastest run (<code>fastest wall / run wall</code>);
+  Speed is relative to the fastest <b>eligible</b> run
+  (<code>fastest eligible wall / run wall</code>), capped at 1.0;
   compactions score as <code>1 / (1 + count)</code>. Runs that fail eligibility
   keep {LEADERBOARD_INELIGIBLE_FACTOR:.0%} of their score, so they fall below
   quality runs (dimmed; hover the score for the raw value). The default sort is
-  score, highest first. Click a column header to sort by it and click again to
-  reverse. Use the Provider and Reasoning filters to narrow the table. Missing
-  compaction data counts as zero.
+  score, highest first. Use <b>Wall basis</b> to score total wall or wall
+  excluding self-test execution; each basis uses its own eligible baseline.
+  Click a column header to sort by it and click again to reverse. Use the
+  Provider and Reasoning filters to narrow the table. Missing compaction data
+  counts as zero; provider retries are excluded from tok/s and shown separately.
   <div class="legend">
     <span><i style="background:var(--ttft)"></i>TTFT / prefill</span>
     <span><i style="background:var(--think)"></i>thinking</span>
@@ -2888,6 +3192,11 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
   <select id="filter-provider">{provider_options}</select>
   <label for="filter-reasoning">Reasoning</label>
   <select id="filter-reasoning">{reasoning_options}</select>
+  <label for="filter-wall-basis">Wall basis</label>
+  <select id="filter-wall-basis">
+    <option value="total">Total wall</option>
+    <option value="work">Excl. self-test</option>
+  </select>
   <button type="button" onclick="location.reload()">Refresh</button>
 </div>
 {table}
@@ -2909,11 +3218,14 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 const search = document.getElementById('filter');
 const providerFilter = document.getElementById('filter-provider');
 const reasoningFilter = document.getElementById('filter-reasoning');
+const wallBasisFilter = document.getElementById('filter-wall-basis');
 const tableBody = document.querySelector('tbody');
 const SORT_STATE_KEY = 'opencode-bench-sort-state';
 const FILTER_KEY = 'opencode-bench-filters';
+const WALL_BASIS_KEY = 'opencode-bench-wall-basis';
 let sortKey = 'score';
 let sortDir = 'desc';
+let wallBasis = 'total';
 try {{
   const savedSort = JSON.parse(localStorage.getItem(SORT_STATE_KEY) || '{{}}');
   if (savedSort.key && document.querySelector(`th[data-sort="${{savedSort.key}}"]`)) {{
@@ -2923,6 +3235,9 @@ try {{
   const savedFilters = JSON.parse(localStorage.getItem(FILTER_KEY) || '{{}}');
   if (savedFilters.provider && providerFilter) providerFilter.value = savedFilters.provider;
   if (savedFilters.reasoning && reasoningFilter) reasoningFilter.value = savedFilters.reasoning;
+  const savedBasis = localStorage.getItem(WALL_BASIS_KEY);
+  if (savedBasis === 'work' || savedBasis === 'total') wallBasis = savedBasis;
+  if (wallBasisFilter) wallBasisFilter.value = wallBasis;
 }} catch (error) {{}}
 
 function saveFilters() {{
@@ -2932,6 +3247,21 @@ function saveFilters() {{
       reasoning: reasoningFilter?.value || ''
     }}));
   }} catch (error) {{}}
+}}
+
+function applyWallBasis() {{
+  if (!tableBody) return;
+  const work = wallBasis === 'work';
+  for (const row of tableBody.querySelectorAll('tr')) {{
+    const score = Number((work ? row.dataset.scoreWork : row.dataset.scoreTotal) || 0);
+    row.dataset.score = score.toFixed(6);
+    const value = row.querySelector('.score b');
+    const bar = row.querySelector('.score .bar');
+    if (value) value.textContent = score.toFixed(1);
+    if (bar) bar.style.width = `${{Math.max(0, Math.min(100, score)).toFixed(1)}}%`;
+  }}
+  if (sortKey === 'score') sortRows();
+  applyView();
 }}
 
 function updateRanks() {{
@@ -3076,14 +3406,21 @@ function effortBodyHtml(row) {{
   const outputNote = Number(data.output || 0) < 1 && Number(data.tokensOut || 0) > 1000
     ? '<p class="effort-note">No separate timestamped output block was recorded; output tokens may be inside the reasoning stream, so output time is a lower bound.</p>'
     : '';
+  const retryNote = Number(data.retries || 0) > 0
+    ? '<p class="effort-note">Provider errors/retries are counted in wall time and other, but excluded from think/output and tok/s.</p>'
+    : '';
   return `
     <div><h3>Time</h3><dl>${{detailList([
       ['Wall', fmtSec(data.wall)],
+      ['Wall excl. self-test', fmtSec(Number(data.wall || 0) - Number(data.selfTest || 0))],
       ['Agent turns', fmtSec(data.agent)],
       ['TTFT / prefill', fmtSec(data.ttft)],
       ['Thinking', fmtSec(data.think)],
       ['Model output', fmtSec(data.output)],
       ['Tool execution', fmtSec(data.tool)],
+      ['Self-test', fmtSec(data.selfTest)],
+      ['Build / typecheck', fmtSec(data.buildTool)],
+      ['Provider retry', fmtSec(data.retryS)],
       ['Other', fmtSec(data.other)]
     ])}}</dl></div>
     <div><h3>Request tokens</h3><dl>${{detailList([
@@ -3099,13 +3436,18 @@ function effortBodyHtml(row) {{
     ])}}</dl></div>
     <div><h3>Rates</h3><dl>${{detailList([
       ['Generation tok/s', fmtNum(data.toks, 1)],
+      ['Median step tok/s', fmtNum(data.toksMed, 1)],
+      ['Self-test runs', fmtNum(data.selfTestRuns)],
+      ['Self-test failures', fmtNum(data.selfTestFailures)],
+      ['Retries', fmtNum(data.retries)],
       ['Tokens / step', fmtTok(data.tokensStep)],
       ['Cache hit rate', fmtPct(data.cacheRate)],
       ['Cost', fmtNum(data.cost, 4)]
     ])}}</dl></div>
     ${{note}}
     ${{outputNote}}
-    <p class="effort-note">Source: ${{esc(data.source || 'none')}}. tok/s is output+reasoning over think+output time; hardware-dependent.</p>
+    ${{retryNote}}
+    <p class="effort-note">Source: ${{esc(data.source || 'none')}}. tok/s excludes failed/retried attempts; aggregate is output+reasoning over think+output time, median is per step. Hardware-dependent.</p>
   `;
 }}
 
@@ -3134,10 +3476,13 @@ function effortTipHtml(row) {{
   const caveat = reasoning === 0 && Number(data.think || 0) > 60 && Number(data.tokensOut || 0) > 1000
     ? '<div class="tip-note">Output tokens may include unreported reasoning.</div>'
     : '';
+  const retries = Number(data.retries || 0);
   return `<div class="tip-title">Effort · ${{fmtSec(data.wall)}}</div>`
     + `<table class="tip-table">${{rowsHtml}}</table>`
     + `<div class="tip-footer">peak ${{fmtTok(data.tokensMax)}} / mean ${{fmtTok(data.tokensMean)}} req tok`
-    + ` · ${{fmtNum(data.toks, 1)}} tok/s`
+    + ` · ${{fmtNum(data.toks, 1)}} tok/s aggregate / ${{fmtNum(data.toksMed, 1)}} median`
+    + ` · self-test ${{fmtSec(data.selfTest)}} (${{fmtNum(data.selfTestRuns)}} runs)`
+    + (retries ? ` · ${{retries}} retr${{retries === 1 ? 'y' : 'ies'}}` : '')
     + ` · ${{fmtNum(data.steps)}} steps · ${{fmtPct(data.cacheRate)}} cache</div>`
     + caveat;
 }}
@@ -3209,7 +3554,15 @@ reasoningFilter?.addEventListener('change', () => {{
   saveFilters();
   applyView();
 }});
+wallBasisFilter?.addEventListener('change', () => {{
+  wallBasis = wallBasisFilter.value === 'work' ? 'work' : 'total';
+  try {{
+    localStorage.setItem(WALL_BASIS_KEY, wallBasis);
+  }} catch (error) {{}}
+  applyWallBasis();
+}});
 
+applyWallBasis();
 sortRows();
 applyView();
 
@@ -3300,8 +3653,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     lines = [
         "# opencode-bench report",
         "",
-        "| model | thinking | runs | quality med | wall med | think% med | req tok peak med | tok/s med | compactions med | minor med | eligible |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| model | thinking | runs | quality med | wall med | work med | self-test% med | retries med | think% med | req tok peak med | tok/s med | compactions med | minor med | eligible |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for model, items in sorted(by_model.items()):
         quality = statistics.median(float(item["quality"]) for item in items)
@@ -3317,12 +3670,20 @@ def cmd_report(args: argparse.Namespace) -> int:
             }
         )
         think = _metric_median(items, "think_share")
+        work = _metric_median(items, "wall_ex_self_test_s")
+        selftest = _metric_median(items, "self_test_share")
+        retries = _metric_median(items, "retries")
         tokens = _metric_median(items, "max_request_tokens")
-        toks = _metric_median(items, "gen_tokens_per_s")
+        toks = _metric_median(items, "gen_tokens_per_s_median")
+        if toks is None:
+            toks = _metric_median(items, "gen_tokens_per_s")
         toks_text = f"{toks:.0f}" if toks is not None else "—"
+        retries_text = f"{retries:.0f}" if retries is not None else "—"
         lines.append(
             f"| {model} | {', '.join(labels)} | {len(items)} | {quality:.2f} | "
-            f"{format_duration(wall)} | {format_percent(think)} | "
+            f"{format_duration(wall)} | {format_optional_duration(work)} | "
+            f"{format_percent(selftest)} | "
+            f"{retries_text} | {format_percent(think)} | "
             f"{format_tokens(tokens)} | {toks_text} | "
             f"{compactions:.0f} | {minor:.0f} | {'yes' if eligible else 'no'} |"
         )
@@ -3339,16 +3700,23 @@ def cmd_report(args: argparse.Namespace) -> int:
         "",
         "## Effort by variant",
         "",
-        "| model | variant | thinking | runs | wall med | think% med | out% med | tool% med | req tok peak med | req tok mean | reason tok med | tok/s med |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| model | variant | thinking | runs | wall med | work med | self-test% med | retries med | think% med | out% med | tool% med | req tok peak med | req tok mean | reason tok med | tok/s med |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for (model, variant, thinking), items in sorted(by_variant.items()):
         wall = statistics.median(float(item["wall_s"]) for item in items)
-        toks = _metric_median(items, "gen_tokens_per_s")
+        toks = _metric_median(items, "gen_tokens_per_s_median")
+        if toks is None:
+            toks = _metric_median(items, "gen_tokens_per_s")
         toks_text = f"{toks:.0f}" if toks is not None else "—"
+        retries = _metric_median(items, "retries")
+        retries_text = f"{retries:.0f}" if retries is not None else "—"
         lines.append(
             f"| {model} | {variant} | {thinking} | {len(items)} | "
             f"{format_duration(wall)} | "
+            f"{format_optional_duration(_metric_median(items, 'wall_ex_self_test_s'))} | "
+            f"{format_percent(_metric_median(items, 'self_test_share'))} | "
+            f"{retries_text} | "
             f"{format_percent(_metric_median(items, 'think_share'))} | "
             f"{format_percent(_metric_median(items, 'output_share'))} | "
             f"{format_percent(_metric_median(items, 'tool_share'))} | "
@@ -3366,6 +3734,16 @@ def cmd_report(args: argparse.Namespace) -> int:
         "they are not context pressure. Reasoning tokens are provider-reported. "
         "See `results.csv` for `input_tokens`, `output_tokens`, `reasoning_tokens`, "
         "`cache_read_tokens` and `cache_write_tokens`.",
+        "",
+        "`wall_ex_self_test_s` is end-to-end wall minus classified self-test "
+        "command time. `self_test_s` counts Playwright/Vitest/browser-test tool "
+        "calls; `build_tool_s` counts build/typecheck commands. Provider "
+        "errors/retries are excluded from think/output and tok/s, counted in "
+        "`retries`/`retry_s`, and remain in wall time. tok/s medians are "
+        "per-step and are more robust than the aggregate when a run retries.",
+        "",
+        "Wall time remains hardware-dependent. The leaderboard speed baseline "
+        "uses the fastest eligible run and caps the speed ratio at 1.0.",
         "",
         "Full rows: `results.csv`. Per-run artifacts: `runs/<run_id>/`.",
         "",
@@ -3424,6 +3802,11 @@ def make_parser() -> argparse.ArgumentParser:
     run.add_argument("--provider", default=None, help="filter the model menu")
     run.add_argument("--config", default=None, help="OpenCode config file or directory")
     run.add_argument("--env", action="append", default=[], metavar="KEY", help="pass an env var")
+    run.add_argument(
+        "--hardware",
+        default=None,
+        help="optional free-text hardware note stored with the run",
+    )
     run.add_argument(
         "--variant",
         default=None,

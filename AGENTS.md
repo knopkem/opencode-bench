@@ -4,7 +4,8 @@
 
 - `bench.py` is the entire harness: one stdlib-only Python 3.10+ file for run
   orchestration, Docker mounts, scoring, CSV, reports and the leaderboard. There
-  is no root `package.json` and no automated test suite for the harness itself.
+  is no root `package.json`; `tests/test_bench.py` is a stdlib `unittest` suite
+  for metric extraction and leaderboard scoring.
 - `tasks/spriteforge-lite/seed/` is copied into each run and is what the model
   sees. `tasks/spriteforge-lite/tests/` is the hidden Playwright suite.
   `tasks/spriteforge-lite/reference/` is a working implementation used only to
@@ -36,8 +37,9 @@ Run from the repo root:
 
 `docker info` must succeed for build/run/check/rescore; `check` and `models`
 also need the `opencode` CLI. `preview` only needs `node`; `report`,
-`leaderboard` and `backfill` need neither Docker nor `opencode`. Harness syntax
-check: `python3 -m py_compile bench.py`.
+`leaderboard`, `backfill` and the unit tests need neither Docker nor `opencode`.
+Harness syntax check: `python3 -m py_compile bench.py`.
+Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 
 ## Hidden-test and scoring invariants
 
@@ -63,7 +65,21 @@ check: `python3 -m py_compile bench.py`.
   Use `max_request_tokens` / `mean_request_tokens` for per-request context size.
 - `backfill` recomputes these fields from `agent.log` and
   `opencode-data/opencode.db`; it cannot reconstruct timing for runs whose DB
-  was not persisted (`metrics_source=log`).
+  was not persisted (`metrics_source=log`). After changing metric extraction or
+  `METRICS_VERSION`, run `./bench.py backfill --all` and regenerate the
+  leaderboard/report.
+- Provider errors/retries are **not** model generation. Messages with
+  `finish=error`/`error` are excluded from `think_s`, `output_s`, request tokens
+  and `gen_tokens_per_s`; they are counted in `retries`/`retry_s` and remain in
+  `wall_s`/`other_s`. Do not let a zero-token retry depress tok/s.
+- `gen_tokens_per_s` is aggregate successful output+reasoning over
+  think+output. `gen_tokens_per_s_median` is the per-step median and is the
+  robust display value when a provider stalls.
+- `self_test_s` is the classified shell/browser self-test execution time, a
+  subset of `tool_s`; `wall_ex_self_test_s = wall_s - self_test_s`. The
+  leaderboard speed baseline uses the fastest **eligible** run and caps the
+  speed ratio at 1.0. Do not reintroduce `min(wall_s)` across all rows: a fast
+  failed run previously flattened every score.
 
 ## Seed / prompt / image coupling
 
