@@ -12,7 +12,7 @@ subcase; P1 and P2 are the real challenge.
 
 ## Budget and priorities
 
-- Aim for about **12 minutes** of work. The hard cap is **60 minutes**, with a
+- Aim for about **20 minutes** of work. The hard cap is **60 minutes**, with a
   **5-minute** no-output timeout. Stop and write `COMPLETION.md` when you are
   done or when time is nearly up.
 - Prioritise in this order: **P0** (the seed baseline), then **P1** protocol and
@@ -43,19 +43,23 @@ three tiers:
 
 - **P0** is the regression gate. All P0 subcases must pass for eligibility;
   P0 contributes no quality points.
-- **P1** and **P2** are divided into nine equally weighted families. A family's
-  credit is the fraction of its fixed required subcases that pass. Quality is
-  the mean of those nine family credits, so all P0 + all P1 + no P2 credit is
-  `5/9 ≈ 0.556`.
+- **P1** and **P2** are divided into thirteen equally weighted families. A
+  family's credit is the fraction of its fixed required subcases that pass.
+  Quality is the mean of those thirteen family credits, so all P0 + all P1 +
+  no P2 credit is `7/13 ≈ 0.538`.
 - **Eligible** means the build succeeded, every P0 subcase passed, and quality
   is at least **0.80**. Eligibility is a benchmark label, not a claim of
   production readiness.
 
 Scored behavior covers four surfaces in one product: CLI↔HTTP↔storage
 integration, ordinary HTTP object operations, protocol interactions (range,
-conditional, multipart, listing), and storage behavior (coherent publication,
-concurrency, restart recovery, key isolation, streaming memory). The tests use
-small fixtures for most cases and one streaming 128 MiB object.
+conditional, multipart, listing, same-bucket batch operations), and storage
+behavior (coherent publication, concurrency, restart recovery, key isolation,
+streaming memory, behavior when the data filesystem is full). The tests use
+small fixtures for most cases, one streaming 128 MiB object, and a small data
+filesystem for the full-disk cases. Some tests replay generated sequences of
+ordinary operations and compare every response against the documented
+semantics, so partial implementations of any documented rule lose credit.
 
 ## Resource limits
 
@@ -71,6 +75,9 @@ manifest.
 | Individual test request deadline | `60` seconds |
 | Server readiness/startup deadline | `15` seconds |
 | Bounded crash trials | `6` |
+| Maximum operations in one batch request | `32` |
+| Data filesystem size for full-disk cases | `33,554,432` bytes (32 MiB) |
+| Single write attempted on the full data filesystem | `50,331,648` bytes (48 MiB) |
 
 The memory cap is about the server process, not the Python test client. Stream
 object bytes; do not read a whole object body into memory.
@@ -104,6 +111,7 @@ parameters use ordinary URL query decoding.
 | `PUT /b` | 200 | Empty body; creating an existing bucket is idempotent |
 | `DELETE /b` | 204 | Empty body; absent bucket 404, non-empty bucket 409 |
 | `GET /b` or `GET /b?list-type=2` | 200 | `ListBucketResult`; supports the documented listing parameters |
+| `POST /b?batch` | 200 | Atomic same-bucket batch of copy/rename/delete operations; empty body on success |
 | `PUT /b/k` | 200 | Empty body; quoted ETag header; bucket must already exist |
 | `GET /b/k` | 200 or 206 | Object bytes and version headers |
 | `HEAD /b/k` | Same as GET | Same version/range headers, never a body |
@@ -119,6 +127,9 @@ return 404. Multipart routing takes precedence over ordinary object routing;
 invalid/combined multipart action parameters return 400. Unsupported methods
 return 405. Part numbers are decimal integers from 1 through 10000 inclusive.
 Malformed completion XML or an empty part list returns 400 without mutation.
+The `batch` query parameter is valid only as `POST` on a bucket path; `batch`
+combined with any listing or multipart parameter, or present on an object
+path, returns 400.
 
 Valid object/part PUTs support `Expect: 100-continue`: send the interim 100
 response when beginning to read the body, before waiting for the remaining
@@ -223,6 +234,14 @@ other values return 400.
 - Process kill during publication leaves the old or new complete version. A
   write acknowledged before the kill must survive. Power-loss durability is not
   graded.
+- All server state, including temporary and staging files, lives under
+  `--data`. If a write fails because the data filesystem is full or for any
+  other operational reason, respond 500 `InternalError` or close the connection
+  without a success status; leave the published version of every key and every
+  upload session unchanged; release the temporary space the failed write
+  consumed so that later writes which fit can succeed; keep serving other
+  requests; and after a restart load the committed state. Never acknowledge a
+  write whose bytes were not completely stored.
 - On restart, load the committed state. A genuinely new directory starts empty.
   A malformed existing manifest or missing referenced data is an explicit
   startup error; do not silently initialize a fresh store over damaged state.
@@ -246,6 +265,56 @@ other values return 400.
 - Operations using an aborted, completed or unknown upload ID return 404.
 - In-progress multipart session recovery and orphan cleanup after a kill are not
   graded. The published object and subsequent ordinary operations are.
+
+## Batch operations
+
+`POST /b?batch` applies up to 32 copy, rename and delete operations to keys of
+one bucket as a single atomic change. The request body is XML:
+
+```xml
+<Batch>
+  <Copy><Source>KEY</Source><Target>KEY</Target><IfMatch>"MD5"</IfMatch></Copy>
+  <Rename><Source>KEY</Source><Target>KEY</Target></Rename>
+  <Delete><Key>KEY</Key><IfMatch>*</IfMatch></Delete>
+</Batch>
+```
+
+- Operations apply in document order to a working copy of the bucket's
+  committed namespace taken when the batch commits, so a later operation sees
+  the effects of earlier operations in the same batch.
+- `Copy`: `Source` must exist in the working copy. `Target` receives Source's
+  bytes, ETag and Content-Type; its Last-Modified is the batch commit time. An
+  existing Target is replaced. Source and Target may not be equal.
+- `Rename`: a Copy followed by removal of Source.
+- `Delete`: removes `Key`. Without `IfMatch`, deleting an absent key is a
+  no-op. With `IfMatch`, the key must exist and match.
+- `IfMatch` is optional on every operation and names the operation's Source or
+  Key. Its value is one quoted ETag, which must equal that key's current ETag
+  in the working copy, or `*`, which only requires the key to exist.
+- Any failed `IfMatch` or any Copy/Rename whose Source is absent fails the
+  whole batch with 412 `PreconditionFailed` and changes nothing.
+- Malformed XML, zero operations, more than 32 operations, an unknown
+  operation element, a missing or empty Source/Target/Key, or Source equal to
+  Target returns 400 `InvalidArgument` and changes nothing. An absent bucket
+  returns 404.
+- Success is 200 with an empty body. Afterwards every touched key is readable
+  with the stated ETag, Content-Type, Content-Length and bytes, including
+  range and conditional requests, and listings report the new sizes and ETags.
+- Atomicity: a batch publishes as one version change for every key it
+  touches. Any single GET, HEAD or listing request observes either all of a
+  batch's effects or none of them. A batch acknowledged with 200 survives a
+  process kill; a batch interrupted before acknowledgment leaves either all or
+  none of its effects after restart.
+- Concurrency: batches, ordinary writes and multipart completions on the same
+  bucket serialize in some order consistent with every observation; they never
+  produce a 5xx, a mixed version or a deadlock.
+- Independence: after a copy or rename, later writes or deletes of either key
+  never change the other key's bytes, ETag or Content-Type. Whether a copy
+  shares storage with its source internally is your choice; independence and
+  survival across restarts are graded.
+- Multipart sessions are not affected by batches. A session on a key stays
+  usable after that key is renamed, copied over or deleted, and a later
+  completion replaces whatever is then at the key.
 
 ## XML shapes
 
@@ -284,6 +353,12 @@ are substitutions, not literal expected data.
   <Bucket>BUCKET</Bucket><Key>KEY</Key><ETag>"FULL_BODY_MD5"</ETag>
 </CompleteMultipartUploadResult>
 
+<Batch>
+  <Copy><Source>KEY</Source><Target>KEY</Target><IfMatch>"MD5"</IfMatch></Copy>
+  <Rename><Source>KEY</Source><Target>KEY</Target></Rename>
+  <Delete><Key>KEY</Key></Delete>
+</Batch>
+
 <Error><Code>NoSuchKey</Code><Message>Human-readable explanation</Message></Error>
 ```
 
@@ -291,9 +366,10 @@ Repeat `Bucket`, `Contents`, `CommonPrefixes` and `Part` elements as needed;
 empty collections have no entries. XML object timestamps are UTC RFC3339 at
 whole-second precision.
 
-Errors 400/404/409/405/500 use the error XML shape above, except HEAD never has
-a body. Codes are `InvalidArgument`, `NoSuchBucket`/`NoSuchKey`/`NoSuchUpload`,
-`BucketNotEmpty`, `MethodNotAllowed`, and `InternalError`, respectively.
+Errors 400/404/409/405/412/500 use the error XML shape above, except HEAD never
+has a body. Codes are `InvalidArgument`,
+`NoSuchBucket`/`NoSuchKey`/`NoSuchUpload`, `BucketNotEmpty`,
+`MethodNotAllowed`, `PreconditionFailed`, and `InternalError`, respectively.
 Messages must be non-empty but their wording is not graded. If several inputs
 are invalid, no particular validation order is required. Operational failures
 must not be reported as success or reset the store silently.

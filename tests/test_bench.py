@@ -276,7 +276,7 @@ class LockerScoringTests(unittest.TestCase):
         )
         range_family = next(f for f in score["families"] if f["id"] == "p1.range")
         self.assertAlmostEqual(range_family["credit"], 0.75, places=6)
-        self.assertAlmostEqual(score["quality"], (8 + 0.75) / 9, places=6)
+        self.assertAlmostEqual(score["quality"], (12 + 0.75) / 13, places=6)
         self.assertEqual(score["fatal"], 0)
         self.assertTrue(score["eligible"])
 

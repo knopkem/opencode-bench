@@ -8,9 +8,9 @@ Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
 
 - Next phase: the v4 hardening pass (atomic same-bucket batch, full-disk
   fault family, generated histories against an independent state model,
-  realistic mutant campaign) is fully specified in `HARD-TASK-V4-PLAN.md`.
-  It is **not implemented**; every v3 number below remains in force until
-  that document's status line changes.
+  realistic mutant campaign). v4 hardening specified in
+  `HARD-TASK-V4-PLAN.md`; its contract package has landed while the reference,
+  state model, cases and mutants are being built.
 - Frozen suite: `locker-v3`, 12 families, 51 subcases (P0 8 / P1 30 / P2 13),
   fixture seed `20261106`.
 - Frozen limits: 134,217,728-byte stream fixture; 100,663,296-byte server
@@ -1036,7 +1036,7 @@ unit tests without importing reference code or deriving expectations from it.
 
 ### Fixed subcase catalog
 
-The catalog has **51 cases: P0 = 8, P1 = 30, P2 = 13**. Family weights remain
+The catalog has **69 cases: P0 = 8, P1 = 42, P2 = 19**. Family weights remain
 equal within P1/P2 regardless of these counts. Case IDs are scoped by family.
 The last column identifies a private negative control or injected bad response
 that the corresponding assertion must reject; it is not permission to inspect
@@ -1096,6 +1096,24 @@ storage/concurrency controls must also exercise an actual broken server.
 | `p2.perf/stream-roundtrip` | One streamed 128 MiB PUT/GET | Exact size/digest within total workload deadline | Truncates transfer |
 | `p2.perf/range` | Reuse that object; fetch known range | Exact slice, 206 and correct headers | Reads wrong segment |
 | `p2.perf/rss-budget` | Observe the same successful workload's server high-water RSS | Below frozen cap; workload must have completed correctly | `io.ReadAll` on large body |
+| `p1.batch/copy-rename-delete` | Run an in-order copy/rename/delete chain, then delete a key and an absent key | 200 empty body; exact remaining keys, bytes, ETags, types and listing; copy timestamps not older | Applies operations out of order or to stale state |
+| `p1.batch/preconditions` | IfMatch match/mismatch, absent Source, failure in last op, working-copy delete, wildcard | 412 on failure with the bucket snapshot unchanged; 200 and exact effects on success | Checks precondition outside the commit or leaves partial effects |
+| `p1.batch/errors` | Malformed/empty/wrong-root XML, 33 ops, unknown op, missing fields, equal source/target, empty IfMatch, bad routing | 400 `InvalidArgument` with no mutation; object-path and combined-parameter batch 400; absent bucket 404; 32-op boundary 200 | Accepts invalid XML or applies part of a rejected batch |
+| `p1.batch/independence` | Copy then overwrite/delete source; range, empty, multipart and fan-out copies; restart | Targets retain exact bytes, ETags, types and ranges; every surviving copy rereads after restart | Shared blob removed when a source is deleted or overwritten |
+| `p1.batch/cross-feature` | Copied object under range, conditional, HEAD and listing; session across rename/delete; bucket delete guard | All protocol surfaces describe the copied version; sessions complete after rename/delete; empty bucket deletes | Copy bypasses range/conditional metadata or kills sessions |
+| `p1.batch/atomic-visibility` | Writer swaps two keys with a three-rename batch while four readers list and GET | Every read is one complete version; both keys always present with distinct bodies/ETags; no temp key | Readers observe a half-applied swap |
+| `p1.batch/concurrent-batches` | Concurrent renames, precondition conflict, fan-in/fan-out with reads, batch vs ordinary PUT | No 5xx; final state is one valid serial order; exactly one precondition winner; every batch 200 | Lost update or precondition evaluated without the commit lock |
+| `p1.histories/objects` | Replay 80 generated put/get/head/delete/batch/bucket operations | Every response matches the documented state model; final state and listings agree | Partial rule implementation diverges from the model |
+| `p1.histories/multipart` | Replay 50 generated multipart/ordinary operations across session slots | Part lists, completion validation, replacement and dead-session responses match the model | Multipart lifecycle diverges from the model |
+| `p1.histories/listing` | Mutate both buckets, then exercise 16 paginated or invalid listings | Page items, counts, truncation, token shape, echoes and unions match the model | Pagination/grouping diverges from the model |
+| `p1.histories/restart` | Replay 80 operations with three restarts and a pre-restart token reused after restart | All responses match the model across restarts; token continuation is exact | Process-local state is lost or tokens invalidated |
+| `p1.histories/concurrent` | Run 12 concurrent operation groups with quiescent probes | Each group admits a serialization consistent with real-time order and every probe matches a candidate state | Lost writes or non-serializable mixed versions |
+| `p2.batch/kill-during-swap` | Kill during repeated three-rename swap batches, restart each trial | Keys are a permutation of the two bodies, no temp key, coherent headers, store usable after recovery | Torn batch publication or partial rename visible |
+| `p2.batch/kill-after-ack` | Acknowledge copy/rename/delete batch, kill immediately, restart | Every acknowledged effect survives; source keys gone and targets exact | Acknowledges before the atomic commit |
+| `p2.batch/blob-lifetime` | Copy then delete/overwrite source, kill during an unrelated upload, fan-out and restart | Surviving copies keep exact bytes and ranges; overwritten keys are new versions; final listing exact | Blob freed while a copy still references it |
+| `p2.faults/put-preserves-old` | Oversized PUT on a 32 MiB filesystem over an existing object | Failure is 5xx or a closed connection; old object and headers unchanged; server keeps serving; restart preserves state | Truncated body published as success |
+| `p2.faults/space-released` | Repeat failed oversized PUTs, then two sequential 8 MiB PUTs; restart | No partial key appears; both 8 MiB writes succeed; restart preserves them | Failed writes leak staged temp space |
+| `p2.faults/multipart-staging` | Fail an oversized part upload, then list parts, upload a real part and complete | No phantom part; existing part intact; completion exact; later large write succeeds | Part registered before its body is stored |
 
 Do not expand compound cases into extra scored IDs without changing this
 catalog and manifest together. The three performance cases share one workload,

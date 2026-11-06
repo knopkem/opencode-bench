@@ -81,7 +81,7 @@ class ManifestTests(unittest.TestCase):
     def test_catalog_counts(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text())
         families = manifest["families"]
-        self.assertEqual(len(families), 12)
+        self.assertEqual(len(families), 16)
         counts = {"P0": 0, "P1": 0, "P2": 0}
         family_counts = {"P0": 0, "P1": 0, "P2": 0}
         for family in families:
@@ -90,7 +90,7 @@ class ManifestTests(unittest.TestCase):
             self.assertTrue(family["title"].startswith(f"[{family['tier']}]"))
             self.assertEqual(len(family["cases"]), len(set(family["cases"])))
         self.assertEqual(family_counts, manifest["tiers"])
-        self.assertEqual(counts, {"P0": 8, "P1": 30, "P2": 13})
+        self.assertEqual(counts, {"P0": 8, "P1": 42, "P2": 19})
         limits = manifest["limits"]
         self.assertLess(limits["server_rss_bytes"], limits["stream_bytes"])
 

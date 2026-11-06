@@ -1822,6 +1822,10 @@ def p2_perf_family(server: h.Server, limits: Limits) -> dict[str, tuple[bool, st
 # Registry and execution
 
 
+def _not_implemented(server: h.Server, limits: Limits) -> None:
+    fail("case not implemented yet")
+
+
 CASE_FUNCS: dict[str, dict[str, CaseFunc]] = {
     "p0.cli": {
         "roundtrip": p0_cli_roundtrip,
@@ -1894,6 +1898,30 @@ CASE_FUNCS: dict[str, dict[str, CaseFunc]] = {
         "traversal": p2_isolation_traversal,
     },
     "p2.perf": {},
+    "p1.batch": {
+        case: _not_implemented
+        for case in (
+            "copy-rename-delete",
+            "preconditions",
+            "errors",
+            "independence",
+            "cross-feature",
+            "atomic-visibility",
+            "concurrent-batches",
+        )
+    },
+    "p1.histories": {
+        case: _not_implemented
+        for case in ("objects", "multipart", "listing", "restart", "concurrent")
+    },
+    "p2.batch": {
+        case: _not_implemented
+        for case in ("kill-during-swap", "kill-after-ack", "blob-lifetime")
+    },
+    "p2.faults": {
+        case: _not_implemented
+        for case in ("put-preserves-old", "space-released", "multipart-staging")
+    },
 }
 
 

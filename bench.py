@@ -58,8 +58,8 @@ OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
 
 # Family counts for the Locker suite. A family's credit is the fraction of its
 # fixed manifest-backed subcases that pass; P0 gates eligibility but contributes
-# no quality points.
-EXPECTED = {"P0": 3, "P1": 5, "P2": 4}
+# no quality points. EXPECTED counts families, not subcases.
+EXPECTED = {"P0": 3, "P1": 7, "P2": 6}
 WEIGHT = {"P0": 0, "P1": 1, "P2": 1}
 LOCKER_TEST_SCHEMA = "opencode-bench/locker-tests@1"
 LOCKER_MANIFEST_SCHEMA = "opencode-bench/locker-manifest@1"
@@ -2261,8 +2261,9 @@ def cmd_check(args: argparse.Namespace) -> int:
             expected_family_ids = {
                 "p0.cli", "p0.http", "p0.restart",
                 "p1.range", "p1.conditional", "p1.multipart", "p1.listing",
-                "p1.concurrency",
+                "p1.concurrency", "p1.batch", "p1.histories",
                 "p2.overwrite", "p2.multipart", "p2.isolation", "p2.perf",
+                "p2.batch", "p2.faults",
             }
             seen_families: set[str] = set()
             for family in families:
@@ -2299,7 +2300,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                     problems.append(
                         f"manifest has {tier_counts[tier]} {tier} families, expected {expected}"
                     )
-            expected_cases = {"P0": 8, "P1": 30, "P2": 13}
+            expected_cases = {"P0": 8, "P1": 42, "P2": 19}
             for tier, expected in expected_cases.items():
                 if case_counts[tier] != expected:
                     problems.append(
@@ -2314,6 +2315,9 @@ def cmd_check(args: argparse.Namespace) -> int:
                 "progress_deadline_s",
                 "startup_deadline_s",
                 "crash_trials",
+                "batch_max_ops",
+                "fault_fs_bytes",
+                "fault_write_bytes",
             ):
                 if not isinstance(limits.get(key), int) or limits[key] <= 0:
                     problems.append(f"manifest limit {key} must be a positive integer")

@@ -44,19 +44,19 @@ CLI shape.
 
 ## Budget and grading
 
-The prompt asks for roughly 12 minutes of work, with an 60-minute hard cap and
+The prompt asks for roughly 20 minutes of work, with an 60-minute hard cap and
 a 5-minute idle timeout. The model gets the same seed, toolchain and time
 budget every run.
 
 - P0 is a regression gate and contributes no quality points.
-- P1 and P2 are nine equally weighted families. Family credit is passed
+- P1 and P2 are thirteen equally weighted families. Family credit is passed
   required subcases divided by the fixed manifest total.
-- Quality is the mean of the nine P1/P2 family credits.
+- Quality is the mean of the thirteen P1/P2 family credits.
 - Eligible = successful build, every P0 subcase passed, quality ≥ 0.80.
-- All P0 + all P1 + no P2 credit scores `5/9 ≈ 0.556`.
+- All P0 + all P1 + no P2 credit scores `7/13 ≈ 0.538`.
 
-The hidden manifest is `tasks/locker/tests/manifest.json`: 12 families,
-51 subcases (P0 8 / P1 30 / P2 13), suite `locker-v3`, fixture seed
+The hidden manifest is `tasks/locker/tests/manifest.json`: 16 families,
+69 subcases (P0 8 / P1 42 / P2 19), suite `locker-v4`, fixture seed
 `20261106`.
 
 ## Resource limits

@@ -131,3 +131,35 @@ attempts and the full suite.
   ceiling; the provider bill can exceed a target.
 - Independent human/model review of the wire contract and oracle oracles.
 - Any decision to publish a frontier leaderboard or community submissions.
+
+## locker-v4
+
+Catalog changed from 51 to 69 subcases; v3 results are not comparable.
+
+### WP1 Contract
+
+commands run:
+
+```bash
+python3 -m py_compile bench.py
+python3 -m unittest discover -s tests
+python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'
+python3 -c "import json;json.load(open('tasks/locker/tests/manifest.json'))"
+./bench.py check
+cd tasks/locker/seed && go build -trimpath -o bin/locker ./cmd/locker && python3 scripts/smoke.py
+```
+
+Reference full suite (pinned image, `--network none`, built Linux binary):
+51/69 passed; the 51 existing cases pass and the 18 new placeholder cases fail
+with `case not implemented yet`. Seed smoke: 7 public checks fail, including
+exactly the two new `batch copy` and `batch copy visible` checks (the seed
+returns 405 for `POST /b?batch`).
+
+deviations from HARD-TASK-V4-PLAN.md: `AGENTS.md` intro updated so it no longer
+claims the v3 invariants apply; `README.md` budget line also changed from 12 to
+20 minutes; `HARD-TASK-PLAN.md` "Implementation status" line folded into the
+existing v4 paragraph. No code/semantics deviations.
+
+prompt clarifications: none; all §4.1 texts applied verbatim.
+
+open questions: none.

@@ -132,6 +132,17 @@ def main() -> int:
             cli.returncode == 0 and lines and lines[0]["key"] == "key",
             cli.stderr,
         )
+
+        batch = (
+            b"<Batch><Copy><Source>key</Source><Target>key-copy</Target></Copy>"
+            b"<Delete><Key>missing.txt</Key></Delete></Batch>"
+        )
+        status, _headers, _body = client.request(
+            "POST", "/smoke?batch", body=batch, headers={"Content-Type": "application/xml"}
+        )
+        failures += not check("batch copy", status == 200, f"status {status}")
+        status, _headers, returned = client.request("GET", "/smoke/key-copy")
+        failures += not check("batch copy visible", status == 200 and returned == body, f"status {status}")
     finally:
         proc.terminate()
         try:

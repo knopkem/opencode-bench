@@ -4,9 +4,10 @@ This branch (`hard_task`) holds the **Locker** hard-task benchmark. SpriteForge
 and its community leaderboard remain the `main`-branch suite; do not wire Locker
 submissions or CI until the task is calibrated.
 
-`HARD-TASK-V4-PLAN.md` is the step-by-step build sheet for the planned
-`locker-v4` hardening (batch, faults, histories, mutants). It is not
-implemented; the `locker-v3` invariants below apply until it is.
+`HARD-TASK-V4-PLAN.md` is the step-by-step build sheet for the `locker-v4`
+hardening (batch, faults, histories, mutants). Its contract package has landed;
+the reference, state model, cases and mutant campaign are still being built, so
+the invariant section below describes the v4 target catalog.
 
 ## Repository shape
 
@@ -52,19 +53,19 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 
 ## Hidden-suite and scoring invariants
 
-- `tasks/locker/tests/manifest.json` is the source of truth: 12 families,
-  P0 3 / P1 5 / P2 4 families, and 51 fixed subcases P0 8 / P1 30 / P2 13.
-- `EXPECTED = {"P0": 3, "P1": 5, "P2": 4}` in `bench.py` counts **families**.
+- `tasks/locker/tests/manifest.json` is the source of truth: 16 families,
+  P0 3 / P1 7 / P2 6 families, and 69 fixed subcases P0 8 / P1 42 / P2 19.
+- `EXPECTED = {"P0": 3, "P1": 7, "P2": 6}` in `bench.py` counts **families**.
   Changing the catalog requires updating the manifest, `EXPECTED`, prompt and
   docs together; earlier results become non-comparable.
 - Each family's credit is passed required subcases / fixed manifest total.
   Missing subcases earn zero. Duplicate/unknown IDs, wrong titles, wrong suite
   versions and `diagnostic: true` results are invalid.
-- Quality is the mean of the nine P1/P2 family credits. P0 contributes no
+- Quality is the mean of the thirteen P1/P2 family credits. P0 contributes no
   quality points. Eligibility = successful build, every P0 subcase passed,
   quality ≥ 0.80.
 - The runner writes `results.json` with schema
-  `opencode-bench/locker-tests@1`, `suite_version: locker-v3`, the fixture seed
+  `opencode-bench/locker-tests@1`, `suite_version: locker-v4`, the fixture seed
   and per-case durations/errors. `test_ok` is true only when all expected
   subcases pass.
 - The hidden suite runs only against the built `bin/locker`, with
@@ -83,7 +84,8 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - All graded behavior and the exact frozen limits belong in
   `tasks/locker/PROMPT.md`: 128 MiB stream fixture, 96 MiB server `VmHWM` cap,
   180 s large-workload deadline, 10 s progress deadline, 60 s request deadline,
-  15 s startup deadline, 6 bounded crash trials.
+  15 s startup deadline, 6 bounded crash trials, 32 batch operations,
+  33,554,432-byte fault filesystem and 50,331,648-byte oversized write.
 - Go standard library only. No new dependencies, no Node/Playwright, no
   network at build or test time.
 - The image pins Ubuntu 24.04, OpenCode 2.2.5 and the distro Go toolchain.
@@ -143,6 +145,8 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
   Same-model shells contend for the model server and inflate `wall_s`.
 - Crash tests use `SIGKILL`; they check process-kill recovery, not power-loss
   durability or fsync ordering. Do not describe them as power-loss tests.
+- Faults cases need `--tmpfs /scratch` (`run_tests` adds it); running them
+  without a scratch filesystem exits 3 by design.
 - `watchdog: exit` alone is not success. Interpret `outcome`, `COMPLETION.md`,
   `files_changed`, `results.json` and the family credits.
 - The leaderboard speed baseline uses the fastest **eligible** Locker run and
