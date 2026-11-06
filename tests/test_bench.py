@@ -233,6 +233,19 @@ class CommunitySubmissionTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(data["run_id"], self.example["run_id"])
 
+    def test_effort_lines_show_ttft_per_step(self) -> None:
+        meta = {
+            "metrics_source": "db+log",
+            "think_s": 0.0,
+            "ttft_s": 830.0,
+            "ttft_share": 0.51,
+            "steps": 51,
+        }
+        text = "\n".join(bench.render_effort_lines(meta))
+        self.assertIn("TTFT (wait for first token)", text)
+        self.assertIn("00:00:16 per step", text)
+        self.assertIn("51% of wall", text)
+
     def test_extract_block_after_other_fences(self) -> None:
         block = bench._submission_block(self.example)
         body = "Intro\n\n```bash\necho hi\n```\n\n## Result\n\n" + block
@@ -346,6 +359,9 @@ class CommunitySubmissionTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["evidence"]["level"], "verified")
             self.assertEqual(results[0]["source"], "community")
+            html = (out / "index.html").read_text()
+            self.assertIn("TTFT (wait for first token)", html)
+            self.assertIn("TTFT / step", html)
 
     def test_duplicate_prefers_verified(self) -> None:
         issue = json.loads((self.fixtures / "issues.json").read_text())[0]

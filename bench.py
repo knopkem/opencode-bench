@@ -1447,7 +1447,7 @@ def render_effort_lines(meta: dict) -> list[str]:
     ) is not None
     if has_timing:
         buckets = [
-            ("TTFT / prefill", "ttft_s", "ttft_share"),
+            ("TTFT (wait for first token)", "ttft_s", "ttft_share"),
             ("Thinking", "think_s", "think_share"),
             ("Model output", "output_s", "output_share"),
             ("Tool execution", "tool_s", "tool_share"),
@@ -1459,8 +1459,14 @@ def render_effort_lines(meta: dict) -> list[str]:
                 f"| {label} | {format_optional_duration(meta.get(time_key))} | "
                 f"{format_percent(meta.get(share_key))} |"
             )
+        ttft = metric_value(meta, "ttft_s")
+        steps = int(meta.get("steps") or 0)
+        ttft_per_step = ttft / steps if ttft is not None and steps else None
         lines += [
             "",
+            f"- ttft: {format_optional_duration(meta.get('ttft_s'))} total · "
+            f"{format_optional_duration(ttft_per_step)} per step · "
+            f"{format_percent(meta.get('ttft_share'))} of wall",
             f"- tools: shell {format_optional_duration(meta.get('tool_shell_s'))}, "
             f"write/edit {format_optional_duration(meta.get('tool_write_s'))}, "
             f"read {format_optional_duration(meta.get('tool_read_s'))}, "
@@ -4074,7 +4080,7 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
   Provider and Reasoning filters to narrow the table. Missing compaction data
   counts as zero; provider retries are excluded from tok/s and shown separately.
   <div class="legend">
-    <span><i style="background:var(--ttft)"></i>TTFT / prefill</span>
+    <span><i style="background:var(--ttft)"></i>TTFT (wait for first token)</span>
     <span><i style="background:var(--think)"></i>thinking</span>
     <span><i style="background:var(--out)"></i>model output / code</span>
     <span><i style="background:var(--tool)"></i>tool execution</span>
@@ -4309,12 +4315,16 @@ function effortBodyHtml(row) {{
   const retryNote = Number(data.retries || 0) > 0
     ? '<p class="effort-note">Provider errors/retries are counted in wall time and other, but excluded from think/output and tok/s.</p>'
     : '';
+  const ttftNote = Number(data.ttft || 0) > 0
+    ? '<p class="effort-note">TTFT is the wait for the first visible content block; it includes queueing, prefill and any reasoning the provider does not stream.</p>'
+    : '';
   return `
     <div><h3>Time</h3><dl>${{detailList([
       ['Wall', fmtSec(data.wall)],
       ['Wall excl. self-test', fmtSec(Number(data.wall || 0) - Number(data.selfTest || 0))],
       ['Agent turns', fmtSec(data.agent)],
-      ['TTFT / prefill', fmtSec(data.ttft)],
+      ['TTFT (wait for first token)', fmtSec(data.ttft)],
+      ['TTFT / step', Number(data.steps || 0) > 0 ? fmtSec(Number(data.ttft || 0) / Number(data.steps)) : '—'],
       ['Thinking', fmtSec(data.think)],
       ['Model output', fmtSec(data.output)],
       ['Tool execution', fmtSec(data.tool)],
@@ -4323,6 +4333,7 @@ function effortBodyHtml(row) {{
       ['Provider retry', fmtSec(data.retryS)],
       ['Other', fmtSec(data.other)]
     ])}}</dl></div>
+    ${{ttftNote}}
     <div><h3>Request tokens</h3><dl>${{detailList([
       ['Peak request', fmtTok(data.tokensMax)],
       ['Mean request', fmtTok(data.tokensMean)]
