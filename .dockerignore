@@ -6,3 +6,12 @@ docs/
 **/dist/
 **/test-results/
 **/playwright-report/
+results-locker.csv
+report-locker.md
+locker-leaderboard.html
+tasks/locker/**/bin/
+tasks/locker/**/data/
+tasks/locker/reference/
+tasks/locker/tests/
+tasks/locker/CALIBRATION.md
+HARD-TASK-PLAN.md

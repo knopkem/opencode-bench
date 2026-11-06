@@ -8,12 +8,12 @@ Usage:
 
 There is no model list in this repo. `models` asks the local `opencode` CLI what
 its current configuration exposes, and `run --model` passes that reference
-straight through to `opencode run` inside the agent container. The agent
-container gets the local OpenCode config mounted read-only, plus Chromium,
-Playwright and the seed's public smoke tests.
+straight through to `opencode run` inside the agent container. The hard-task
+image is a lean Go image; the agent gets the local OpenCode config mounted
+read-only and the Locker seed.
 
-The hidden Playwright suite is mounted only into the test container after the
-agent is dead.
+The hidden Locker suite is mounted only into the test container after the agent
+is dead.
 """
 
 from __future__ import annotations
@@ -44,20 +44,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-TASK_DIR = ROOT / "tasks" / "spriteforge-lite"
+TASK_DIR = ROOT / "tasks" / "locker"
 SEED_DIR = TASK_DIR / "seed"
 TESTS_DIR = TASK_DIR / "tests"
-PROMPT_PATH = ROOT / "PROMPT.md"
+PROMPT_PATH = TASK_DIR / "PROMPT.md"
 RUNS_DIR = ROOT / "runs"
-RESULTS_PATH = ROOT / "results.csv"
-REPORT_PATH = ROOT / "report.md"
+RESULTS_PATH = ROOT / "results-locker.csv"
+REPORT_PATH = ROOT / "report-locker.md"
 
-DEFAULT_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "opencode-bench:latest")
+DEFAULT_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "opencode-bench-locker:latest")
 DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
 OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
 
-EXPECTED = {"P0": 5, "P1": 9, "P2": 6}
-WEIGHT = {"P0": 3, "P1": 2, "P2": 1}
+# Family counts for the Locker suite. A family's credit is the fraction of its
+# fixed manifest-backed subcases that pass; P0 gates eligibility but contributes
+# no quality points.
+EXPECTED = {"P0": 3, "P1": 5, "P2": 4}
+WEIGHT = {"P0": 0, "P1": 1, "P2": 1}
+LOCKER_TEST_SCHEMA = "opencode-bench/locker-tests@1"
+LOCKER_MANIFEST_SCHEMA = "opencode-bench/locker-manifest@1"
+
 REASONING_ORDER = {
     "xhigh": 6,
     "high": 5,
@@ -67,7 +73,7 @@ REASONING_ORDER = {
     "none": 1,
     "off": 0,
 }
-LEADERBOARD_PATH = ROOT / "leaderboard.html"
+LEADERBOARD_PATH = ROOT / "locker-leaderboard.html"
 SUBMISSIONS_DIR = ROOT / "submissions"
 DOCS_DIR = ROOT / "docs"
 SUBMISSION_SCHEMA = "opencode-bench/result@1"
@@ -77,7 +83,7 @@ BENCHMARK_LABEL = "benchmark-result"
 HIDDEN_LABEL = "hidden"
 VERIFIED_LABEL = "verified"
 ATTENTION_LABEL = "needs-attention"
-LEADERBOARD_WEIGHTS = {"quality": 0.80, "wall": 0.15, "compactions": 0.05}
+LEADERBOARD_WEIGHTS = {"quality": 0.90, "wall": 0.05, "compactions": 0.05}
 # Ineligible runs stay on the leaderboard but keep only this fraction of their
 # score, so a low-quality or broken run drops below quality runs instead of
 # outranking them on raw speed. Tune this to make the penalty larger or smaller.
@@ -85,17 +91,17 @@ LEADERBOARD_INELIGIBLE_FACTOR = 0.75
 METRICS_VERSION = 3
 #: Shell commands that belong to self-testing rather than building.
 SELF_TEST_RE = re.compile(
-    r"(?:playwright\s+test|test:e2e|npm\s+(?:run\s+)?test|vitest|npx\s+playwright)",
+    r"(?:go\s+(?:test|build)|scripts/smoke\.py|python3?\s+scripts/smoke\.py|smoke\.py)",
     re.IGNORECASE,
 )
 #: Build/typecheck commands, tracked separately from self-testing.
 BUILD_TOOL_RE = re.compile(
-    r"(?:npm\s+run\s+build|vite\s+build|(?:npx\s+)?tsc\b|npm\s+run\s+typecheck)",
+    r"(?:go\s+build|go\s+vet)",
     re.IGNORECASE,
 )
 #: Dev-server commands; useful context but not part of the build clock.
 DEV_TOOL_RE = re.compile(
-    r"(?:npm\s+run\s+dev|vite(?:\s+--host)?|npm\s+run\s+preview|vite\s+preview)",
+    r"(?:(?:\./)?(?:bin/)?locker\s+server|go\s+run\s+\./cmd/locker)",
     re.IGNORECASE,
 )
 #: Time and token fields derived from `agent.log` and `opencode-data/opencode.db`.
@@ -133,6 +139,7 @@ EFFORT_FIELDS = [
     "max_request_tokens",
     "mean_request_tokens",
     "cost_usd",
+    "cost_known",
     "think_share",
     "output_share",
     "tool_share",
@@ -153,6 +160,15 @@ CSV_FIELDS = [
     "hardware",
     "rep",
     "goal",
+    "suite_version",
+    "fixture_seed",
+    "harness_commit",
+    "opencode_version",
+    "image",
+    "budget_wall_cap_s",
+    "budget_idle_timeout_s",
+    "budget_enforcement",
+    "pricing_snapshot",
     "variant",
     "thinking",
     "reasoning_effort",
@@ -276,7 +292,7 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 @contextmanager
 def results_lock():
-    """Serialize results.csv and leaderboard updates across processes."""
+    """Serialize results-locker.csv and leaderboard updates across processes."""
     lock_path = RESULTS_PATH.with_suffix(".csv.lock")
     with lock_path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -523,7 +539,9 @@ def copy_seed(destination: Path) -> None:
     shutil.copytree(
         SEED_DIR,
         destination,
-        ignore=shutil.ignore_patterns("node_modules", ".git", "dist", "test-results"),
+        ignore=shutil.ignore_patterns(
+            "bin", "data", "*.test", ".git", "test-results", "__pycache__"
+        ),
     )
     shutil.copy2(PROMPT_PATH, destination / "PROMPT.md")
 
@@ -563,14 +581,14 @@ def count_compactions(data_dir: Path) -> int:
 
 #: Build artefacts and caches that never count as agent edits.
 WORKDIR_ARTEFACTS = {
-    "node_modules",
+    "bin",
+    "data",
     ".git",
-    "dist",
-    "test-results",
-    "playwright-report",
-    "coverage",
-    ".vite",
     ".cache",
+    "test-results",
+    "__pycache__",
+    "node_modules",
+    "dist",
 }
 
 
@@ -587,6 +605,7 @@ def read_agent_usage(log_path: Path) -> dict:
         "max_request_tokens": None,
         "mean_request_tokens": None,
         "cost_usd": 0.0,
+        "cost_known": False,
         "step_median_s": None,
         "step_p90_s": None,
         "step_max_s": None,
@@ -654,6 +673,8 @@ def read_agent_usage(log_path: Path) -> dict:
                 + int(cash.get("read") or 0)
                 + int(cash.get("write") or 0)
             )
+            if "cost" in part:
+                usage["cost_known"] = True
             try:
                 usage["cost_usd"] += float(part.get("cost") or 0)
             except (TypeError, ValueError):
@@ -960,6 +981,7 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
         cache_read_tokens = cache_write_tokens = 0
         cost_usd = 0.0
         steps = 0
+    cost_known = bool(usage.get("cost_known"))
 
     max_request_tokens = usage.get("max_request_tokens")
     mean_request_tokens = usage.get("mean_request_tokens")
@@ -991,6 +1013,7 @@ def compute_metrics(log_path: Path, data_dir: Path, wall_s: float) -> dict:
         "max_request_tokens": max_request_tokens,
         "mean_request_tokens": mean_request_tokens,
         "cost_usd": round(cost_usd, 6),
+        "cost_known": cost_known,
         "step_median_s": usage.get("step_median_s"),
         "step_p90_s": usage.get("step_p90_s"),
         "step_max_s": usage.get("step_max_s"),
@@ -1280,7 +1303,9 @@ def start_agent(
 
     wall_s = time.time() - start
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    self_tests = log_text.count("playwright test") + log_text.count("test:e2e")
+    self_tests = len(
+        re.findall(r"(?:go\s+(?:test|build|vet)|scripts/smoke\.py)", log_text, re.IGNORECASE)
+    )
     return {
         "wall_s": wall_s,
         "watchdog": watchdog,
@@ -1295,6 +1320,68 @@ def read_code(path: Path) -> int | None:
         return int(path.read_text().strip())
     except (FileNotFoundError, ValueError):
         return None
+
+
+def load_locker_manifest() -> dict:
+    path = TESTS_DIR / "manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schema") != LOCKER_MANIFEST_SCHEMA:
+        raise SystemExit(f"error: {path} has unexpected schema {data.get('schema')!r}")
+    return data
+
+
+def _manifest_family_map(manifest: dict) -> dict[str, dict]:
+    return {str(family["id"]): family for family in manifest["families"]}
+
+
+def validate_locker_result(
+    data: object, manifest: dict
+) -> tuple[dict[str, dict[str, bool]] | None, str | None]:
+    """Validate the versioned hidden-suite result without trusting derived data."""
+    if not isinstance(data, dict):
+        return None, "results.json must contain a JSON object"
+    if data.get("schema") != LOCKER_TEST_SCHEMA:
+        return None, f"results.json schema must be {LOCKER_TEST_SCHEMA!r}"
+    if data.get("suite_version") != manifest.get("suite_version"):
+        return None, "results.json suite_version does not match the manifest"
+    if data.get("seed") != manifest.get("seed"):
+        return None, "results.json seed does not match the manifest"
+    if data.get("diagnostic") is not False:
+        return None, "diagnostic results are not eligible for scoring"
+    entries = data.get("tests")
+    if not isinstance(entries, list):
+        return None, "results.json tests must be a list"
+    expected = _manifest_family_map(manifest)
+    tests: dict[str, dict[str, bool]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None, "each test family must be an object"
+        family_id = entry.get("id")
+        if family_id not in expected:
+            return None, f"unknown family id {family_id!r}"
+        if family_id in tests:
+            return None, f"duplicate family id {family_id!r}"
+        family = expected[family_id]
+        if entry.get("title") != family.get("title"):
+            return None, f"family {family_id!r} title does not match the manifest"
+        cases = entry.get("cases")
+        if not isinstance(cases, list):
+            return None, f"family {family_id!r} cases must be a list"
+        expected_cases = set(family["cases"])
+        found: dict[str, bool] = {}
+        for case in cases:
+            if not isinstance(case, dict):
+                return None, f"family {family_id!r} case must be an object"
+            case_id = case.get("id")
+            if case_id not in expected_cases:
+                return None, f"unknown case id {case_id!r} in {family_id!r}"
+            if case_id in found:
+                return None, f"duplicate case id {case_id!r} in {family_id!r}"
+            if not isinstance(case.get("ok"), bool):
+                return None, f"case {family_id}/{case_id} ok must be boolean"
+            found[str(case_id)] = bool(case["ok"])
+        tests[str(family_id)] = found
+    return tests, None
 
 
 def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run: bool) -> dict:
@@ -1314,24 +1401,32 @@ def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         "bash",
         "-lc",
         "set +e; "
-        "npm run typecheck > /out/typecheck.log 2>&1; "
-        "echo $? > /out/typecheck.code; "
-        "npm run build > /out/build.log 2>&1; "
+        "rm -rf /work/bin; mkdir -p /work/bin; "
+        "go build -trimpath -o /work/bin/locker ./cmd/locker > /out/build.log 2>&1; "
         "echo $? > /out/build.code; "
-        "test -f /out/build.code",
+        "test -f /work/bin/locker",
     ]
     proc = run_command(command, log_path=run_dir / "build-run.log", dry_run=dry_run)
     if dry_run:
-        return {"typecheck_ok": True, "build_ok": True, "dist": True}
+        return {"build_ok": True, "typecheck_ok": True, "binary": True}
     return {
-        "typecheck_ok": read_code(run_dir / "typecheck.code") == 0,
         "build_ok": read_code(run_dir / "build.code") == 0 and proc.returncode == 0,
-        "dist": (workdir / "dist" / "index.html").exists(),
+        "typecheck_ok": True,
+        "binary": (workdir / "bin" / "locker").exists(),
     }
 
 
-def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run: bool) -> dict:
-    result_file = run_dir / "playwright.json"
+def run_tests(
+    run_dir: Path,
+    workdir: Path,
+    *,
+    engine: str,
+    image: str,
+    dry_run: bool,
+    manifest: dict | None = None,
+) -> dict:
+    manifest = manifest or load_locker_manifest()
+    result_file = run_dir / "results.json"
     if result_file.exists():
         result_file.unlink()
     command = [
@@ -1340,100 +1435,164 @@ def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         "--rm",
         "--network",
         "none",
-        "--shm-size=1g",
         "-v",
-        f"{workdir / 'dist'}:/app:ro",
+        f"{workdir}:/app:ro",
         "-v",
-        f"{TESTS_DIR}:/opt/opencode-bench/tests:ro",
+        f"{TESTS_DIR}:/opt/opencode-bench/locker-tests:ro",
         "-v",
         f"{run_dir}:/out",
         "-w",
         "/opt/opencode-bench",
         "-e",
-        "BASE_URL=http://127.0.0.1:4173",
+        "HOME=/tmp",
         "-e",
-        "RESULT_FILE=/out/playwright.json",
-        "-e",
-        "OUTPUT_DIR=/out/test-results",
+        "TMPDIR=/tmp",
         image,
-        "bash",
-        "-lc",
-        "npx playwright test --config /opt/opencode-bench/tests/playwright.config.ts",
+        "python3",
+        "-B",
+        "/opt/opencode-bench/locker-tests/run.py",
+        "--binary",
+        "/app/bin/locker",
+        "--manifest",
+        "/opt/opencode-bench/locker-tests/manifest.json",
+        "--seed",
+        str(manifest.get("seed", 1)),
+        "--output",
+        "/out/results.json",
     ]
     proc = run_command(command, log_path=run_dir / "test.log", dry_run=dry_run)
     if dry_run:
-        return {"test_ok": True, "tests": {}, "error": None, "exit_code": 0}
+        return {"test_ok": True, "tests": {}, "result": None, "error": None, "exit_code": 0}
     if not result_file.exists():
         return {
             "test_ok": False,
             "tests": {},
-            "error": "playwright.json missing (suite failed to start)",
+            "result": None,
+            "error": "results.json missing (suite failed to start)",
             "exit_code": proc.returncode,
         }
     try:
-        data = json.loads(result_file.read_text())
+        data = json.loads(result_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         return {
             "test_ok": False,
             "tests": {},
-            "error": f"invalid playwright.json: {exc}",
+            "result": None,
+            "error": f"invalid results.json: {exc}",
             "exit_code": proc.returncode,
         }
-
-    tests: dict[str, bool] = {}
-
-    def walk(suites: list) -> None:
-        for suite in suites:
-            for spec in suite.get("specs", []):
-                title = str(spec.get("title", ""))
-                ok = spec.get("ok")
-                if ok is None:
-                    results = [
-                        result
-                        for test in spec.get("tests", [])
-                        for result in test.get("results", [])
-                    ]
-                    ok = bool(results) and all(result.get("status") == "passed" for result in results)
-                tests[title] = bool(ok)
-            walk(suite.get("suites", []))
-
-    walk(data.get("suites", []))
+    tests, error = validate_locker_result(data, manifest)
+    if error is not None or tests is None:
+        return {
+            "test_ok": False,
+            "tests": {},
+            "result": data if isinstance(data, dict) else None,
+            "error": error or "invalid results.json",
+            "exit_code": proc.returncode,
+        }
+    failed = sum(1 for cases in tests.values() for ok in cases.values() if not ok)
+    expected_cases = sum(len(family["cases"]) for family in manifest["families"])
+    missing = expected_cases - sum(len(cases) for cases in tests.values())
+    all_ok = proc.returncode == 0 and failed == 0 and missing == 0
     return {
-        "test_ok": proc.returncode == 0,
+        "test_ok": all_ok,
         "tests": tests,
-        "error": None if proc.returncode == 0 else f"playwright exit {proc.returncode}",
+        "result": data,
+        "error": None if all_ok else f"{failed} failed and {missing} missing subcases",
         "exit_code": proc.returncode,
     }
 
 
-def score_run(tests: dict[str, bool], build: dict, *, goal: str) -> dict:
-    counts = {tier: {"pass": 0, "total": EXPECTED[tier]} for tier in EXPECTED}
+def score_run(
+    tests: dict[str, dict[str, bool]],
+    build: dict,
+    *,
+    goal: str,
+    manifest: dict,
+    result_valid: bool = True,
+) -> dict:
+    families: list[dict] = []
+    p0_pass_cases = 0
+    p0_total_cases = 0
+    p1_failed_cases = 0
+    p2_failed_cases = 0
+    for family in manifest["families"]:
+        family_id = str(family["id"])
+        provided = tests.get(family_id, {})
+        expected_cases = list(family["cases"])
+        case_results = {case_id: bool(provided.get(case_id, False)) for case_id in expected_cases}
+        passed = sum(1 for ok in case_results.values() if ok)
+        credit = passed / len(expected_cases) if expected_cases else 0.0
+        tier = str(family["tier"])
+        if tier == "P0":
+            p0_pass_cases += passed
+            p0_total_cases += len(expected_cases)
+        elif tier == "P1":
+            p1_failed_cases += len(expected_cases) - passed
+        elif tier == "P2":
+            p2_failed_cases += len(expected_cases) - passed
+        families.append(
+            {
+                "id": family_id,
+                "tier": tier,
+                "title": family["title"],
+                "cases": case_results,
+                "passed": passed,
+                "total": len(expected_cases),
+                "credit": credit,
+            }
+        )
+
+    challenge = [item for item in families if item["tier"] in ("P1", "P2")]
+    quality = (
+        sum(item["credit"] for item in challenge) / len(challenge)
+        if challenge
+        else 0.0
+    )
+    counts = {
+        tier: {
+            "pass": sum(1 for item in families if item["tier"] == tier and item["credit"] == 1.0),
+            "total": EXPECTED[tier],
+        }
+        for tier in EXPECTED
+    }
     details = []
-    for title, ok in tests.items():
-        match = re.match(r"^\[(P[012])\]", title)
-        tier = match.group(1) if match else "P2"
-        if ok:
-            counts[tier]["pass"] += 1
-        details.append({"title": title, "tier": tier, "ok": ok})
-
-    for tier, expected in EXPECTED.items():
-        counts[tier]["pass"] = min(counts[tier]["pass"], expected)
-
-    weighted_total = sum(WEIGHT[tier] * EXPECTED[tier] for tier in EXPECTED)
-    weighted_pass = sum(WEIGHT[tier] * counts[tier]["pass"] for tier in EXPECTED)
-    quality = weighted_pass / weighted_total if weighted_total else 0.0
-    fatal = counts["P0"]["total"] - counts["P0"]["pass"]
-    major = counts["P1"]["total"] - counts["P1"]["pass"]
-    minor = counts["P2"]["total"] - counts["P2"]["pass"]
-    eligible = bool(build.get("build_ok")) and fatal == 0 and quality >= 0.80
-
+    for item in families:
+        details.append(
+            {
+                "tier": item["tier"],
+                "title": item["title"],
+                "ok": item["credit"] == 1.0,
+                "credit": item["credit"],
+                "passed": item["passed"],
+                "total": item["total"],
+                "failed_cases": [
+                    case_id for case_id, ok in item["cases"].items() if not ok
+                ],
+            }
+        )
+    fatal = p0_total_cases - p0_pass_cases
+    eligible = (
+        bool(build.get("build_ok"))
+        and result_valid
+        and fatal == 0
+        and quality >= 0.80
+    )
     return {
+        "families": families,
         "counts": counts,
         "details": details,
         "quality": quality,
         "fatal": fatal,
-        "major": major,
-        "minor": minor,
+        "major": p1_failed_cases,
+        "minor": p2_failed_cases,
+        "p0_cases": {"pass": p0_pass_cases, "total": p0_total_cases},
+        "subcases": {
+            "pass": p0_pass_cases
+            + sum(item["passed"] for item in families if item["tier"] != "P0"),
+            "total": p0_total_cases
+            + sum(item["total"] for item in families if item["tier"] != "P0"),
+        },
         "eligible": eligible,
         "goal": goal,
     }
@@ -1509,7 +1668,7 @@ def render_effort_lines(meta: dict) -> list[str]:
         f"- total tokens: {format_tokens(meta.get('total_tokens'))}; "
         f"generation: {gen_text}",
         f"- cache hit rate: {format_percent(meta.get('cache_hit_rate'))}; "
-        f"cost: {meta.get('cost_usd', 0)}",
+        f"cost: {meta.get('cost_usd', 0) if meta.get('cost_known') else 'unknown'}",
         "",
     ]
     if meta.get("reasoning_tokens") in (0, "0", 0.0) and meta.get("think_s"):
@@ -1556,18 +1715,22 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- build: {'ok' if meta['build_ok'] else 'failed'}",
         f"- typecheck: {'ok' if meta['typecheck_ok'] else 'failed'}",
         f"- quality: {score['quality']:.3f}",
+        f"- subcases: {score['subcases']['pass']}/{score['subcases']['total']}",
+        f"- P0 gate: {score['p0_cases']['pass']}/{score['p0_cases']['total']}",
         f"- fatal/major/minor: {score['fatal']}/{score['major']}/{score['minor']}",
         f"- eligible: {score['eligible']}",
         "",
         *render_effort_lines(meta),
         "## Tests",
         "",
-        "| tier | test | result |",
-        "|---|---|---|",
+        "| tier | family | credit | failed subcases |",
+        "|---|---|---:|---|",
     ]
     for detail in score["details"]:
+        failed = ", ".join(detail.get("failed_cases") or []) or "-"
         lines.append(
-            f"| {detail['tier']} | {detail['title']} | {'pass' if detail['ok'] else 'FAIL'} |"
+            f"| {detail['tier']} | {detail['title']} | "
+            f"{detail['passed']}/{detail['total']} | {failed} |"
         )
     lines += [
         "",
@@ -1575,9 +1738,8 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         "- `agent.log`",
         "- `build.log`",
-        "- `typecheck.log`",
         "- `test.log`",
-        "- `playwright.json`",
+        "- `results.json`",
         "",
     ]
     (run_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
@@ -1650,9 +1812,10 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   thinking {thinking}" + (f" ({effort})" if effort else "")
     )
     print(
-        f"  P0 {counts['P0']['pass']}/{counts['P0']['total']}"
+        f"  families P0 {counts['P0']['pass']}/{counts['P0']['total']}"
         f"   P1 {counts['P1']['pass']}/{counts['P1']['total']}"
         f"   P2 {counts['P2']['pass']}/{counts['P2']['total']}"
+        f"   subcases {score['subcases']['pass']}/{score['subcases']['total']}"
     )
     print(
         f"  quality {score['quality']:.2f}"
@@ -1694,7 +1857,8 @@ def print_summary(meta: dict, score: dict) -> None:
         f" · peak {format_tokens(meta.get('max_request_tokens'))} req tok"
         f" · {gen_text} tok/s"
     )
-    print(f"  report {meta['report']}")
+    if meta.get("report"):
+        print(f"  report {meta['report']}")
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -1705,12 +1869,12 @@ def cmd_build(args: argparse.Namespace) -> int:
         args.engine,
         "build",
         "-f",
-        str(ROOT / "docker" / "agent.Dockerfile"),
+        str(ROOT / "docker" / "locker.Dockerfile"),
         "-t",
         args.image,
     ]
-    if args.playwright_image:
-        command += ["--build-arg", f"PLAYWRIGHT_IMAGE={args.playwright_image}"]
+    if args.ubuntu_image:
+        command += ["--build-arg", f"UBUNTU_IMAGE={args.ubuntu_image}"]
     if args.opencode_version:
         command += ["--build-arg", f"OPENCODE_VERSION={args.opencode_version}"]
     command.append(str(ROOT))
@@ -1852,7 +2016,7 @@ def claim_run_dir(base_id: str) -> tuple[str, Path]:
 def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | None) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     variant_slug = slug(variant) if variant else "default"
-    base_id = f"{timestamp}-{slug(model)}-{variant_slug}-r{rep}"
+    base_id = f"{timestamp}-locker-{slug(model)}-{variant_slug}-r{rep}"
     run_id, run_dir = claim_run_dir(base_id)
     workdir = run_dir / "workdir"
     data_dir = run_dir / "opencode-data"
@@ -1898,14 +2062,23 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         files_changed=files_changed,
         agent_ok=agent["agent_ok"],
     )
+    manifest = load_locker_manifest()
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
-    if build["dist"]:
-        tests = run_tests(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
+    if build["binary"]:
+        tests = run_tests(
+            run_dir,
+            workdir,
+            engine=args.engine,
+            image=args.image,
+            dry_run=args.dry_run,
+            manifest=manifest,
+        )
     else:
         tests = {
             "test_ok": False,
             "tests": {},
-            "error": "dist/index.html missing; suite not run",
+            "result": None,
+            "error": "bin/locker missing; suite not run",
             "exit_code": None,
         }
 
@@ -1914,7 +2087,20 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         shutil.rmtree(run_dir, ignore_errors=True)
         return {}
 
-    score = score_run(tests["tests"], build, goal=args.goal)
+    score = score_run(
+        tests["tests"],
+        build,
+        goal=args.goal,
+        manifest=manifest,
+        result_valid=tests.get("result") is not None,
+    )
+    tier_cases = {
+        tier: {
+            "pass": sum(item["passed"] for item in score["families"] if item["tier"] == tier),
+            "total": sum(item["total"] for item in score["families"] if item["tier"] == tier),
+        }
+        for tier in EXPECTED
+    }
     meta = {
         "run_id": run_id,
         "timestamp": timestamp,
@@ -1923,6 +2109,15 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "hardware": (getattr(args, "hardware", None) or "").strip()[:300],
         "rep": rep,
         "goal": args.goal,
+        "suite_version": manifest.get("suite_version"),
+        "fixture_seed": manifest.get("seed"),
+        "harness_commit": _git_output("rev-parse", "--short=12", "HEAD"),
+        "opencode_version": os.environ.get("OPENCODE_BENCH_OPENCODE_VERSION"),
+        "image": args.image,
+        "budget_wall_cap_s": args.timeout,
+        "budget_idle_timeout_s": args.idle_timeout,
+        "budget_enforcement": "wall and idle watchdogs only; provider token/spend limits are not enforced",
+        "pricing_snapshot": None,
         "variant": variant_label,
         "thinking": thinking,
         "reasoning_effort": effort,
@@ -1945,15 +2140,19 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "test_ok": tests["test_ok"],
         "test_error": tests["error"],
         "counts": score["counts"],
+        "tier_cases": tier_cases,
+        "subcases": score["subcases"],
+        "p0_cases": score["p0_cases"],
+        "families": score["families"],
         "quality": score["quality"],
         "fatal": score["fatal"],
         "major": score["major"],
         "minor": score["minor"],
         "eligible": score["eligible"],
+        "limits": manifest.get("limits"),
         "report": str(run_dir / "report.md"),
         "agent_log": str(run_dir / "agent.log"),
         "build_log": str(run_dir / "build.log"),
-        "typecheck_log": str(run_dir / "typecheck.log"),
         "test_log": str(run_dir / "test.log"),
     }
     write_run_report(run_dir, meta, score)
@@ -1963,12 +2162,12 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         **meta,
         "major_issues": score["major"],
         "minor_issues": score["minor"],
-        "p0_pass": score["counts"]["P0"]["pass"],
-        "p0_total": score["counts"]["P0"]["total"],
-        "p1_pass": score["counts"]["P1"]["pass"],
-        "p1_total": score["counts"]["P1"]["total"],
-        "p2_pass": score["counts"]["P2"]["pass"],
-        "p2_total": score["counts"]["P2"]["total"],
+        "p0_pass": tier_cases["P0"]["pass"],
+        "p0_total": tier_cases["P0"]["total"],
+        "p1_pass": tier_cases["P1"]["pass"],
+        "p1_total": tier_cases["P1"]["total"],
+        "p2_pass": tier_cases["P2"]["pass"],
+        "p2_total": tier_cases["P2"]["total"],
     }
     append_result(row)
     try:
@@ -2017,23 +2216,107 @@ def cmd_check(args: argparse.Namespace) -> int:
     problems: list[str] = []
     if not PROMPT_PATH.exists():
         problems.append(f"missing {PROMPT_PATH}")
-    if not (SEED_DIR / "package.json").exists():
-        problems.append(f"missing {SEED_DIR / 'package.json'}")
-    if not (SEED_DIR / "package-lock.json").exists():
-        problems.append(f"missing {SEED_DIR / 'package-lock.json'}")
-    hidden = sorted(TESTS_DIR.glob("*.spec.ts"))
-    if not hidden:
-        problems.append(f"no hidden specs in {TESTS_DIR}")
+    if not (ROOT / "docker" / "locker.Dockerfile").exists():
+        problems.append(f"missing {ROOT / 'docker' / 'locker.Dockerfile'}")
+    for required in (
+        SEED_DIR / "go.mod",
+        SEED_DIR / "cmd" / "locker" / "main.go",
+        SEED_DIR / "internal" / "server",
+        SEED_DIR / "internal" / "store",
+        SEED_DIR / "internal" / "cli",
+        SEED_DIR / "scripts" / "smoke.py",
+        SEED_DIR / "AGENTS.md",
+        TESTS_DIR / "run.py",
+        TESTS_DIR / "helpers.py",
+        TESTS_DIR / "test_oracles.py",
+        TESTS_DIR / "test_runner.py",
+    ):
+        if not required.exists():
+            problems.append(f"missing {required}")
+
+    manifest: dict = {}
+    manifest_path = TESTS_DIR / "manifest.json"
     tier_counts = {tier: 0 for tier in EXPECTED}
-    for path in hidden:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for tier in tier_counts:
-            tier_counts[tier] += len(re.findall(rf'test\("\[{tier}\]', text))
-    for tier, expected in EXPECTED.items():
-        if tier_counts[tier] != expected:
-            problems.append(
-                f"hidden suite has {tier_counts[tier]} {tier} tests, expected {expected}"
-            )
+    case_counts = {tier: 0 for tier in EXPECTED}
+    if not manifest_path.exists():
+        problems.append(f"missing {manifest_path}")
+    else:
+        try:
+            manifest = load_locker_manifest()
+        except (json.JSONDecodeError, SystemExit) as exc:
+            problems.append(f"invalid manifest: {exc}")
+        else:
+            if not isinstance(manifest.get("suite_version"), str) or not manifest["suite_version"]:
+                problems.append("manifest suite_version must be a non-empty string")
+            families = manifest.get("families")
+            if not isinstance(families, list):
+                problems.append("manifest families must be a list")
+                families = []
+            expected_family_ids = {
+                "p0.cli", "p0.http", "p0.restart",
+                "p1.range", "p1.conditional", "p1.multipart", "p1.listing",
+                "p1.concurrency",
+                "p2.overwrite", "p2.multipart", "p2.isolation", "p2.perf",
+            }
+            seen_families: set[str] = set()
+            for family in families:
+                if not isinstance(family, dict):
+                    problems.append("manifest family must be an object")
+                    continue
+                family_id = str(family.get("id", ""))
+                tier = str(family.get("tier", ""))
+                if family_id in seen_families:
+                    problems.append(f"duplicate manifest family {family_id!r}")
+                seen_families.add(family_id)
+                if tier not in EXPECTED:
+                    problems.append(f"manifest family {family_id!r} has invalid tier {tier!r}")
+                    continue
+                tier_counts[tier] += 1
+                cases = family.get("cases")
+                if not isinstance(cases, list) or not cases:
+                    problems.append(f"manifest family {family_id!r} has no cases")
+                    continue
+                if len(set(cases)) != len(cases):
+                    problems.append(f"manifest family {family_id!r} has duplicate cases")
+                case_counts[tier] += len(cases)
+                title = str(family.get("title", ""))
+                if not title.startswith(f"[{tier}]"):
+                    problems.append(f"manifest family {family_id!r} title lacks [{tier}] prefix")
+            if seen_families != expected_family_ids:
+                missing = sorted(expected_family_ids - seen_families)
+                extra = sorted(seen_families - expected_family_ids)
+                problems.append(
+                    f"manifest family ids differ from the frozen catalog (missing {missing}, extra {extra})"
+                )
+            for tier, expected in EXPECTED.items():
+                if tier_counts[tier] != expected:
+                    problems.append(
+                        f"manifest has {tier_counts[tier]} {tier} families, expected {expected}"
+                    )
+            expected_cases = {"P0": 8, "P1": 30, "P2": 13}
+            for tier, expected in expected_cases.items():
+                if case_counts[tier] != expected:
+                    problems.append(
+                        f"manifest has {case_counts[tier]} {tier} subcases, expected {expected}"
+                    )
+            limits = manifest.get("limits") if isinstance(manifest.get("limits"), dict) else {}
+            for key in (
+                "stream_bytes",
+                "server_rss_bytes",
+                "operation_deadline_s",
+                "request_deadline_s",
+                "progress_deadline_s",
+                "startup_deadline_s",
+                "crash_trials",
+            ):
+                if not isinstance(limits.get(key), int) or limits[key] <= 0:
+                    problems.append(f"manifest limit {key} must be a positive integer")
+            if problems == []:
+                prompt = PROMPT_PATH.read_text(encoding="utf-8", errors="replace")
+                for key, value in limits.items():
+                    if str(value) not in prompt and f"{value:,}" not in prompt:
+                        problems.append(f"PROMPT.md does not state the frozen {key} value {value}")
+
     if not engine_available(args.engine, args.dry_run):
         problems.append(f"{args.engine} is not available")
     elif not args.dry_run and not image_exists(args.engine, args.image):
@@ -2064,7 +2347,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                     args.image,
                     "bash",
                     "-lc",
-                    "opencode --version && node --version && npx playwright --version",
+                    "opencode --version && go version && python3 --version",
                 ],
                 capture_output=True,
                 text=True,
@@ -2088,7 +2371,12 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"  image   {args.image}")
     print(f"  seed    {SEED_DIR}")
     counts_label = " / ".join(f"{tier} {tier_counts[tier]}" for tier in EXPECTED)
-    print(f"  tests   {TESTS_DIR} ({sum(tier_counts.values())} tests: {counts_label})")
+    case_label = " / ".join(f"{tier} {case_counts[tier]}" for tier in EXPECTED)
+    print(
+        f"  tests   {TESTS_DIR} ({sum(tier_counts.values())} families: {counts_label}; "
+        f"{sum(case_counts.values())} subcases: {case_label})"
+    )
+    print(f"  suite   {manifest.get('suite_version')} seed {manifest.get('seed')}")
     print(f"  config  {config_dir}")
     print(f"  models  {len(models)}")
     if versions:
@@ -2131,12 +2419,33 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         files_changed=meta["files_changed"],
         agent_ok=bool(meta.get("agent_ok")),
     )
+    manifest = load_locker_manifest()
     build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
-    if not build["dist"]:
-        eprint("error: build produced no dist/index.html")
+    if not build["binary"]:
+        eprint("error: build produced no bin/locker")
         return 1
-    tests = run_tests(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
-    score = score_run(tests["tests"], build, goal=meta.get("goal", "balanced"))
+    tests = run_tests(
+        run_dir,
+        workdir,
+        engine=args.engine,
+        image=args.image,
+        dry_run=False,
+        manifest=manifest,
+    )
+    score = score_run(
+        tests["tests"],
+        build,
+        goal=meta.get("goal", "balanced"),
+        manifest=manifest,
+        result_valid=tests.get("result") is not None,
+    )
+    tier_cases = {
+        tier: {
+            "pass": sum(item["passed"] for item in score["families"] if item["tier"] == tier),
+            "total": sum(item["total"] for item in score["families"] if item["tier"] == tier),
+        }
+        for tier in EXPECTED
+    }
     meta.update(
         {
             "build_ok": build["build_ok"],
@@ -2144,11 +2453,25 @@ def cmd_rescore(args: argparse.Namespace) -> int:
             "test_ok": tests["test_ok"],
             "test_error": tests["error"],
             "counts": score["counts"],
+            "tier_cases": tier_cases,
+            "subcases": score["subcases"],
+            "p0_cases": score["p0_cases"],
+            "families": score["families"],
             "quality": score["quality"],
             "fatal": score["fatal"],
             "major": score["major"],
             "minor": score["minor"],
             "eligible": score["eligible"],
+            "suite_version": manifest.get("suite_version"),
+            "fixture_seed": manifest.get("seed"),
+            "harness_commit": _git_output("rev-parse", "--short=12", "HEAD"),
+            "opencode_version": os.environ.get("OPENCODE_BENCH_OPENCODE_VERSION"),
+            "image": args.image,
+            "limits": manifest.get("limits"),
+            "report": str(run_dir / "report.md"),
+            "agent_log": str(run_dir / "agent.log"),
+            "build_log": str(run_dir / "build.log"),
+            "test_log": str(run_dir / "test.log"),
         }
     )
     write_run_report(run_dir, meta, score)
@@ -2157,12 +2480,12 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         **meta,
         "major_issues": score["major"],
         "minor_issues": score["minor"],
-        "p0_pass": score["counts"]["P0"]["pass"],
-        "p0_total": score["counts"]["P0"]["total"],
-        "p1_pass": score["counts"]["P1"]["pass"],
-        "p1_total": score["counts"]["P1"]["total"],
-        "p2_pass": score["counts"]["P2"]["pass"],
-        "p2_total": score["counts"]["P2"]["total"],
+        "p0_pass": tier_cases["P0"]["pass"],
+        "p0_total": tier_cases["P0"]["total"],
+        "p1_pass": tier_cases["P1"]["pass"],
+        "p1_total": tier_cases["P1"]["total"],
+        "p2_pass": tier_cases["P2"]["pass"],
+        "p2_total": tier_cases["P2"]["total"],
     }
     rewrite_result(meta["run_id"], row)
     try:
@@ -2196,7 +2519,7 @@ def _backfill_row(meta: dict, existing: dict) -> dict:
     row.update(meta)
     row["major_issues"] = meta.get("major", 0)
     row["minor_issues"] = meta.get("minor", 0)
-    counts = meta.get("counts") or {}
+    counts = meta.get("tier_cases") or meta.get("counts") or {}
     for tier in ("P0", "P1", "P2"):
         tier_counts = counts.get(tier) or {}
         row[f"{tier.lower()}_pass"] = tier_counts.get("pass", row.get(f"{tier.lower()}_pass", ""))
@@ -2209,7 +2532,11 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         run_dirs = [RUNS_DIR / args.run]
     elif args.all:
         run_dirs = (
-            sorted(path for path in RUNS_DIR.iterdir() if (path / "score.json").exists())
+            sorted(
+                path
+                for path in RUNS_DIR.iterdir()
+                if (path / "score.json").exists() and "-locker-" in path.name
+            )
             if RUNS_DIR.exists()
             else []
         )
@@ -2218,7 +2545,9 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             [
                 path
                 for path in RUNS_DIR.iterdir()
-                if path.is_dir() and (path / "agent.log").exists()
+                if path.is_dir()
+                and (path / "agent.log").exists()
+                and "-locker-" in path.name
             ]
             if RUNS_DIR.exists()
             else []
@@ -2408,21 +2737,32 @@ def cmd_preview(args: argparse.Namespace) -> int:
         runs = [
             path
             for path in RUNS_DIR.iterdir()
-            if (path / "workdir" / "dist" / "index.html").exists()
+            if (path / "workdir" / "bin" / "locker").exists()
         ] if RUNS_DIR.exists() else []
         if not runs:
             eprint("error: no built run found")
             return 1
-        run_dir = max(runs, key=lambda path: (path / "workdir" / "dist").stat().st_mtime)
-    dist = run_dir / "workdir" / "dist"
-    if not (dist / "index.html").exists():
-        eprint(f"error: {dist}/index.html missing; run ./bench.py rescore")
+        run_dir = max(
+            runs,
+            key=lambda path: (path / "workdir" / "bin" / "locker").stat().st_mtime,
+        )
+    binary = run_dir / "workdir" / "bin" / "locker"
+    if not binary.exists():
+        eprint(f"error: {binary} missing; run ./bench.py rescore")
         return 1
-    print(f"serving {dist}")
-    print(f"open http://127.0.0.1:{args.port}/")
+    data = run_dir / "preview-data"
+    data.mkdir(parents=True, exist_ok=True)
+    print(f"serving {binary} on http://127.0.0.1:{args.port}/")
     print("Ctrl+C to stop")
     return subprocess.run(
-        ["node", str(ROOT / "docker" / "serve.mjs"), str(dist), str(args.port)],
+        [
+            str(binary),
+            "server",
+            "--data",
+            str(data),
+            "--addr",
+            f"127.0.0.1:{args.port}",
+        ],
         check=False,
     ).returncode
 
@@ -2435,6 +2775,15 @@ def failed_tests(path: Path) -> list[str]:
     except json.JSONDecodeError:
         return []
     failures: list[str] = []
+    if isinstance(data, dict) and data.get("schema") == LOCKER_TEST_SCHEMA:
+        for family in data.get("tests") or []:
+            if not isinstance(family, dict):
+                continue
+            for case in family.get("cases") or []:
+                if case.get("ok") is False:
+                    detail = case.get("error") or "failed"
+                    failures.append(f"{family.get('id')}/{case.get('id')}: {detail}")
+        return failures
 
     def walk(suites: list) -> None:
         for suite in suites:
@@ -3091,7 +3440,7 @@ def submission_template() -> dict:
         "harness": {
             "commit": None,
             "opencode_version": None,
-            "suite": "spriteforge-lite",
+            "suite": "locker",
             "hidden_tests": dict(EXPECTED),
         },
         "model": {
@@ -3289,7 +3638,7 @@ def submission_from_score(meta: dict, *, hardware: str | None = None) -> dict:
         "harness": {
             "commit": _git_output("rev-parse", "--short=12", "HEAD"),
             "opencode_version": os.environ.get("OPENCODE_BENCH_OPENCODE_VERSION"),
-            "suite": "spriteforge-lite",
+            "suite": "locker",
             "hidden_tests": dict(EXPECTED),
         },
         "model": {
@@ -3622,7 +3971,7 @@ def render_leaderboard(
     output_path: Path = LEADERBOARD_PATH,
     *,
     public: bool = False,
-    title: str = "opencode-bench leaderboard",
+    title: str = "Locker leaderboard",
     subtitle: str = "Build-and-play benchmark",
 ) -> Path:
     entries = leaderboard_entries(rows)
@@ -4047,7 +4396,7 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
         if public
         else 'Generated by <code>./bench.py leaderboard</code>. That command '
         'serves the page and opens it in the browser; use <code>--write</code> '
-        'to write the file only. Raw data: <code>results.csv</code>. '
+        'to write the file only. Raw data: <code>results-locker.csv</code>. '
         'Effort/token fields can be rebuilt from existing run artifacts with '
         '<code>./bench.py backfill --all</code>.'
     )
@@ -4778,7 +5127,7 @@ def cmd_site(args: argparse.Namespace) -> int:
         rows,
         output_dir / "index.html",
         public=True,
-        title="opencode-bench community leaderboard",
+        title="Locker community leaderboard",
         subtitle="Community submissions · self-reported unless verified",
     )
     data_dir = output_dir / "data"
@@ -4946,13 +5295,13 @@ def cmd_report(args: argparse.Namespace) -> int:
         "",
         "Request tokens are the per-request prompt size (input + cache reads/writes); "
         "peak is the largest single request. Cumulative token fields in "
-        "`results.csv` include cache reads/writes and can exceed the context window; "
+        "`results-locker.csv` include cache reads/writes and can exceed the context window; "
         "they are not context pressure. Reasoning tokens are provider-reported. "
-        "See `results.csv` for `input_tokens`, `output_tokens`, `reasoning_tokens`, "
+        "See `results-locker.csv` for `input_tokens`, `output_tokens`, `reasoning_tokens`, "
         "`cache_read_tokens` and `cache_write_tokens`.",
         "",
         "`wall_ex_self_test_s` is end-to-end wall minus classified self-test "
-        "command time. `self_test_s` counts Playwright/Vitest/browser-test tool "
+        "command time. `self_test_s` counts Go build/test/vet and smoke-test tool "
         "calls; `build_tool_s` counts build/typecheck commands. Provider "
         "errors/retries are excluded from think/output and tok/s, counted in "
         "`retries`/`retry_s`, and remain in wall time. tok/s medians are "
@@ -4961,9 +5310,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         "Wall time remains hardware-dependent. The leaderboard speed baseline "
         "uses the fastest eligible run and caps the speed ratio at 1.0.",
         "",
-        "Full rows: `results.csv`. Per-run artifacts: `runs/<run_id>/`.",
+        "Full rows: `results-locker.csv`. Per-run artifacts: `runs/<run_id>/`.",
         "",
-        "Leaderboard: `leaderboard.html` (serve and open with `./bench.py leaderboard`; "
+        "Leaderboard: `locker-leaderboard.html` (serve and open with `./bench.py leaderboard`; "
         "write only with `--write`).",
         "",
         "## Failures",
@@ -4972,7 +5321,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     any_failure = False
     for row in rows:
         report_path = Path(row.get("report", ""))
-        failures = failed_tests(report_path.parent / "playwright.json")
+        failures = failed_tests(report_path.parent / "results.json")
         if failures:
             any_failure = True
             for failure in failures:
@@ -4996,9 +5345,9 @@ def make_parser() -> argparse.ArgumentParser:
     build = sub.add_parser("build", help="build the agent/eval image")
     build.add_argument("--dry-run", action="store_true")
     build.add_argument(
-        "--playwright-image",
-        default=os.environ.get("OPENCODE_BENCH_PLAYWRIGHT_IMAGE", ""),
-        help="override the Playwright base image tag",
+        "--ubuntu-image",
+        default=os.environ.get("OPENCODE_BENCH_UBUNTU_IMAGE", ""),
+        help="override the pinned Ubuntu base image tag",
     )
     build.add_argument(
         "--opencode-version",
@@ -5037,8 +5386,8 @@ def make_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--reps", type=int, default=1)
     run.add_argument("--goal", choices=["speed", "quality", "balanced"], default="balanced")
-    run.add_argument("--timeout", type=int, default=4 * 3600, help="hard safety timeout")
-    run.add_argument("--idle-timeout", type=int, default=1800, help="no-output timeout")
+    run.add_argument("--timeout", type=int, default=18 * 60, help="hard wall timeout (default 18 min)")
+    run.add_argument("--idle-timeout", type=int, default=5 * 60, help="no-output timeout (default 5 min)")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--no-preflight", action="store_true")
     run.set_defaults(func=cmd_run)
@@ -5069,7 +5418,7 @@ def make_parser() -> argparse.ArgumentParser:
         "leaderboard", help="serve and open the all-runs leaderboard"
     )
     leaderboard.add_argument(
-        "--write", action="store_true", help="write leaderboard.html without serving"
+        "--write", action="store_true", help="write locker-leaderboard.html without serving"
     )
     leaderboard.add_argument("--port", type=int, default=4174)
     leaderboard.set_defaults(func=cmd_leaderboard)
@@ -5138,7 +5487,7 @@ def make_parser() -> argparse.ArgumentParser:
     status.add_argument("--config", default=None, help="OpenCode config file or directory")
     status.set_defaults(func=cmd_status)
 
-    report = sub.add_parser("report", help="render results.csv")
+    report = sub.add_parser("report", help="render results-locker.csv")
     report.set_defaults(func=cmd_report)
 
     return parser

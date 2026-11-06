@@ -9,3 +9,9 @@ docs/
 **/test-results/
 **/playwright-report/
 __pycache__/
+results-locker.csv
+results-locker.csv.lock
+report-locker.md
+locker-leaderboard.html
+tasks/locker/**/bin/
+tasks/locker/**/data/

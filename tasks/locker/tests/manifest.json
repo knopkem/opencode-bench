@@ -1,0 +1,157 @@
+{
+  "schema": "opencode-bench/locker-manifest@1",
+  "suite_version": "locker-v3",
+  "seed": 20261106,
+  "description": "Locker hidden behavioural suite. The manifest is the scoring denominator; case IDs are fixed and may not be inferred from a submitted result.",
+  "tiers": {
+    "P0": 3,
+    "P1": 5,
+    "P2": 4
+  },
+  "limits": {
+    "stream_bytes": 134217728,
+    "server_rss_bytes": 100663296,
+    "operation_deadline_s": 180,
+    "request_deadline_s": 60,
+    "progress_deadline_s": 10,
+    "startup_deadline_s": 15,
+    "crash_trials": 6
+  },
+  "families": [
+    {
+      "id": "p0.cli",
+      "tier": "P0",
+      "title": "[P0][cli] cli bucket and object round-trip",
+      "cases": [
+        "roundtrip",
+        "list-cleanup",
+        "errors"
+      ]
+    },
+    {
+      "id": "p0.http",
+      "tier": "P0",
+      "title": "[P0][http] http object CRUD and basic headers",
+      "cases": [
+        "crud",
+        "headers",
+        "empty-missing"
+      ]
+    },
+    {
+      "id": "p0.restart",
+      "tier": "P0",
+      "title": "[P0][db] buckets unicode keys and metadata survive restart",
+      "cases": [
+        "objects",
+        "metadata"
+      ]
+    },
+    {
+      "id": "p1.range",
+      "tier": "P1",
+      "title": "[P1][http] range requests preserve byte equivalence after replacement",
+      "cases": [
+        "closed",
+        "open-suffix",
+        "bounds",
+        "after-replacement"
+      ]
+    },
+    {
+      "id": "p1.conditional",
+      "tier": "P1",
+      "title": "[P1][http] conditional requests preserve validator semantics after updates",
+      "cases": [
+        "etags",
+        "dates",
+        "precedence",
+        "after-restart"
+      ]
+    },
+    {
+      "id": "p1.multipart",
+      "tier": "P1",
+      "title": "[P1][http] multipart transitions preserve objects and permit corrected completion",
+      "cases": [
+        "roundtrip",
+        "stale-retry",
+        "invalid-complete",
+        "abort-scope",
+        "abort-during-part",
+        "concurrent-replace",
+        "concurrent-complete",
+        "abort-complete-race",
+        "list-during-complete",
+        "list-during-abort",
+        "parameter-errors"
+      ]
+    },
+    {
+      "id": "p1.listing",
+      "tier": "P1",
+      "title": "[P1][http] paginated listings match complete grouped listings",
+      "cases": [
+        "pages",
+        "groups",
+        "tokens-restart",
+        "list-type",
+        "max-keys",
+        "page-limits"
+      ]
+    },
+    {
+      "id": "p1.concurrency",
+      "tier": "P1",
+      "title": "[P1][db] concurrent operations preserve coherent versions and independent progress",
+      "cases": [
+        "coherent",
+        "no-lost-writes",
+        "progress",
+        "churn-replace",
+        "churn-delete"
+      ]
+    },
+    {
+      "id": "p2.overwrite",
+      "tier": "P2",
+      "title": "[P2][db] interrupted writes preserve coherent publication and recovery",
+      "cases": [
+        "incomplete-disconnect",
+        "incomplete-kill",
+        "publication-crash",
+        "acknowledged"
+      ]
+    },
+    {
+      "id": "p2.multipart",
+      "tier": "P2",
+      "title": "[P2][http] multipart publication survives interruption and cross-feature reads",
+      "cases": [
+        "cross-feature",
+        "crash-existing",
+        "crash-absent"
+      ]
+    },
+    {
+      "id": "p2.isolation",
+      "tier": "P2",
+      "title": "[P2][sec] keys preserve identity bucket isolation and traversal containment",
+      "cases": [
+        "identity",
+        "escaping",
+        "traversal"
+      ]
+    },
+    {
+      "id": "p2.perf",
+      "tier": "P2",
+      "title": "[P2][perf] large object put get and range stay within memory cap",
+      "cases": [
+        "stream-roundtrip",
+        "range",
+        "rss-budget"
+      ]
+    }
+  ]
+}

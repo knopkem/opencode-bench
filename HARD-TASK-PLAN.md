@@ -1,7 +1,40 @@
 # Hard-task benchmark plan — Locker
 
-Status: design candidate; implementation and calibration pending.
+Status: packages A–E implemented on `hard_task`; model calibration (package F)
+pending.
 Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
+
+## Implementation status
+
+- Frozen suite: `locker-v3`, 12 families, 51 subcases (P0 8 / P1 30 / P2 13),
+  fixture seed `20261106`.
+- Frozen limits: 134,217,728-byte stream fixture; 100,663,296-byte server
+  `VmHWM` cap; 180 s large-workload deadline; 10 s progress deadline; 60 s
+  request deadline; 15 s startup deadline; 6 bounded crash trials.
+- Reference: 51/51 subcases on macOS and in the pinned Linux image. The
+  concurrency/overwrite/multipart diagnostic families were repeated; the
+  injected-fault controls detect split publication, lost unrelated writes, a
+  global lock held across body input and premature multipart replacement.
+- Seed baseline: all 8 P0 subcases pass; challenge credit is P1 range 0/4,
+  conditional 0/4, multipart 0/11, listing 0/6, concurrency 1–2/5
+  (race-dependent); P2 overwrite 4/4, multipart 0/3, isolation 0/3, perf 1/3.
+  Quality is `0.170–0.193` across five seed runs and always ineligible. The
+  seed is deliberately naive, so the overwrite passes are measured rather than
+  assumed away.
+- Hardening: a first local model run saturated v1 (39/39). Suite v2 added ten
+  multipart/concurrency/parameter subcases; the same binary then scored 40/49
+  (quality ≈0.857). A fresh v2 model run adapted and scored 48/49. Suite v3
+  adds two bounded multipart list/complete/abort races, bringing the catalog to
+  51 cases; a fresh v3 run scored 50/51 but hit the 18-minute hard wall cap.
+  Only combined multipart parameter validation remained. See
+  `tasks/locker/CALIBRATION.md`.
+- Harness: Locker builds `bin/locker`, mounts the workdir read-only for the
+  hidden suite, rejects diagnostic/malformed results, scores fixed-denominator
+  family fractions and writes `results-locker.csv`, `report-locker.md` and
+  `locker-leaderboard.html`.
+- Not done: the six paid screening runs in section 10, leaderboard/submission
+  publication, and any final decision about whether Locker is a frontier
+  discriminator.
 
 Locker is a promising systems-engineering task, not yet a demonstrated frontier
 discriminator. Keep the product small; establish difficulty through interacting
@@ -241,9 +274,13 @@ locker rm   s3://bucket/key
   existing object. A disconnected client that already sent the entire body may
   still have committed; do not confuse this with an incomplete-body failure.
 - **Multipart transitions:** upload IDs are scoped to their bucket/key.
-  Completion supplies a non-empty list of unique part numbers and current
-  ETags; missing parts, duplicate numbers or stale ETags return 400 without
-  changing the object or upload, so a corrected completion can succeed.
+  Same-session mutations serialize: a part re-upload or abort cannot change
+  the parts a successful completion validated. If completion wins, a
+  concurrent abort/re-upload returns 404; if abort wins, completion returns 404
+  and the published object is unchanged. These races must not produce a 5xx or
+  a mixed version. Completion supplies a non-empty list of unique part numbers
+  and current ETags; missing parts, duplicate numbers or stale ETags return 400
+  without changing the object or upload, so a corrected completion can succeed.
   Completion assembles only the requested parts and consumes the upload.
   Abort removes the upload without changing the published object. Operations
   using an aborted, completed or unknown upload ID return 404.
@@ -257,9 +294,11 @@ locker rm   s3://bucket/key
   Order keys and grouped prefixes bytewise and continue without duplicates or
   omissions. Tokens are valid for the same bucket/prefix/delimiter query;
   malformed or mismatched tokens return 400. `max-keys` is a decimal integer
-  from 1 through 1000 inclusive; omitted means 1000, other values return 400.
-  Tokens remain usable across restart when the query and namespace are
-  unchanged. Namespace mutation between pages is outside the contract.
+  from 1 through 1000 inclusive; omitted means 1000, other values return 400
+  (an explicitly empty value is invalid). When present, `list-type` must be
+  `2`; other values return 400. Tokens remain usable across restart when the
+  query and namespace are unchanged. Namespace mutation between pages is
+  outside the contract.
 - **Key identity:** `a` and `a/b` can coexist; identical keys in different
   buckets are independent. For example, URL path `%252F` names a literal
   `%2F`, not `/`. Accepting a traversal-looking key must not alias another key,
@@ -457,7 +496,8 @@ subcase IDs, family membership, input seeds and resource limits. Keep sequences
 short and independently assessable; shared setup failure must not create
 vacuous passes for downstream checks.
 
-Section 16 fixes the initial 39 subcase IDs and supplies authoring recipes.
+Section 16 fixes the initial 39 subcase IDs and supplies authoring recipes;
+the hardening revision adds twelve state-transition/parameter/concurrency subcases (51 total).
 The manifest must match that catalog, not infer cases from implementation output.
 
 | # | Tier | Category | Family |
@@ -991,7 +1031,7 @@ unit tests without importing reference code or deriving expectations from it.
 
 ### Fixed subcase catalog
 
-The catalog has **39 cases: P0 = 8, P1 = 18, P2 = 13**. Family weights remain
+The catalog has **51 cases: P0 = 8, P1 = 30, P2 = 13**. Family weights remain
 equal within P1/P2 regardless of these counts. Case IDs are scoped by family.
 The last column identifies a private negative control or injected bad response
 that the corresponding assertion must reject; it is not permission to inspect
@@ -1020,12 +1060,24 @@ storage/concurrency controls must also exercise an actual broken server.
 | `p1.multipart/stale-retry` | Execute the detailed recipe below | Failed completion preserves A; corrected completion succeeds | Publishes before validating |
 | `p1.multipart/invalid-complete` | Independent uploads: missing part, duplicate number, malformed XML, empty list | 400, old object unchanged, session still usable | Accepts invalid list or destroys session |
 | `p1.multipart/abort-scope` | Wrong-key/bucket use of ID; abort real session; reuse ID | Wrong scope 404; old objects unchanged; aborted ID 404 | Global unscoped ID lookup |
+| `p1.multipart/abort-during-part` | Abort a session while a large part body is still being read | Part upload terminates with 404, old object unchanged, aborted ID 404 | Abort races into a 500 or publishes the part |
+| `p1.multipart/concurrent-replace` | Start completion with current ETags; re-upload part 2 during assembly | Success must use the validated part; no mixed/partial version | Part file replaced after ETag validation |
+| `p1.multipart/concurrent-complete` | Two completions of the same upload start together | Exactly one 200, one 404; one exact completed object; upload consumed | Both completions report success |
+| `p1.multipart/abort-complete-race` | Start completion then abort the same upload | One operation wins: 200 completion/404 abort with new object, or 404 completion/204 abort with old object; never 5xx | Abort wins but completion still publishes, or abort races into a 500 |
+| `p1.multipart/list-during-complete` | List parts while a large completion is assembling | List is 404 or returns the pre-completion parts; never an empty 200 after the upload is consumed | List waits on the session lock and returns an empty 200 |
+| `p1.multipart/list-during-abort` | Abort/list while a gated part upload holds the session | Abort 204; list is 404 or returns the pre-abort part; never an empty 200 | List waits behind abort and returns an empty 200 |
+| `p1.multipart/parameter-errors` | Combined/invalid multipart parameters, invalid part bounds | Invalid/combined action parameters are 400 and leave the session usable | Action parameters ignored or session consumed by an invalid request |
 | `p1.listing/pages` | Seed known keys; enumerate with page sizes 1 and 2 | Exact sorted union, no duplicates, proper truncation/counts | Drops a page-boundary key |
 | `p1.listing/groups` | Keys `a/1`, `a/2`, `b/1`, `c`; delimiter `/`, small pages; prefix `a/` | Expected grouped prefixes/objects; prefixes consume page slots | Paginates before grouping |
 | `p1.listing/tokens-restart` | Finish listing after restart without mutation; malformed/wrong-scope token; invalid max-keys | Same complete result for valid token; bad inputs 400 | Tokens depend on process-local cursor |
+| `p1.listing/list-type` | Unsupported/empty `list-type`; valid `list-type=2` | Bad inputs 400; valid listing works | Ignores `list-type` |
+| `p1.listing/max-keys` | Empty/zero/oversized/non-numeric `max-keys`; valid small page | Bad inputs 400; valid page honors `max-keys` | Treats an empty `max-keys` as omitted |
+| `p1.listing/page-limits` | Page unions for limits 1, 2 and 1000 | Sorted union, correct truncation/counts | Drops or duplicates a page-boundary key |
 | `p1.concurrency/coherent` | Bounded overlapping PUTs/GETs with distinct body/type pairs, then serialized final PUT | Every read is one coherent pair; final write wins | Body and metadata published separately |
 | `p1.concurrency/no-lost-writes` | Concurrent different-key writes; wait for all acknowledgments; restart | Every acknowledged key survives with exact content | Commits a pre-upload manifest snapshot |
 | `p1.concurrency/progress` | Gated partial PUT plus old-object GET and unrelated PUT/GET | Independent requests finish before releasing upload gate | Global lock held across body read |
+| `p1.concurrency/churn-replace` | Bounded overlapping PUTs and GETs on one key, repeated | Every GET is a complete coherent version; no transport truncation | Deletes the old data file before concurrent readers open it |
+| `p1.concurrency/churn-delete` | Bounded PUT/DELETE churn with concurrent GETs | Every GET is 404 or one complete coherent version; no truncation | Delete/overwrite races truncate a reader |
 | `p2.overwrite/incomplete-disconnect` | Send prefix of declared body, half-close write side; collect failure/close | Old object/metadata unchanged; later PUT succeeds | Publishes short body despite read error |
 | `p2.overwrite/incomplete-kill` | Kill with deliberately unfinished body; restart | Old object/metadata intact, subsequent write succeeds | Truncates published file before body completion |
 | `p2.overwrite/publication-crash` | Bounded unacknowledged full-overwrite kill trials, different body/type pairs | Old or new coherent pair only, never 404 on existing key | Torn body/manifest publication |
@@ -1102,7 +1154,7 @@ image with network disabled.
 
 | Package | Files/scope | Gate before proceeding |
 |---|---|---|
-| A: contract and oracles | Candidate prompt, manifest, `tests/test_oracles.py` | Catalog has 12 families/39 cases; literal HTTP/XML/score fixtures agree with section 3; independent contract review resolves contradictions |
+| A: contract and oracles | Candidate prompt, manifest, `tests/test_oracles.py` | Catalog has 12 families/51 cases; literal HTTP/XML/score fixtures agree with section 3; independent contract review resolves contradictions |
 | B: P0 vertical slice | Seed CLI/HTTP/store; `tests/helpers.py`, `run.py`, `test_runner.py`; P0 cases | Seed builds; all eight P0 cases pass; server lifecycle, timeouts, result writing and cleanup have deliberate-failure coverage |
 | C: deterministic reference | Reference storage recipe and deterministic P1 cases | Reference passes P0 plus deterministic protocol cases; stale-retry control is detected; no crash tests or harness rewrite yet |
 | D: adversarial evaluator | Progress/crash/isolation/performance cases, private broken variants | All reference cases pass; repeated subset and negative-control gates pass; resource values measured/frozen; independent oracle/publication review resolved |

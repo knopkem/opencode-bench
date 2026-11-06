@@ -5,9 +5,6 @@ Run with: python3 -m unittest discover -s tests
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import io
 import json
 import sqlite3
 import sys
@@ -55,13 +52,13 @@ class LeaderboardTests(unittest.TestCase):
 
         # The failed 10s run must not set the baseline for eligible scoring.
         self.assertAlmostEqual(by_id["eligible-a"]["score_total"], 100.0, places=6)
-        self.assertAlmostEqual(by_id["eligible-b"]["score_total"], 92.5, places=6)
+        self.assertAlmostEqual(by_id["eligible-b"]["score_total"], 97.5, places=6)
         self.assertAlmostEqual(by_id["fast-failed"]["speed_total"], 1.0, places=6)
-        self.assertAlmostEqual(by_id["fast-failed"]["score_total"], 15.0, places=6)
+        self.assertAlmostEqual(by_id["fast-failed"]["score_total"], 7.5, places=6)
 
         # Work basis has its own eligible baseline (50s) and cap.
         self.assertAlmostEqual(by_id["eligible-a"]["score_work"], 100.0, places=6)
-        self.assertAlmostEqual(by_id["eligible-b"]["score_work"], 88.75, places=6)
+        self.assertAlmostEqual(by_id["eligible-b"]["score_work"], 96.25, places=6)
         self.assertAlmostEqual(by_id["fast-failed"]["speed_work"], 1.0, places=6)
 
         self.assertEqual(entries[0]["row"]["run_id"], "eligible-a")
@@ -97,7 +94,7 @@ class SessionMetricTests(unittest.TestCase):
                             "type": "tool",
                             "name": "shell",
                             "state": {
-                                "input": {"command": "npx playwright test"},
+                                "input": {"command": "go test ./..."},
                                 "content": [{"type": "text", "text": "1 failed"}],
                                 "metadata": {"exit": 0},
                             },
@@ -126,7 +123,7 @@ class SessionMetricTests(unittest.TestCase):
                         {
                             "type": "tool",
                             "name": "shell",
-                            "state": {"input": {"command": "npm run build"}},
+                            "state": {"input": {"command": "go vet ./..."}},
                             "time": {"created": 3500, "ran": 3600, "completed": 3900},
                         },
                     ],
@@ -212,215 +209,121 @@ class SessionMetricTests(unittest.TestCase):
         self.assertAlmostEqual(usage["gen_tokens_per_s_median"], 75.0, places=6)
 
 
-class CommunitySubmissionTests(unittest.TestCase):
+class LockerScoringTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixtures = ROOT / "tests" / "fixtures"
-        self.example = json.loads(
-            (ROOT / "submissions" / "examples" / "issue-1.json").read_text()
-        )
+        self.manifest = bench.load_locker_manifest()
 
-    def test_example_validates(self) -> None:
-        self.assertEqual(bench.validate_submission(self.example), [])
-
-    def test_schema_is_valid_json(self) -> None:
-        schema = json.loads((ROOT / "submissions" / "schema.json").read_text())
-        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
-        self.assertEqual(schema["properties"]["schema"]["const"], bench.SUBMISSION_SCHEMA)
-
-    def test_extract_block(self) -> None:
-        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
-        data, errors = bench.extract_result_block(issue["body"])
-        self.assertEqual(errors, [])
-        self.assertEqual(data["run_id"], self.example["run_id"])
-
-    def test_effort_lines_show_ttft_per_step(self) -> None:
-        meta = {
-            "metrics_source": "db+log",
-            "think_s": 0.0,
-            "ttft_s": 830.0,
-            "ttft_share": 0.51,
-            "steps": 51,
+    def all_pass(self) -> dict[str, dict[str, bool]]:
+        return {
+            family["id"]: {case: True for case in family["cases"]}
+            for family in self.manifest["families"]
         }
-        text = "\n".join(bench.render_effort_lines(meta))
-        self.assertIn("TTFT (wait for first token)", text)
-        self.assertIn("00:00:16 per step", text)
-        self.assertIn("51% of wall", text)
 
-    def test_extract_block_after_other_fences(self) -> None:
-        block = bench._submission_block(self.example)
-        body = "Intro\n\n```bash\necho hi\n```\n\n## Result\n\n" + block
-        data, errors = bench.extract_result_block(body)
-        self.assertEqual(errors, [])
-        self.assertEqual(data["run_id"], self.example["run_id"])
-
-    def test_update_preserves_prose_around_result_block(self) -> None:
-        block = bench._submission_block(self.example)
-        body = (
-            "## Details\n\nSome notes.\n\n"
-            + block
-            + "\n## Reproduce\n\nRun it.\n"
+    def test_manifest_matches_family_counts(self) -> None:
+        self.assertEqual(
+            {tier: sum(1 for f in self.manifest["families"] if f["tier"] == tier)
+             for tier in bench.EXPECTED},
+            bench.EXPECTED,
         )
-        updated = bench._replace_result_block(body, block)
-        self.assertTrue(updated.startswith("## Details\n\nSome notes."))
-        self.assertIn("```\n\n## Reproduce\n\nRun it.", updated)
-        self.assertEqual(updated.count('"schema": "opencode-bench/result@1"'), 1)
 
-    def test_update_keeps_other_fenced_blocks(self) -> None:
-        block = bench._submission_block(self.example)
-        body = "Intro\n\n```bash\necho hi\n```\n\n" + block
-        updated = bench._replace_result_block(body, block)
-        self.assertIn("```bash\necho hi\n```", updated)
-
-    def test_update_collapses_duplicate_result_blocks(self) -> None:
-        block = bench._submission_block(self.example)
-        body = "Intro\n\n" + block + "\nMiddle\n\n" + block + "\nEnd\n"
-        updated = bench._replace_result_block(body, block)
-        self.assertEqual(updated.count('"schema": "opencode-bench/result@1"'), 1)
-        self.assertIn("Intro", updated)
-        self.assertIn("End", updated)
-
-    def test_find_submission_issue_by_run_id(self) -> None:
-        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
-        other = json.loads(json.dumps(issue))
-        other["number"] = 2
-        other["body"] = other["body"].replace(
-            self.example["run_id"], "20260101T000000Z-other-model-r1"
+    def test_fractional_family_credit(self) -> None:
+        tests = self.all_pass()
+        tests["p1.range"]["bounds"] = False
+        score = bench.score_run(
+            tests, {"build_ok": True}, goal="quality", manifest=self.manifest
         )
-        found = bench.find_submission_issue([other, issue], self.example["run_id"])
-        self.assertEqual(found["number"], issue["number"])
-        self.assertIsNone(bench.find_submission_issue([other], self.example["run_id"]))
+        range_family = next(f for f in score["families"] if f["id"] == "p1.range")
+        self.assertAlmostEqual(range_family["credit"], 0.75, places=6)
+        self.assertAlmostEqual(score["quality"], (8 + 0.75) / 9, places=6)
+        self.assertEqual(score["fatal"], 0)
+        self.assertTrue(score["eligible"])
 
-    def test_find_submission_issue_prefers_visible_newest(self) -> None:
-        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
-        hidden = json.loads(json.dumps(issue))
-        hidden["number"] = 99
-        hidden["labels"].append({"name": "hidden"})
-        newer = json.loads(json.dumps(issue))
-        newer["number"] = 10
-        found = bench.find_submission_issue([issue, hidden, newer], self.example["run_id"])
-        self.assertEqual(found["number"], 10)
+    def test_p0_gates_eligibility(self) -> None:
+        tests = self.all_pass()
+        tests["p0.cli"]["roundtrip"] = False
+        score = bench.score_run(
+            tests, {"build_ok": True}, goal="quality", manifest=self.manifest
+        )
+        self.assertEqual(score["fatal"], 1)
+        self.assertAlmostEqual(score["quality"], 1.0, places=6)
+        self.assertFalse(score["eligible"])
 
-    def test_find_submission_issue_prefers_verified(self) -> None:
-        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
-        verified = json.loads(json.dumps(issue))
-        verified["number"] = 3
-        verified["labels"].append({"name": "verified"})
-        newer = json.loads(json.dumps(issue))
-        newer["number"] = 10
-        newer["createdAt"] = "2026-11-05T10:00:00Z"
-        found = bench.find_submission_issue([newer, verified], self.example["run_id"])
-        self.assertEqual(found["number"], 3)
+    def test_fixed_denominator_for_missing_cases(self) -> None:
+        tests = self.all_pass()
+        tests["p1.range"] = {"closed": True}
+        score = bench.score_run(
+            tests, {"build_ok": True}, goal="quality", manifest=self.manifest
+        )
+        range_family = next(f for f in score["families"] if f["id"] == "p1.range")
+        self.assertEqual(range_family["total"], 4)
+        self.assertEqual(range_family["passed"], 1)
+        self.assertAlmostEqual(range_family["credit"], 0.25, places=6)
 
-    def test_bad_counts_rejected(self) -> None:
-        bad = json.loads(json.dumps(self.example))
-        bad["run"]["counts"]["P0"]["pass"] = 4
-        bad["run"]["counts"]["P1"]["pass"] = 9
-        bad["run"]["counts"]["P2"]["pass"] = 6
-        errors = bench.validate_submission(bad)
-        self.assertTrue(any("quality" in error or "eligible" in error for error in errors))
+    def test_quality_below_threshold_is_ineligible(self) -> None:
+        tests = {family["id"]: {} for family in self.manifest["families"]}
+        score = bench.score_run(
+            tests, {"build_ok": True}, goal="quality", manifest=self.manifest
+        )
+        self.assertAlmostEqual(score["quality"], 0.0, places=6)
+        self.assertFalse(score["eligible"])
 
-        bad["run"]["self_test_s"] = 100
-        bad["run"]["wall_ex_self_test_s"] = 10
-        errors = bench.validate_submission(bad)
-        self.assertTrue(any("wall_ex_self_test_s" in error for error in errors))
-
-    def test_hidden_submission_is_not_rendered(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            out = Path(temp) / "site"
-            errors = Path(temp) / "errors.json"
-            args = argparse.Namespace(
-                issues=str(self.fixtures / "issues-hidden.json"),
-                output=str(out),
-                errors=str(errors),
-                include_hidden=False,
+    def _result(self) -> dict:
+        tests = []
+        for family in self.manifest["families"]:
+            tests.append(
+                {
+                    "id": family["id"],
+                    "title": family["title"],
+                    "cases": [
+                        {"id": case, "ok": True, "duration": 0.1, "error": None}
+                        for case in family["cases"]
+                    ],
+                }
             )
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-                io.StringIO()
-            ):
-                self.assertEqual(bench.cmd_site(args), 0)
-            results = json.loads((out / "data" / "results.json").read_text())
-            self.assertEqual(results, [])
-            self.assertTrue((out / "index.html").exists())
+        return {
+            "schema": bench.LOCKER_TEST_SCHEMA,
+            "suite_version": self.manifest["suite_version"],
+            "seed": self.manifest["seed"],
+            "diagnostic": False,
+            "tests": tests,
+        }
 
-    def test_verified_submission_is_rendered(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            out = Path(temp) / "site"
-            args = argparse.Namespace(
-                issues=str(self.fixtures / "issues-verified.json"),
-                output=str(out),
-                errors=None,
-                include_hidden=False,
-            )
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-                io.StringIO()
-            ):
-                self.assertEqual(bench.cmd_site(args), 0)
-            results = json.loads((out / "data" / "results.json").read_text())
-            self.assertEqual(len(results), 1)
-            self.assertEqual(results[0]["evidence"]["level"], "verified")
-            self.assertEqual(results[0]["source"], "community")
-            html = (out / "index.html").read_text()
-            self.assertIn("TTFT (wait for first token)", html)
-            self.assertIn("TTFT / step", html)
+    def test_valid_result_parses(self) -> None:
+        parsed, error = bench.validate_locker_result(self._result(), self.manifest)
+        self.assertIsNone(error)
+        self.assertEqual(
+            sum(len(cases) for cases in parsed.values()),
+            sum(len(f["cases"]) for f in self.manifest["families"]),
+        )
 
-    def test_duplicate_prefers_verified(self) -> None:
-        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
-        newer = json.loads(json.dumps(issue))
-        newer["number"] = 10
-        newer["createdAt"] = "2026-11-05T10:00:00Z"
-        newer["url"] = "https://github.com/knopkem/opencode-bench/issues/10"
-        verified = json.loads(json.dumps(issue))
-        verified["number"] = 11
-        verified["createdAt"] = "2026-11-04T10:00:00Z"
-        verified["url"] = "https://github.com/knopkem/opencode-bench/issues/11"
-        verified["labels"].append({"name": "verified"})
-        with tempfile.TemporaryDirectory() as temp:
-            issues_path = Path(temp) / "issues.json"
-            issues_path.write_text(json.dumps([newer, verified]))
-            out = Path(temp) / "site"
-            args = argparse.Namespace(
-                issues=str(issues_path),
-                output=str(out),
-                errors=None,
-                include_hidden=False,
-            )
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-                io.StringIO()
-            ):
-                self.assertEqual(bench.cmd_site(args), 0)
-            results = json.loads((out / "data" / "results.json").read_text())
-            self.assertEqual(len(results), 1)
-            self.assertEqual(results[0]["issue"], 11)
-            self.assertEqual(results[0]["evidence"]["level"], "verified")
+    def test_diagnostic_result_is_rejected(self) -> None:
+        data = self._result()
+        data["diagnostic"] = True
+        parsed, error = bench.validate_locker_result(data, self.manifest)
+        self.assertIsNone(parsed)
+        self.assertIn("diagnostic", error)
 
-    def test_invalid_submission_is_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            out = Path(temp) / "site"
-            errors_path = Path(temp) / "errors.json"
-            args = argparse.Namespace(
-                issues=str(self.fixtures / "issues-invalid.json"),
-                output=str(out),
-                errors=str(errors_path),
-                include_hidden=False,
-            )
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-                io.StringIO()
-            ):
-                self.assertEqual(bench.cmd_site(args), 0)
-            errors = json.loads(errors_path.read_text())
-            self.assertEqual(len(errors), 1)
-            self.assertEqual(errors[0]["issue"], 2)
-            self.assertTrue(errors[0]["errors"])
+    def test_duplicate_and_unknown_case_ids_are_rejected(self) -> None:
+        data = self._result()
+        data["tests"][0]["cases"].append(dict(data["tests"][0]["cases"][0]))
+        parsed, error = bench.validate_locker_result(data, self.manifest)
+        self.assertIsNone(parsed)
+        self.assertIn("duplicate", error)
 
-    def test_row_conversion_keeps_metrics(self) -> None:
-        normalized = bench.normalize_submission(self.example)
-        row = bench.submission_to_row(normalized)
-        self.assertEqual(row["run_id"], self.example["run_id"])
-        self.assertEqual(row["quality"], 1.0)
-        self.assertTrue(row["eligible"])
-        self.assertEqual(row["wall_s"], 1136)
-        self.assertEqual(row["self_test_runs"], 28)
-        self.assertEqual(row["source"], "community")
+        data = self._result()
+        data["tests"][0]["cases"][0]["id"] = "not-a-real-case"
+        parsed, error = bench.validate_locker_result(data, self.manifest)
+        self.assertIsNone(parsed)
+        self.assertIn("unknown", error)
+
+    def test_wrong_suite_version_and_title_are_rejected(self) -> None:
+        data = self._result()
+        data["suite_version"] = "other"
+        self.assertIsNone(bench.validate_locker_result(data, self.manifest)[0])
+
+        data = self._result()
+        data["tests"][0]["title"] = "[P0][cli] changed"
+        self.assertIsNone(bench.validate_locker_result(data, self.manifest)[0])
 
 
 if __name__ == "__main__":
