@@ -47,6 +47,7 @@ ROOT = Path(__file__).resolve().parent
 TASK_DIR = ROOT / "tasks" / "locker"
 SEED_DIR = TASK_DIR / "seed"
 TESTS_DIR = TASK_DIR / "tests"
+SEED_BASELINE_PATH = TESTS_DIR / "seed-baseline.json"
 PROMPT_PATH = TASK_DIR / "PROMPT.md"
 RUNS_DIR = ROOT / "runs"
 RESULTS_PATH = ROOT / "results-locker.csv"
@@ -56,13 +57,17 @@ DEFAULT_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "opencode-bench-locker:la
 DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
 OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
 
-# Family counts for the Locker suite. A family's credit is the fraction of its
-# fixed manifest-backed subcases that pass; P0 gates eligibility but contributes
-# no quality points. EXPECTED counts families, not subcases.
+# Family counts for the Locker suite. Quality is normalised against the
+# untouched seed: P0 and every seed-passing subcase are gates, and a family
+# earns credit only for seed-failing subcases that now pass. EXPECTED counts
+# families, not subcases.
 EXPECTED = {"P0": 3, "P1": 7, "P2": 6}
 WEIGHT = {"P0": 0, "P1": 1, "P2": 1}
+#: Tiers that can earn quality. P0 is only a regression gate.
+SCORE_TIERS = ("P1", "P2")
 LOCKER_TEST_SCHEMA = "opencode-bench/locker-tests@1"
 LOCKER_MANIFEST_SCHEMA = "opencode-bench/locker-manifest@1"
+LOCKER_BASELINE_SCHEMA = "opencode-bench/locker-seed-baseline@1"
 
 REASONING_ORDER = {
     "xhigh": 6,
@@ -174,16 +179,18 @@ CSV_FIELDS = [
     "reasoning_effort",
     "build_ok",
     "typecheck_ok",
-    "p0_pass",
-    "p0_total",
+    "gate_ok",
     "p1_pass",
     "p1_total",
     "p2_pass",
     "p2_total",
+    "headroom_pass",
+    "headroom_total",
     "quality",
     "major_issues",
     "minor_issues",
     "fatal",
+    "regressions",
     "eligible",
     "wall_s",
     "compactions",
@@ -1170,7 +1177,10 @@ def count_changed_files(workdir: Path) -> int:
         baseline["PROMPT.md"] = hashlib.sha1(PROMPT_PATH.read_bytes()).hexdigest()
     current = workdir_manifest(workdir)
     return sum(
-        1 for name in baseline.keys() | current.keys() if baseline.get(name) != current.get(name)
+        1
+        for name in baseline.keys() | current.keys()
+        # PROMPT.md is harness-owned and may change between runs.
+        if name != "PROMPT.md" and baseline.get(name) != current.get(name)
     )
 
 
@@ -1332,6 +1342,61 @@ def load_locker_manifest() -> dict:
 
 def _manifest_family_map(manifest: dict) -> dict[str, dict]:
     return {str(family["id"]): family for family in manifest["families"]}
+
+
+def validate_seed_baseline(
+    data: object, manifest: dict
+) -> tuple[dict[str, dict[str, bool]] | None, str | None]:
+    """Validate the frozen untouched-seed result used to normalise quality."""
+    if not isinstance(data, dict):
+        return None, f"{SEED_BASELINE_PATH.name} must contain a JSON object"
+    if data.get("schema") != LOCKER_BASELINE_SCHEMA:
+        return None, f"{SEED_BASELINE_PATH.name} schema must be {LOCKER_BASELINE_SCHEMA!r}"
+    if data.get("suite_version") != manifest.get("suite_version"):
+        return None, f"{SEED_BASELINE_PATH.name} suite_version does not match the manifest"
+    if data.get("seed") != manifest.get("seed"):
+        return None, f"{SEED_BASELINE_PATH.name} seed does not match the manifest"
+    raw = data.get("families")
+    if not isinstance(raw, dict):
+        return None, f"{SEED_BASELINE_PATH.name} families must be an object"
+    expected = _manifest_family_map(manifest)
+    if set(raw) != set(expected):
+        missing = sorted(set(expected) - set(raw))
+        extra = sorted(set(raw) - set(expected))
+        return None, (
+            f"{SEED_BASELINE_PATH.name} family ids differ from the manifest "
+            f"(missing {missing}, extra {extra})"
+        )
+    baseline: dict[str, dict[str, bool]] = {}
+    for family_id, family in expected.items():
+        cases = raw[family_id]
+        if not isinstance(cases, dict):
+            return None, f"{SEED_BASELINE_PATH.name} family {family_id!r} must be an object"
+        if set(cases) != set(family["cases"]):
+            missing = sorted(set(family["cases"]) - set(cases))
+            extra = sorted(set(cases) - set(family["cases"]))
+            return None, (
+                f"{SEED_BASELINE_PATH.name} case ids for {family_id!r} differ from the manifest "
+                f"(missing {missing}, extra {extra})"
+            )
+        if any(not isinstance(ok, bool) for ok in cases.values()):
+            return None, f"{SEED_BASELINE_PATH.name} case results must be booleans"
+        baseline[family_id] = {str(case): bool(ok) for case, ok in cases.items()}
+    return baseline, None
+
+
+def load_seed_baseline(manifest: dict | None = None) -> dict[str, dict[str, bool]]:
+    manifest = manifest or load_locker_manifest()
+    try:
+        data = json.loads(SEED_BASELINE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"error: seed baseline missing: {SEED_BASELINE_PATH}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"error: invalid seed baseline {SEED_BASELINE_PATH}: {exc}")
+    baseline, error = validate_seed_baseline(data, manifest)
+    if error is not None or baseline is None:
+        raise SystemExit(f"error: {error}")
+    return baseline
 
 
 def validate_locker_result(
@@ -1525,27 +1590,59 @@ def score_run(
     goal: str,
     manifest: dict,
     result_valid: bool = True,
+    baseline: dict[str, dict[str, bool]] | None = None,
 ) -> dict:
+    """Score challenge work above the untouched seed.
+
+    P0 is an eligibility gate only. Every subcase the seed already passes is a
+    regression gate. Quality is the mean credit over the challenge families
+    that still have headroom, where a family's credit is the fraction of
+    seed-failing subcases that pass. A run that changes nothing therefore
+    scores 0.0 even though the seed passes some P1/P2 subcases.
+    """
+    baseline = baseline if baseline is not None else load_seed_baseline(manifest)
     families: list[dict] = []
-    p0_pass_cases = 0
+    gate_failures = 0
+    p0_passed_cases = 0
     p0_total_cases = 0
     p1_failed_cases = 0
     p2_failed_cases = 0
+    regressions = 0
     for family in manifest["families"]:
         family_id = str(family["id"])
         provided = tests.get(family_id, {})
         expected_cases = list(family["cases"])
         case_results = {case_id: bool(provided.get(case_id, False)) for case_id in expected_cases}
+        baseline_cases = baseline.get(family_id, {})
         passed = sum(1 for ok in case_results.values() if ok)
-        credit = passed / len(expected_cases) if expected_cases else 0.0
+        total = len(expected_cases)
+        baseline_passed = sum(
+            1 for case_id in expected_cases if baseline_cases.get(case_id, False)
+        )
+        headroom_cases = [
+            case_id for case_id in expected_cases
+            if not baseline_cases.get(case_id, False)
+        ]
+        headroom_passed = sum(1 for case_id in headroom_cases if case_results[case_id])
+        regressed_cases = [
+            case_id for case_id in expected_cases
+            if baseline_cases.get(case_id, False) and not case_results[case_id]
+        ]
         tier = str(family["tier"])
         if tier == "P0":
-            p0_pass_cases += passed
-            p0_total_cases += len(expected_cases)
-        elif tier == "P1":
-            p1_failed_cases += len(expected_cases) - passed
-        elif tier == "P2":
-            p2_failed_cases += len(expected_cases) - passed
+            p0_passed_cases += passed
+            p0_total_cases += total
+            gate_failures += total - passed
+            scored = False
+            credit = 0.0
+        else:
+            regressions += len(regressed_cases)
+            if tier == "P1":
+                p1_failed_cases += total - passed
+            elif tier == "P2":
+                p2_failed_cases += total - passed
+            scored = bool(headroom_cases)
+            credit = headroom_passed / len(headroom_cases) if scored else 0.0
         families.append(
             {
                 "id": family_id,
@@ -1553,44 +1650,60 @@ def score_run(
                 "title": family["title"],
                 "cases": case_results,
                 "passed": passed,
-                "total": len(expected_cases),
+                "total": total,
+                "baseline_passed": baseline_passed,
+                "headroom": len(headroom_cases),
+                "headroom_passed": headroom_passed,
+                "scored": scored,
                 "credit": credit,
+                "failed_cases": [
+                    case_id for case_id, ok in case_results.items() if not ok
+                ],
+                "regressed_cases": regressed_cases,
             }
         )
 
-    challenge = [item for item in families if item["tier"] in ("P1", "P2")]
+    challenge = [item for item in families if item["tier"] in SCORE_TIERS]
+    scored_families = [item for item in challenge if item["scored"]]
     quality = (
-        sum(item["credit"] for item in challenge) / len(challenge)
-        if challenge
+        sum(item["credit"] for item in scored_families) / len(scored_families)
+        if scored_families
         else 0.0
     )
     counts = {
         tier: {
-            "pass": sum(1 for item in families if item["tier"] == tier and item["credit"] == 1.0),
-            "total": EXPECTED[tier],
+            "pass": sum(
+                1
+                for item in families
+                if item["tier"] == tier and item["scored"] and item["credit"] == 1.0
+            ),
+            "total": sum(
+                1 for item in families if item["tier"] == tier and item["scored"]
+            ),
         }
-        for tier in EXPECTED
+        for tier in SCORE_TIERS
     }
-    details = []
-    for item in families:
-        details.append(
-            {
-                "tier": item["tier"],
-                "title": item["title"],
-                "ok": item["credit"] == 1.0,
-                "credit": item["credit"],
-                "passed": item["passed"],
-                "total": item["total"],
-                "failed_cases": [
-                    case_id for case_id, ok in item["cases"].items() if not ok
-                ],
-            }
-        )
-    fatal = p0_total_cases - p0_pass_cases
+    details = [
+        {
+            "tier": item["tier"],
+            "title": item["title"],
+            "ok": item["scored"] and item["credit"] == 1.0,
+            "scored": item["scored"],
+            "credit": item["credit"],
+            "passed": item["passed"],
+            "total": item["total"],
+            "headroom_passed": item["headroom_passed"],
+            "headroom": item["headroom"],
+            "failed_cases": item["failed_cases"],
+            "regressed_cases": item["regressed_cases"],
+        }
+        for item in challenge
+    ]
+    gate_ok = gate_failures == 0 and regressions == 0
     eligible = (
         bool(build.get("build_ok"))
         and result_valid
-        and fatal == 0
+        and gate_ok
         and quality >= 0.80
     )
     return {
@@ -1598,18 +1711,45 @@ def score_run(
         "counts": counts,
         "details": details,
         "quality": quality,
-        "fatal": fatal,
+        "fatal": gate_failures,
+        "regressions": regressions,
+        "gate_ok": gate_ok,
         "major": p1_failed_cases,
         "minor": p2_failed_cases,
-        "p0_cases": {"pass": p0_pass_cases, "total": p0_total_cases},
+        "p0_cases": {"pass": p0_passed_cases, "total": p0_total_cases},
         "subcases": {
-            "pass": p0_pass_cases
-            + sum(item["passed"] for item in families if item["tier"] != "P0"),
-            "total": p0_total_cases
-            + sum(item["total"] for item in families if item["tier"] != "P0"),
+            "pass": sum(item["passed"] for item in challenge),
+            "total": sum(item["total"] for item in challenge),
+        },
+        "headroom": {
+            "pass": sum(item["headroom_passed"] for item in challenge),
+            "total": sum(item["headroom"] for item in challenge),
         },
         "eligible": eligible,
         "goal": goal,
+    }
+
+
+def tier_case_counts(score: dict) -> dict[str, dict[str, int]]:
+    """Raw and headroom subcase counts for the scored tiers."""
+    return {
+        tier: {
+            "pass": sum(
+                item["passed"] for item in score["families"] if item["tier"] == tier
+            ),
+            "total": sum(
+                item["total"] for item in score["families"] if item["tier"] == tier
+            ),
+            "scored_pass": sum(
+                item["headroom_passed"]
+                for item in score["families"]
+                if item["tier"] == tier
+            ),
+            "scored_total": sum(
+                item["headroom"] for item in score["families"] if item["tier"] == tier
+            ),
+        }
+        for tier in SCORE_TIERS
     }
 
 
@@ -1730,22 +1870,33 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- build: {'ok' if meta['build_ok'] else 'failed'}",
         f"- typecheck: {'ok' if meta['typecheck_ok'] else 'failed'}",
         f"- quality: {score['quality']:.3f}",
-        f"- subcases: {score['subcases']['pass']}/{score['subcases']['total']}",
-        f"- P0 gate: {score['p0_cases']['pass']}/{score['p0_cases']['total']}",
-        f"- fatal/major/minor: {score['fatal']}/{score['major']}/{score['minor']}",
+        f"- scored subcases: {score['headroom']['pass']}/{score['headroom']['total']}",
+        f"- challenge subcases: {score['subcases']['pass']}/{score['subcases']['total']}",
+        f"- gate: {'pass' if score.get('gate_ok', score['fatal'] == 0) else 'fail'}"
+        f" (P0 failures {score['fatal']}, baseline regressions {score.get('regressions', 0)})",
+        f"- major/minor failures: {score['major']}/{score['minor']}",
         f"- eligible: {score['eligible']}",
         "",
         *render_effort_lines(meta),
         "## Tests",
         "",
-        "| tier | family | credit | failed subcases |",
-        "|---|---|---:|---|",
+        "Quality counts only subcases the untouched seed fails. P0 and every",
+        "seed-passing subcase are regression gates; saturated families show `gate`.",
+        "",
+        "| tier | family | credit | scored | failed subcases |",
+        "|---|---|---:|---:|---|",
     ]
     for detail in score["details"]:
         failed = ", ".join(detail.get("failed_cases") or []) or "-"
+        if detail.get("scored"):
+            credit = f"{detail['credit']:.2f}"
+            scored = f"{detail['headroom_passed']}/{detail['headroom']}"
+        else:
+            credit = "gate"
+            scored = f"{detail['passed']}/{detail['total']}"
         lines.append(
             f"| {detail['tier']} | {detail['title']} | "
-            f"{detail['passed']}/{detail['total']} | {failed} |"
+            f"{credit} | {scored} | {failed} |"
         )
     lines += [
         "",
@@ -1827,13 +1978,14 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   thinking {thinking}" + (f" ({effort})" if effort else "")
     )
     print(
-        f"  families P0 {counts['P0']['pass']}/{counts['P0']['total']}"
-        f"   P1 {counts['P1']['pass']}/{counts['P1']['total']}"
+        f"  families P1 {counts['P1']['pass']}/{counts['P1']['total']}"
         f"   P2 {counts['P2']['pass']}/{counts['P2']['total']}"
-        f"   subcases {score['subcases']['pass']}/{score['subcases']['total']}"
+        f"   scored {score['headroom']['pass']}/{score['headroom']['total']}"
+        f"   challenge {score['subcases']['pass']}/{score['subcases']['total']}"
     )
     print(
         f"  quality {score['quality']:.2f}"
+        f"   gate {'pass' if score.get('gate_ok', score['fatal'] == 0) else 'FAIL'}"
         f"   minor {score['minor']}   major {score['major']}"
         f"   {'ELIGIBLE' if score['eligible'] else 'not eligible'}"
     )
@@ -2109,13 +2261,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         manifest=manifest,
         result_valid=tests.get("result_valid", tests.get("result") is not None),
     )
-    tier_cases = {
-        tier: {
-            "pass": sum(item["passed"] for item in score["families"] if item["tier"] == tier),
-            "total": sum(item["total"] for item in score["families"] if item["tier"] == tier),
-        }
-        for tier in EXPECTED
-    }
+    tier_cases = tier_case_counts(score)
     meta = {
         "run_id": run_id,
         "timestamp": timestamp,
@@ -2157,7 +2303,9 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "counts": score["counts"],
         "tier_cases": tier_cases,
         "subcases": score["subcases"],
-        "p0_cases": score["p0_cases"],
+        "headroom": score["headroom"],
+        "gate_ok": score["gate_ok"],
+        "regressions": score["regressions"],
         "families": score["families"],
         "quality": score["quality"],
         "fatal": score["fatal"],
@@ -2177,12 +2325,13 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         **meta,
         "major_issues": score["major"],
         "minor_issues": score["minor"],
-        "p0_pass": tier_cases["P0"]["pass"],
-        "p0_total": tier_cases["P0"]["total"],
         "p1_pass": tier_cases["P1"]["pass"],
         "p1_total": tier_cases["P1"]["total"],
         "p2_pass": tier_cases["P2"]["pass"],
         "p2_total": tier_cases["P2"]["total"],
+        "headroom_pass": score["headroom"]["pass"],
+        "headroom_total": score["headroom"]["total"],
+        "regressions": score["regressions"],
     }
     append_result(row)
     try:
@@ -2315,6 +2464,20 @@ def cmd_check(args: argparse.Namespace) -> int:
                     problems.append(
                         f"manifest has {case_counts[tier]} {tier} subcases, expected {expected}"
                     )
+            baseline_path = SEED_BASELINE_PATH
+            if not baseline_path.exists():
+                problems.append(f"missing {baseline_path}")
+            else:
+                try:
+                    baseline_data = json.loads(
+                        baseline_path.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError as exc:
+                    problems.append(f"invalid seed baseline: {exc}")
+                else:
+                    _, baseline_error = validate_seed_baseline(baseline_data, manifest)
+                    if baseline_error is not None:
+                        problems.append(f"invalid seed baseline: {baseline_error}")
             limits = manifest.get("limits") if isinstance(manifest.get("limits"), dict) else {}
             for key in (
                 "stream_bytes",
@@ -2426,6 +2589,25 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"{sum(case_counts.values())} subcases: {case_label})"
     )
     print(f"  suite   {manifest.get('suite_version')} seed {manifest.get('seed')}")
+    try:
+        baseline = load_seed_baseline(manifest)
+        scored_families = sum(
+            1
+            for family in manifest["families"]
+            if any(not baseline[family["id"]][case] for case in family["cases"])
+        )
+        scored_cases = sum(
+            1
+            for family in manifest["families"]
+            for case in family["cases"]
+            if not baseline[family["id"]][case]
+        )
+    except SystemExit:
+        scored_families = scored_cases = 0
+    print(
+        f"  baseline {SEED_BASELINE_PATH.name} "
+        f"({scored_families} scored families, {scored_cases} scored subcases)"
+    )
     print(f"  config  {config_dir}")
     print(f"  models  {len(models)}")
     if versions:
@@ -2469,18 +2651,50 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         agent_ok=bool(meta.get("agent_ok")),
     )
     manifest = load_locker_manifest()
-    build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
-    if not build["binary"]:
-        eprint("error: build produced no bin/locker")
-        return 1
-    tests = run_tests(
-        run_dir,
-        workdir,
-        engine=args.engine,
-        image=args.image,
-        dry_run=False,
-        manifest=manifest,
-    )
+    if getattr(args, "from_results", False):
+        result_file = run_dir / "results.json"
+        if not result_file.exists():
+            eprint(f"error: {result_file} missing; cannot rescore offline")
+            return 1
+        try:
+            data = json.loads(result_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            eprint(f"error: invalid results.json: {exc}")
+            return 1
+        parsed, error = validate_locker_result(data, manifest)
+        if error is not None or parsed is None:
+            eprint(f"error: {error}")
+            return 1
+        missing = sum(
+            len(family["cases"]) for family in manifest["families"]
+        ) - sum(len(cases) for cases in parsed.values())
+        failed = sum(1 for cases in parsed.values() for ok in cases.values() if not ok)
+        build = {
+            "build_ok": bool(meta.get("build_ok")),
+            "typecheck_ok": bool(meta.get("typecheck_ok")),
+        }
+        tests = {
+            "result_valid": True,
+            "test_ok": failed == 0 and missing == 0,
+            "tests": parsed,
+            "result": data,
+            "error": None if failed == 0 and missing == 0 else f"{failed} failed and {missing} missing subcases",
+            "exit_code": None,
+        }
+        print("  offline rescore from results.json (build and suite not rerun)")
+    else:
+        build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
+        if not build["binary"]:
+            eprint("error: build produced no bin/locker")
+            return 1
+        tests = run_tests(
+            run_dir,
+            workdir,
+            engine=args.engine,
+            image=args.image,
+            dry_run=False,
+            manifest=manifest,
+        )
     score = score_run(
         tests["tests"],
         build,
@@ -2488,13 +2702,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         manifest=manifest,
         result_valid=tests.get("result_valid", tests.get("result") is not None),
     )
-    tier_cases = {
-        tier: {
-            "pass": sum(item["passed"] for item in score["families"] if item["tier"] == tier),
-            "total": sum(item["total"] for item in score["families"] if item["tier"] == tier),
-        }
-        for tier in EXPECTED
-    }
+    tier_cases = tier_case_counts(score)
     meta.update(
         {
             "build_ok": build["build_ok"],
@@ -2504,7 +2712,9 @@ def cmd_rescore(args: argparse.Namespace) -> int:
             "counts": score["counts"],
             "tier_cases": tier_cases,
             "subcases": score["subcases"],
-            "p0_cases": score["p0_cases"],
+            "headroom": score["headroom"],
+            "gate_ok": score["gate_ok"],
+            "regressions": score["regressions"],
             "families": score["families"],
             "quality": score["quality"],
             "fatal": score["fatal"],
@@ -2529,12 +2739,13 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         **meta,
         "major_issues": score["major"],
         "minor_issues": score["minor"],
-        "p0_pass": tier_cases["P0"]["pass"],
-        "p0_total": tier_cases["P0"]["total"],
         "p1_pass": tier_cases["P1"]["pass"],
         "p1_total": tier_cases["P1"]["total"],
         "p2_pass": tier_cases["P2"]["pass"],
         "p2_total": tier_cases["P2"]["total"],
+        "headroom_pass": score["headroom"]["pass"],
+        "headroom_total": score["headroom"]["total"],
+        "regressions": score["regressions"],
     }
     rewrite_result(meta["run_id"], row)
     try:
@@ -2542,7 +2753,11 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - the score is already saved
         eprint(f"warning: could not update leaderboard: {exc}")
     print_summary(meta, score)
-    print("  rescored with the current hidden suite")
+    print(
+        "  rescored from stored results.json"
+        if getattr(args, "from_results", False)
+        else "  rescored with the current hidden suite"
+    )
     return 0
 
 
@@ -2569,10 +2784,16 @@ def _backfill_row(meta: dict, existing: dict) -> dict:
     row["major_issues"] = meta.get("major", 0)
     row["minor_issues"] = meta.get("minor", 0)
     counts = meta.get("tier_cases") or meta.get("counts") or {}
-    for tier in ("P0", "P1", "P2"):
+    for tier in SCORE_TIERS:
         tier_counts = counts.get(tier) or {}
         row[f"{tier.lower()}_pass"] = tier_counts.get("pass", row.get(f"{tier.lower()}_pass", ""))
         row[f"{tier.lower()}_total"] = tier_counts.get("total", row.get(f"{tier.lower()}_total", ""))
+    headroom = meta.get("headroom") or {}
+    if isinstance(headroom, dict):
+        row["headroom_pass"] = headroom.get("pass", row.get("headroom_pass", ""))
+        row["headroom_total"] = headroom.get("total", row.get("headroom_total", ""))
+    row["regressions"] = meta.get("regressions", row.get("regressions", ""))
+    row["gate_ok"] = meta.get("gate_ok", row.get("gate_ok", ""))
     return row
 
 
@@ -3761,6 +3982,10 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
         score = raw * (
             1.0 if item["eligible"] else LEADERBOARD_INELIGIBLE_FACTOR
         )
+        if item["quality"] <= 0:
+            # No challenge work means no score, regardless of how fast the
+            # process exited or how few compactions it used.
+            score = 0.0
         return speed, raw, score
 
     entries: list[dict] = []
@@ -4101,10 +4326,20 @@ def render_leaderboard(
         effort_rank = reasoning_rank(row)
         started_dt = run_started(row)
         started_epoch = int(started_dt.timestamp()) if started_dt else 0
-        p0_pass = int(row.get("p0_pass") or 0)
-        p1_pass = int(row.get("p1_pass") or 0)
-        p2_pass = int(row.get("p2_pass") or 0)
-        counts_rank = p0_pass * 100 + p1_pass * 10 + p2_pass
+        headroom_pass = row.get("headroom_pass")
+        if headroom_pass in (None, ""):
+            # Older rows predate seed-normalised scoring; show their challenge
+            # subcase counts rather than a misleading zero.
+            scored_pass = int(float(row.get("p1_pass") or 0)) + int(
+                float(row.get("p2_pass") or 0)
+            )
+            scored_total = int(float(row.get("p1_total") or 0)) + int(
+                float(row.get("p2_total") or 0)
+            )
+        else:
+            scored_pass = int(float(headroom_pass))
+            scored_total = int(float(row.get("headroom_total") or 0))
+        counts_rank = scored_pass
         compactions = "—" if entry["compactions"] is None else str(entry["compactions"])
         hardware = escaped(entry.get("hardware") or "")
         hardware_line = (
@@ -4157,10 +4392,7 @@ def render_leaderboard(
                 f'×{LEADERBOARD_INELIGIBLE_FACTOR:g}"'
             )
         )
-        counts = " · ".join(
-            f'{escaped(str(row.get(f"p{tier}_pass") or "0"))}/{escaped(str(row.get(f"p{tier}_total") or "0"))}'
-            for tier in (0, 1, 2)
-        )
+        counts = f"{scored_pass}/{scored_total}"
         search = escaped(
             " ".join(
                 [
@@ -4272,7 +4504,7 @@ def render_leaderboard(
             '<th data-sort="variant" data-type="text" data-default-dir="asc">Variant</th>'
             '<th data-sort="thinking" data-type="number" data-default-dir="desc">Thinking</th>'
             '<th data-sort="quality" data-type="number" data-default-dir="desc">Quality</th>'
-            '<th data-sort="counts" data-type="number" data-default-dir="desc">P0 · P1 · P2</th>'
+            '<th data-sort="counts" data-type="number" data-default-dir="desc">Scored subcases</th>'
             '<th data-sort="wall" data-type="number" data-default-dir="asc">Wall / work</th>'
             '<th>Effort</th>'
             '<th data-sort="compactions" data-type="number" data-default-dir="asc">Compactions</th>'
@@ -4467,11 +4699,14 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 </header>
 <div class="formula">
   <b>Score = {weights["quality"]:.0%} quality + {weights["wall"]:.0%} speed + {weights["compactions"]:.0%} compactions.</b>
+  Quality counts only subcases the untouched seed fails; P0 and every
+  seed-passing subcase are regression gates and earn no credit.
   Speed is relative to the fastest <b>eligible</b> run
   (<code>fastest eligible wall / run wall</code>), capped at 1.0;
   compactions score as <code>1 / (1 + count)</code>. Runs that fail eligibility
   keep {LEADERBOARD_INELIGIBLE_FACTOR:.0%} of their score, so they fall below
-  quality runs (dimmed; hover the score for the raw value). The default sort is
+  quality runs (dimmed; hover the score for the raw value). A run with zero
+  scored work keeps zero score even if it exits quickly. The default sort is
   score, highest first. Use <b>Wall basis</b> to score total wall or wall
   excluding self-test execution; each basis uses its own eligible baseline.
   Click a column header to sort by it and click again to reverse. Use the
@@ -5448,6 +5683,11 @@ def make_parser() -> argparse.ArgumentParser:
 
     rescore = sub.add_parser("rescore", help="rerun build+tests on an existing run")
     rescore.add_argument("--run", default=None, help="run directory name (default: latest)")
+    rescore.add_argument(
+        "--from-results",
+        action="store_true",
+        help="rescore the existing results.json without rerunning build or hidden tests",
+    )
     rescore.set_defaults(func=cmd_rescore)
 
     backfill = sub.add_parser(

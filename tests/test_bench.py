@@ -54,7 +54,8 @@ class LeaderboardTests(unittest.TestCase):
         self.assertAlmostEqual(by_id["eligible-a"]["score_total"], 100.0, places=6)
         self.assertAlmostEqual(by_id["eligible-b"]["score_total"], 97.5, places=6)
         self.assertAlmostEqual(by_id["fast-failed"]["speed_total"], 1.0, places=6)
-        self.assertAlmostEqual(by_id["fast-failed"]["score_total"], 7.5, places=6)
+        # A zero-quality run keeps zero score even though it was fastest.
+        self.assertAlmostEqual(by_id["fast-failed"]["score_total"], 0.0, places=6)
 
         # Work basis has its own eligible baseline (50s) and cap.
         self.assertAlmostEqual(by_id["eligible-a"]["score_work"], 100.0, places=6)
@@ -279,9 +280,61 @@ class LockerScoringTests(unittest.TestCase):
         )
         range_family = next(f for f in score["families"] if f["id"] == "p1.range")
         self.assertAlmostEqual(range_family["credit"], 0.75, places=6)
-        self.assertAlmostEqual(score["quality"], (12 + 0.75) / 13, places=6)
+        # p2.overwrite is saturated by the seed and is a gate, not a scored family.
+        self.assertEqual(score["counts"]["P2"]["total"], 5)
+        self.assertAlmostEqual(score["quality"], (11 + 0.75) / 12, places=6)
+        self.assertEqual(score["headroom"]["total"], 55)
         self.assertEqual(score["fatal"], 0)
         self.assertTrue(score["eligible"])
+
+    def test_seed_baseline_scores_zero(self) -> None:
+        baseline = bench.load_seed_baseline(self.manifest)
+        score = bench.score_run(
+            baseline, {"build_ok": True}, goal="quality", manifest=self.manifest
+        )
+        self.assertAlmostEqual(score["quality"], 0.0, places=6)
+        self.assertEqual(score["headroom"], {"pass": 0, "total": 55})
+        self.assertEqual(score["regressions"], 0)
+        self.assertTrue(score["gate_ok"])
+        self.assertFalse(score["eligible"])
+        self.assertEqual(score["subcases"], {"pass": 6, "total": 61})
+
+    def test_saturated_family_is_a_gate(self) -> None:
+        tests = self.all_pass()
+        score = bench.score_run(
+            tests, {"build_ok": True}, goal="quality", manifest=self.manifest
+        )
+        overwrite = next(f for f in score["families"] if f["id"] == "p2.overwrite")
+        self.assertFalse(overwrite["scored"])
+        self.assertEqual(overwrite["headroom"], 0)
+
+    def test_baseline_regression_blocks_eligibility(self) -> None:
+        tests = self.all_pass()
+        tests["p2.overwrite"]["acknowledged"] = False
+        score = bench.score_run(
+            tests, {"build_ok": True}, goal="quality", manifest=self.manifest
+        )
+        self.assertAlmostEqual(score["quality"], 1.0, places=6)
+        self.assertEqual(score["regressions"], 1)
+        self.assertFalse(score["gate_ok"])
+        self.assertFalse(score["eligible"])
+
+    def test_seed_baseline_matches_manifest(self) -> None:
+        baseline = bench.load_seed_baseline(self.manifest)
+        for family in self.manifest["families"]:
+            self.assertEqual(set(baseline[family["id"]]), set(family["cases"]))
+        passed = sum(
+            1 for cases in baseline.values() for ok in cases.values() if ok
+        )
+        self.assertEqual(passed, 14)
+
+    def test_seed_baseline_rejects_missing_case(self) -> None:
+        data = json.loads(bench.SEED_BASELINE_PATH.read_text(encoding="utf-8"))
+        first = self.manifest["families"][0]
+        del data["families"][first["id"]][first["cases"][0]]
+        _, error = bench.validate_seed_baseline(data, self.manifest)
+        self.assertIsNotNone(error)
+        self.assertIn("case ids", error or "")
 
     def test_p0_gates_eligibility(self) -> None:
         tests = self.all_pass()
@@ -292,6 +345,7 @@ class LockerScoringTests(unittest.TestCase):
         self.assertEqual(score["fatal"], 1)
         self.assertAlmostEqual(score["quality"], 1.0, places=6)
         self.assertFalse(score["eligible"])
+        self.assertNotIn("P0", score["counts"])
 
     def test_fixed_denominator_for_missing_cases(self) -> None:
         tests = self.all_pass()

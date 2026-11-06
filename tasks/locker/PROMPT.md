@@ -15,7 +15,7 @@ subcase; P1 and P2 are the real challenge.
 - Aim for about **20 minutes** of work. The hard cap is **60 minutes**, with a
   **5-minute** no-output timeout. Stop and write `COMPLETION.md` when you are
   done or when time is nearly up.
-- Prioritise in this order: **P0** (the seed baseline), then **P1** protocol and
+- Prioritise in this order: **P0** (the regression gate), then **P1** protocol and
   interaction behavior, then **P2** interrupted-publication, isolation and
   resource behavior.
 - Use only the Go standard library. Do not add dependencies, do not use the
@@ -41,15 +41,20 @@ The hidden suite is black-box: it invokes the built binary over HTTP and the
 CLI and never imports internal packages or inspects the data format. It has
 three tiers:
 
-- **P0** is the regression gate. All P0 subcases must pass for eligibility;
-  P0 contributes no quality points.
-- **P1** and **P2** are divided into thirteen equally weighted families. A
-  family's credit is the fraction of its fixed required subcases that pass.
-  Quality is the mean of those thirteen family credits, so all P0 + all P1 +
-  no P2 credit is `7/13 ≈ 0.538`.
-- **Eligible** means the build succeeded, every P0 subcase passed, and quality
-  is at least **0.80**. Eligibility is a benchmark label, not a claim of
-  production readiness.
+- **P0** is a regression gate: every P0 subcase must pass for eligibility.
+  P0 earns no quality points and is not part of the reported score.
+- The unchanged seed already passes a fixed set of P1/P2 subcases. Those
+  subcases are also a regression gate: losing one makes the run ineligible,
+  and they earn no quality credit.
+- **P1** and **P2** families are scored only on the subcases the seed does
+  **not** pass. A family's credit is the fraction of those seed-failing
+  subcases that pass. Quality is the mean credit over the families that still
+  have headroom; a family the seed already passes completely is a gate and is
+  not scored. Doing nothing therefore scores `0.0`, and passing every subcase
+  scores `1.0`.
+- **Eligible** means the build succeeded, every P0 subcase passed, no
+  seed-passing subcase regressed, and quality is at least **0.80**.
+  Eligibility is a benchmark label, not a claim of production readiness.
 
 Scored behavior covers four surfaces in one product: CLI↔HTTP↔storage
 integration, ordinary HTTP object operations, protocol interactions (range,

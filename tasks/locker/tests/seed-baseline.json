@@ -1,0 +1,110 @@
+{
+  "schema": "opencode-bench/locker-seed-baseline@1",
+  "suite_version": "locker-v4",
+  "seed": 20261106,
+  "description": "Per-subcase results of the untouched seed. Cases the seed passes are a regression gate; only cases the seed fails count toward quality.",
+  "source": "untouched tasks/locker/seed run through the hidden suite",
+  "families": {
+    "p0.cli": {
+      "roundtrip": true,
+      "list-cleanup": true,
+      "errors": true
+    },
+    "p0.http": {
+      "crud": true,
+      "headers": true,
+      "empty-missing": true
+    },
+    "p0.restart": {
+      "objects": true,
+      "metadata": true
+    },
+    "p1.range": {
+      "closed": false,
+      "open-suffix": false,
+      "bounds": false,
+      "after-replacement": false
+    },
+    "p1.conditional": {
+      "etags": false,
+      "dates": false,
+      "precedence": false,
+      "after-restart": false
+    },
+    "p1.multipart": {
+      "roundtrip": false,
+      "stale-retry": false,
+      "invalid-complete": false,
+      "abort-scope": false,
+      "abort-during-part": false,
+      "concurrent-replace": false,
+      "concurrent-complete": false,
+      "abort-complete-race": false,
+      "list-during-complete": false,
+      "list-during-abort": false,
+      "parameter-errors": false
+    },
+    "p1.listing": {
+      "pages": false,
+      "groups": false,
+      "tokens-restart": false,
+      "list-type": false,
+      "max-keys": false,
+      "page-limits": false
+    },
+    "p1.concurrency": {
+      "coherent": false,
+      "no-lost-writes": false,
+      "progress": true,
+      "churn-replace": false,
+      "churn-delete": false
+    },
+    "p2.overwrite": {
+      "incomplete-disconnect": true,
+      "incomplete-kill": true,
+      "publication-crash": true,
+      "acknowledged": true
+    },
+    "p2.multipart": {
+      "cross-feature": false,
+      "crash-existing": false,
+      "crash-absent": false
+    },
+    "p2.isolation": {
+      "identity": false,
+      "escaping": false,
+      "traversal": false
+    },
+    "p2.perf": {
+      "stream-roundtrip": true,
+      "range": false,
+      "rss-budget": false
+    },
+    "p1.batch": {
+      "copy-rename-delete": false,
+      "preconditions": false,
+      "errors": false,
+      "independence": false,
+      "cross-feature": false,
+      "atomic-visibility": false,
+      "concurrent-batches": false
+    },
+    "p1.histories": {
+      "objects": false,
+      "multipart": false,
+      "listing": false,
+      "restart": false,
+      "concurrent": false
+    },
+    "p2.batch": {
+      "kill-during-swap": false,
+      "kill-after-ack": false,
+      "blob-lifetime": false
+    },
+    "p2.faults": {
+      "put-preserves-old": false,
+      "space-released": false,
+      "multipart-staging": false
+    }
+  }
+}

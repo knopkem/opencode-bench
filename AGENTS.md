@@ -16,8 +16,9 @@ are the v4 catalog.
   `tasks/locker/PROMPT.md` is copied into the workdir as `PROMPT.md`.
 - `tasks/locker/reference/` is a complete Go implementation used only to
   validate the hidden suite. Never mount it into an agent workdir.
-- `tasks/locker/tests/` is the hidden black-box Python suite and its trusted
-  `manifest.json`. Mount it only after the agent exits.
+- `tasks/locker/tests/` is the hidden black-box Python suite, its trusted
+  `manifest.json`, and `seed-baseline.json`, the frozen untouched-seed result
+  used to normalise quality. Mount the directory only after the agent exits.
 - `docker/locker.Dockerfile` is the lean Ubuntu + Go + Python + OpenCode image.
 - `tests/test_bench.py` covers leaderboard metrics and Locker scoring.
 - `runs/`, `results-locker.csv`, `report-locker.md`, `locker-leaderboard.html`
@@ -57,12 +58,16 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - `EXPECTED = {"P0": 3, "P1": 7, "P2": 6}` in `bench.py` counts **families**.
   Changing the catalog requires updating the manifest, `EXPECTED`, prompt and
   docs together; earlier results become non-comparable.
-- Each family's credit is passed required subcases / fixed manifest total.
-  Missing subcases earn zero. Duplicate/unknown IDs, wrong titles, wrong suite
-  versions and `diagnostic: true` results are invalid.
-- Quality is the mean of the thirteen P1/P2 family credits. P0 contributes no
-  quality points. Eligibility = successful build, every P0 subcase passed,
-  quality ≥ 0.80.
+- `tasks/locker/tests/seed-baseline.json` records the untouched seed's pass/fail
+  for every subcase. P0 is only an eligibility gate and is never scored.
+  Every seed-passing subcase is a regression gate: losing one makes the run
+  ineligible. Quality is the mean credit over the P1/P2 families that still
+  have headroom, where a family's credit is passed seed-failing subcases /
+  fixed seed-failing subcases. A family the seed passes completely is a gate
+  and is not scored. A no-op run therefore has quality 0.0, not the seed's
+  inherited passes. Regenerate the baseline when the seed or suite changes.
+- Eligibility = successful build, every P0 subcase passed, no seed-passing
+  subcase regressed, quality ≥ 0.80.
 - The runner writes `results.json` with schema
   `opencode-bench/locker-tests@1`, `suite_version: locker-v4`, the fixture seed
   and per-case durations/errors. `test_ok` is true only when all expected
@@ -112,8 +117,10 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
   its intended invariant fail.
 - Repeated crash/concurrency diagnostic runs are a release gate. A flaky run is
   an evaluator bug, not a model failure.
-- Seed baseline: build/run the seed and require all eight P0 subcases; record
-  the P1/P2 credits rather than assuming zero.
+- Seed baseline: build/run the seed, require all eight P0 subcases, and require
+  the hidden suite output to match `tasks/locker/tests/seed-baseline.json`
+  subcase-for-subcase (14/69 today: P0 8, P1 1, P2 5). A no-op must score 0.0.
+  The saturated `p2.overwrite` family is a gate, not a scored family.
 - Run Linux-dependent cases in the pinned image with network disabled; the
   performance case reads `VmHWM` from `/proc/<pid>/status`.
 - For harness changes: `./bench.py check`,

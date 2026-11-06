@@ -48,12 +48,18 @@ The prompt asks for roughly 20 minutes of work, with an 60-minute hard cap and
 a 5-minute idle timeout. The model gets the same seed, toolchain and time
 budget every run.
 
-- P0 is a regression gate and contributes no quality points.
-- P1 and P2 are thirteen equally weighted families. Family credit is passed
-  required subcases divided by the fixed manifest total.
-- Quality is the mean of the thirteen P1/P2 family credits.
-- Eligible = successful build, every P0 subcase passed, quality ≥ 0.80.
-- All P0 + all P1 + no P2 credit scores `7/13 ≈ 0.538`.
+- P0 is a regression gate and is neither reported nor scored.
+- The untouched seed's passing subcases are also a regression gate: losing one
+  makes the run ineligible, and they earn no quality credit.
+- P1 and P2 are scored only on the subcases the seed fails. Family credit is
+  passed seed-failing subcases divided by the fixed seed-failing total. A
+  family the seed passes completely is a gate and is not scored.
+- Quality is the mean credit over the families that still have headroom. A run
+  that changes nothing scores `0.0`; passing every subcase scores `1.0`.
+- Eligible = successful build, every P0 subcase passed, no seed-passing
+  subcase regressed, quality ≥ 0.80.
+- The seed baseline is `tasks/locker/tests/seed-baseline.json` (14/69 subcases:
+  P0 8, P1 1, P2 5; 12 scored families, 55 scored subcases).
 
 The hidden manifest is `tasks/locker/tests/manifest.json`: 16 families,
 69 subcases (P0 8 / P1 42 / P2 19), suite `locker-v4`, fixture seed
