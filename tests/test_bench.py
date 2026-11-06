@@ -233,6 +233,39 @@ class CommunitySubmissionTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(data["run_id"], self.example["run_id"])
 
+    def test_extract_block_after_other_fences(self) -> None:
+        block = bench._submission_block(self.example)
+        body = "Intro\n\n```bash\necho hi\n```\n\n## Result\n\n" + block
+        data, errors = bench.extract_result_block(body)
+        self.assertEqual(errors, [])
+        self.assertEqual(data["run_id"], self.example["run_id"])
+
+    def test_update_preserves_prose_around_result_block(self) -> None:
+        block = bench._submission_block(self.example)
+        body = (
+            "## Details\n\nSome notes.\n\n"
+            + block
+            + "\n## Reproduce\n\nRun it.\n"
+        )
+        updated = bench._replace_result_block(body, block)
+        self.assertTrue(updated.startswith("## Details\n\nSome notes."))
+        self.assertIn("```\n\n## Reproduce\n\nRun it.", updated)
+        self.assertEqual(updated.count('"schema": "opencode-bench/result@1"'), 1)
+
+    def test_update_keeps_other_fenced_blocks(self) -> None:
+        block = bench._submission_block(self.example)
+        body = "Intro\n\n```bash\necho hi\n```\n\n" + block
+        updated = bench._replace_result_block(body, block)
+        self.assertIn("```bash\necho hi\n```", updated)
+
+    def test_update_collapses_duplicate_result_blocks(self) -> None:
+        block = bench._submission_block(self.example)
+        body = "Intro\n\n" + block + "\nMiddle\n\n" + block + "\nEnd\n"
+        updated = bench._replace_result_block(body, block)
+        self.assertEqual(updated.count('"schema": "opencode-bench/result@1"'), 1)
+        self.assertIn("Intro", updated)
+        self.assertIn("End", updated)
+
     def test_find_submission_issue_by_run_id(self) -> None:
         issue = json.loads((self.fixtures / "issues.json").read_text())[0]
         other = json.loads(json.dumps(issue))

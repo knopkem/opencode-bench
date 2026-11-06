@@ -2906,13 +2906,29 @@ def submission_to_row(submission: dict) -> dict:
     }
 
 
+def _fenced_blocks(body: str) -> list[tuple[int, int, str]]:
+    """Return ``(start, end, content)`` for each fenced code block."""
+    blocks: list[tuple[int, int, str]] = []
+    offset = 0
+    open_start: int | None = None
+    content_start = 0
+    for line in body.splitlines(keepends=True):
+        if open_start is None:
+            if line.strip().startswith("```"):
+                open_start = offset
+                content_start = offset + len(line)
+        elif line.strip().startswith("```"):
+            blocks.append((open_start, offset + len(line), body[content_start:offset]))
+            open_start = None
+        offset += len(line)
+    return blocks
+
+
 def extract_result_block(body: object) -> tuple[dict | None, list[str]]:
     """Extract exactly one opencode-bench result block from an issue body."""
     if not isinstance(body, str):
         return None, ["issue body is missing"]
-    blocks = re.findall(
-        r"```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```", body, re.IGNORECASE | re.DOTALL
-    )
+    blocks = [content for _, _, content in _fenced_blocks(body)]
     candidates: list[dict] = []
     parse_errors: list[str] = []
     for text in blocks:
@@ -2937,6 +2953,34 @@ def extract_result_block(body: object) -> tuple[dict | None, list[str]]:
     if isinstance(parsed, dict) and parsed.get("schema") == SUBMISSION_SCHEMA:
         return parsed, []
     return None, [f"JSON block must contain schema {SUBMISSION_SCHEMA!r}"]
+
+
+def _replace_result_block(body: object, block: str) -> str:
+    """Replace the result block but keep prose/details around it."""
+    if not isinstance(body, str):
+        return block
+    matches: list[tuple[int, int]] = []
+    for start, end, content in _fenced_blocks(body):
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("schema") == SUBMISSION_SCHEMA:
+            matches.append((start, end))
+    if not matches:
+        return block
+    # Keep everything outside result blocks. If an issue somehow has more than
+    # one, collapse them to the fresh block.
+    replacement = block.rstrip("\n") + "\n"
+    pieces: list[str] = []
+    last = 0
+    for index, (start, end) in enumerate(matches):
+        pieces.append(body[last:start])
+        if index == 0:
+            pieces.append(replacement)
+        last = end
+    pieces.append(body[last:])
+    return "".join(pieces)
 
 
 def _issue_labels(issue: dict) -> set[str]:
@@ -3006,6 +3050,31 @@ def _gh_open_issues(repo: str) -> list[dict]:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"cannot parse gh issue list output: {exc}") from exc
     return payload if isinstance(payload, list) else []
+
+
+def _gh_issue_body(repo: str, number: int) -> str | None:
+    result = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "body",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"gh issue view #{number} failed")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"cannot parse gh issue view output: {exc}") from exc
+    return payload.get("body") if isinstance(payload, dict) else None
 
 
 def submission_template() -> dict:
@@ -4539,6 +4608,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         f"{format_duration(run.get('wall_s') or 0)}"
     )
     issue_number = args.issue
+    issue_body: object = None
     if issue_number is None and not args.new:
         try:
             issues = _gh_open_issues(repo)
@@ -4548,10 +4618,22 @@ def cmd_submit(args: argparse.Namespace) -> int:
         existing = find_submission_issue(issues, run_id)
         if existing is not None:
             issue_number = int(existing.get("number"))
+            issue_body = existing.get("body")
+    elif issue_number is not None:
+        try:
+            issue_body = _gh_issue_body(repo, issue_number)
+        except RuntimeError as exc:
+            eprint(f"error: {exc}")
+            return 1
     try:
         with tempfile.TemporaryDirectory() as temp:
             body_path = Path(temp) / "issue.md"
-            body_path.write_text(block, encoding="utf-8")
+            body_text = (
+                _replace_result_block(issue_body, block)
+                if issue_number is not None
+                else block
+            )
+            body_path.write_text(body_text, encoding="utf-8")
             if issue_number is None:
                 command = [
                     "gh",
