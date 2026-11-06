@@ -2066,6 +2066,7 @@ def p1_batch_errors(server: h.Server, limits: Limits) -> None:
         b"<Batch><Delete></Delete></Batch>",
         b"<Batch><Copy><Source>a</Source><Target>a</Target></Copy></Batch>",
         b"<Batch><Delete><Key>a</Key><IfMatch></IfMatch></Delete></Batch>",
+        b"<Batch><Delete><Key>a</Key><IfMatch>abc</IfMatch></Delete></Batch>",
     ]
     for index, body in enumerate(invalid):
         expect_error(raw_batch(port, "/err?batch", body), 400, "InvalidArgument", f"invalid batch {index}")

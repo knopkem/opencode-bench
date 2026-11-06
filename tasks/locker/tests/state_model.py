@@ -297,8 +297,6 @@ def batch(state: State, bucket: str, ops: list[tuple]) -> Expected:
     for op in ops:
         kind = op[0]
         if kind in ("copy", "rename"):
-            if len(op) != 4:
-                return _error(400, "InvalidArgument")
             _, source, target, if_match = op
             if not source or not target or source == target:
                 return _error(400, "InvalidArgument")
@@ -314,8 +312,6 @@ def batch(state: State, bucket: str, ops: list[tuple]) -> Expected:
             if kind == "rename":
                 del working[source]
         elif kind == "delete":
-            if len(op) != 3:
-                return _error(400, "InvalidArgument")
             _, key, if_match = op
             if not key:
                 return _error(400, "InvalidArgument")

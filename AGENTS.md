@@ -4,10 +4,9 @@ This branch (`hard_task`) holds the **Locker** hard-task benchmark. SpriteForge
 and its community leaderboard remain the `main`-branch suite; do not wire Locker
 submissions or CI until the task is calibrated.
 
-`HARD-TASK-V4-PLAN.md` is the step-by-step build sheet for the `locker-v4`
-hardening (batch, faults, histories, mutants). Its contract package has landed;
-the reference, state model, cases and mutant campaign are still being built, so
-the invariant section below describes the v4 target catalog.
+`HARD-TASK-V4-PLAN.md` is the implemented, frozen build record for the
+`locker-v4` hardening (batch, faults, histories, mutants). The invariants below
+are the v4 catalog.
 
 ## Repository shape
 
@@ -103,8 +102,9 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
     --seed 20261106 --output /tmp/locker-result.json
   ```
 
-  Expect 51/51 subcases. `--family FAMILY` is author-only and marks the result
-  diagnostic; it is never eligible for ingestion.
+  Expect 69/69 subcases. Add `--scratch /scratch` with the frozen 32 MiB tmpfs
+  when `p2.faults` is included. `--family FAMILY` is author-only and marks the
+  result diagnostic; it is never eligible for ingestion.
 - Oracle unit tests:
   `python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'`.
 - Evaluator sensitivity: `python3 tasks/locker/tests/negative_controls.py

@@ -1,11 +1,10 @@
 # Locker v4 — implementation specification for the hardening pass
 
-**Status: planned, not implemented.** The repository is still `locker-v3`
-(12 families / 51 subcases). Everything below is the exact work to make the
-hidden suite `locker-v4` (16 families / 69 subcases). `HARD-TASK-PLAN.md`
+**Status: implemented, frozen.** The repository is `locker-v4`
+(16 families / 69 subcases). Everything below was the exact work to make the
+hidden suite v4; it is retained as the build record. `HARD-TASK-PLAN.md`
 remains the design history; this file is the authoritative, step-by-step
-build sheet for v4. When v4 is finished, update the status line above and the
-"Implementation status" paragraph in `HARD-TASK-PLAN.md`.
+build sheet for v4.
 
 This document is written for a worker model that has **not** read the design
 discussion. Every code change names the file, the function and the insertion
@@ -245,9 +244,9 @@ one bucket as a single atomic change. The request body is XML:
 - Any failed `IfMatch` or any Copy/Rename whose Source is absent fails the
   whole batch with 412 `PreconditionFailed` and changes nothing.
 - Malformed XML, zero operations, more than 32 operations, an unknown
-  operation element, a missing or empty Source/Target/Key, or Source equal to
-  Target returns 400 `InvalidArgument` and changes nothing. An absent bucket
-  returns 404.
+  operation element, a missing or empty Source/Target/Key, Source equal to
+  Target, or an `IfMatch` that is neither `*` nor one quoted token returns 400
+  `InvalidArgument` and changes nothing. An absent bucket returns 404.
 - Success is 200 with an empty body. Afterwards every touched key is readable
   with the stated ETag, Content-Type, Content-Length and bytes, including
   range and conditional requests, and listings report the new sizes and ETags.

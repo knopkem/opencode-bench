@@ -294,9 +294,9 @@ one bucket as a single atomic change. The request body is XML:
 - Any failed `IfMatch` or any Copy/Rename whose Source is absent fails the
   whole batch with 412 `PreconditionFailed` and changes nothing.
 - Malformed XML, zero operations, more than 32 operations, an unknown
-  operation element, a missing or empty Source/Target/Key, or Source equal to
-  Target returns 400 `InvalidArgument` and changes nothing. An absent bucket
-  returns 404.
+  operation element, a missing or empty Source/Target/Key, Source equal to
+  Target, or an `IfMatch` that is neither `*` nor one quoted token returns 400
+  `InvalidArgument` and changes nothing. An absent bucket returns 404.
 - Success is 200 with an empty body. Afterwards every touched key is readable
   with the stated ETag, Content-Type, Content-Length and bytes, including
   range and conditional requests, and listings report the new sizes and ETags.

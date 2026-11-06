@@ -70,6 +70,9 @@ The hidden manifest is `tasks/locker/tests/manifest.json`: 16 families,
 | Individual request deadline | 60 s |
 | Startup/readiness deadline | 15 s |
 | Bounded crash trials | 6 |
+| Maximum operations in one batch | 32 |
+| Data filesystem for full-disk cases | 33,554,432 bytes (32 MiB) |
+| Oversized write on that filesystem | 50,331,648 bytes (48 MiB) |
 
 The RSS figure is about the server process, not the Python test client.
 

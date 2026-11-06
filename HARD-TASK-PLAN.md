@@ -6,33 +6,34 @@ Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
 
 ## Implementation status
 
-- Next phase: the v4 hardening pass (atomic same-bucket batch, full-disk
-  fault family, generated histories against an independent state model,
-  realistic mutant campaign). v4 hardening specified in
-  `HARD-TASK-V4-PLAN.md`; its contract package has landed while the reference,
-  state model, cases and mutants are being built.
-- Frozen suite: `locker-v3`, 12 families, 51 subcases (P0 8 / P1 30 / P2 13),
+- v4 hardening (atomic same-bucket batch, full-disk fault family, generated
+  histories against an independent state model, realistic mutant campaign) is
+  implemented and frozen; `HARD-TASK-V4-PLAN.md` is the build record.
+- Frozen suite: `locker-v4`, 16 families, 69 subcases (P0 8 / P1 42 / P2 19),
   fixture seed `20261106`.
 - Frozen limits: 134,217,728-byte stream fixture; 100,663,296-byte server
   `VmHWM` cap; 180 s large-workload deadline; 10 s progress deadline; 60 s
-  request deadline; 15 s startup deadline; 6 bounded crash trials.
-- Reference: 51/51 subcases on macOS and in the pinned Linux image. The
-  concurrency/overwrite/multipart diagnostic families were repeated; the
-  injected-fault controls detect split publication, lost unrelated writes, a
-  global lock held across body input and premature multipart replacement.
-- Seed baseline: all 8 P0 subcases pass; challenge credit is P1 range 0/4,
-  conditional 0/4, multipart 0/11, listing 0/6, concurrency 1–2/5
-  (race-dependent); P2 overwrite 4/4, multipart 0/3, isolation 0/3, perf 1/3.
-  Quality is `0.170–0.193` across five seed runs and always ineligible. The
-  seed is deliberately naive, so the overwrite passes are measured rather than
-  assumed away.
+  request deadline; 15 s startup deadline; 6 bounded crash trials; 32 batch
+  operations; 33,554,432-byte fault filesystem; 50,331,648-byte oversized
+  write.
+- Reference: 69/69 subcases on macOS and in the pinned Linux image. Five timed
+  Linux runs had a 19.6 s median wall time; 210 consecutive diagnostic
+  race/crash/fault runs were clean; all 13 realistic mutants were detected
+  10/10 (both amplified variants 10/10); a 200-seed history sweep passed
+  1000/1000.
+- Seed baseline: all 8 P0 subcases pass and the build succeeds. Credit is P1
+  range 0/4, conditional 0/4, multipart 0/11, listing 0/6, concurrency 2/5;
+  P2 overwrite 4/4, multipart 0/3, isolation 0/3, perf 1/3, batch 0/7,
+  histories 0/5, faults 0/3. Total 15/69 and quality 0.1333; always ineligible.
+  The seed is deliberately naive, so the overwrite passes are measured rather
+  than assumed away.
 - Hardening: a first local model run saturated v1 (39/39). Suite v2 added ten
   multipart/concurrency/parameter subcases; the same binary then scored 40/49
   (quality ≈0.857). A fresh v2 model run adapted and scored 48/49. Suite v3
-  adds two bounded multipart list/complete/abort races, bringing the catalog to
-  51 cases; a fresh v3 run scored 50/51 but hit the then-current 18-minute hard wall cap (now 60 minutes).
-  Only combined multipart parameter validation remained. See
-  `tasks/locker/CALIBRATION.md`.
+  added two bounded multipart list/complete/abort races (51 cases); a fresh v3
+  run scored 50/51 but hit the then-current 18-minute hard wall cap (now 60
+  minutes). Suite v4 adds batch, fault, history and mutant dimensions
+  (69 cases). See `tasks/locker/CALIBRATION.md`.
 - Harness: Locker builds `bin/locker`, mounts the workdir read-only for the
   hidden suite, rejects diagnostic/malformed results, scores fixed-denominator
   family fractions and writes `results-locker.csv`, `report-locker.md` and

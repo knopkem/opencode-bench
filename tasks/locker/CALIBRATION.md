@@ -1,7 +1,8 @@
 # Locker implementation and evaluator validation
 
-Status: authoring/evaluator validation complete; paid model calibration is
-pending. This file is not visible to candidates.
+Status: `locker-v4` is implemented and frozen (see `## locker-v4` below); the
+earlier sections are the v3 history. Paid model calibration is still pending.
+This file is not visible to candidates.
 
 ## Frozen inputs
 
@@ -334,3 +335,69 @@ small writes into `CaseFailure` so `leak-temp-on-error` is a clean detection.
 prompt clarifications: none.
 
 open questions: none.
+
+### WP8 Release
+
+Reference commit: `78ead33` (WP7 fault-switch commit; the reference did not
+change during WP8). Image: `opencode-bench-locker:latest`, ID
+`sha256:dd5a3f4123ffbc1f50ab174280ef5ff11230e36a39aba77a3299a9c58683515b`.
+
+commands run:
+
+```bash
+python3 -m py_compile bench.py tasks/locker/tests/*.py
+python3 -m unittest discover -s tests
+python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'
+./bench.py check
+# five timed full runs in the pinned image with --tmpfs /scratch
+# 30 diagnostic runs each of p1.batch, p2.batch, p2.faults, p1.histories,
+#   p1.concurrency, p2.overwrite, p2.multipart
+# negative_controls.py --scratch /scratch --repeat 10
+# history_sweep.py --seeds 200
+# full seed run with --tmpfs /scratch
+./bench.py rescore --run 20261106T150936Z-locker-strata-swift-1.5-iq3_xxs-medium-r1
+./bench.py run --model deepseek/deepseek-flash --dry-run
+```
+
+results:
+
+- Static: `py_compile` OK; harness tests 13/13; oracle/state-model tests 19/19;
+  `./bench.py check` passes (16 families, 69 subcases, new limits, tmpfs probe).
+- Five timed full reference runs: 69/69 each, `diagnostic: false`,
+  `suite_version: locker-v4`; wall times 19.81, 19.14, 21.50, 19.57, 18.45 s;
+  median **19.57 s** (limit 90 s).
+- Flake gate: 30/30 clean for each of the seven families (210/210 diagnostic
+  runs, zero failures).
+- Mutants: 13/13 controls detected naturally 10/10; both amplified variants
+  10/10; see `NEGATIVE_CONTROLS.md`.
+- Sweep: 200 seeds × 5 cases = 1000/1000 histories, zero disagreements.
+- Seed baseline: build OK, 8/8 P0, 15/69 total, quality **0.1333**, ineligible.
+  Per family: P1 range 0/4, conditional 0/4, multipart 0/11, listing 0/6,
+  concurrency 2/5; P2 overwrite 4/4, multipart 0/3, isolation 0/3, perf 1/3,
+  batch 0/7, histories 0/5, faults 0/3. The three new families and every batch
+  case fail as designed.
+- Harness end-to-end: `./bench.py rescore` on a v3-era Locker workdir completed
+  and produced a v4 score of 45/69, quality 0.69, not eligible; `./bench.py run
+  --dry-run` prints `--tmpfs /scratch:rw,size=33554432` and `--scratch /scratch`.
+- Independent review (fresh agent): list (B) — model batch rules without a
+  prompt sentence — is **EMPTY** after the clarification below. List (A) is
+  limited to behaviours intentionally outside a pure no-I/O state model:
+  HTTP/XML shape and malformed XML, `Last-Modified`/commit-time metadata,
+  version identity and observation isolation, crash/restart persistence,
+  concurrent serialization/5xx/deadlock, and operational-failure/ENOSPC. Each
+  is graded outside `state_model.py` by the batch, history, concurrency, crash
+  or fault families.
+
+prompt clarifications: the batch malformed-input bullet now also says "or an
+`IfMatch` that is neither `*` nor one quoted token returns 400
+`InvalidArgument`". This is required by `p1.batch/errors` (empty and bare
+`IfMatch` bodies) and is mirrored into `HARD-TASK-V4-PLAN.md` §4.1(h). It is the
+only prompt change made during implementation; §4.1(a)–(j) were otherwise
+applied verbatim.
+
+deviations from HARD-TASK-V4-PLAN.md: the flake-gate family list names
+`p2.crash`, which does not exist in the v4 catalog; the gate was run over
+`p2.overwrite` and `p2.multipart` (the two crash families) in its place.
+
+open questions: none. Suite is frozen; the only remaining measurement is the
+user's rerun of the saturating local model.
