@@ -16,8 +16,9 @@ with `"schema": "opencode-bench/result@1"`.
 `submit` reads `runs/<run_id>/score.json`, strips local artifact paths, computes
 the score hash and validates the block before printing or creating the issue.
 `--gh` updates the existing open issue for the same `run_id` instead of
-posting a duplicate; use `--new` to force a new issue or `--issue N` to target
-one explicitly.
+posting a duplicate. It replaces only the result JSON block, so any prose or
+details around it are kept. Use `--new` to force a new issue or `--issue N` to
+target one explicitly.
 
 ## LLM / agent instructions
 

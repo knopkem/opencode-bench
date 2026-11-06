@@ -324,9 +324,10 @@ automatically and labeled before the page is built.
 ```
 
 `submit --gh` is idempotent per `run_id`: if an open issue already contains
-that run, it edits the issue body and title instead of creating a duplicate.
-This is the normal way to refresh a submission after `backfill` or `rescore`.
-Pass `--new` to force a new issue or `--issue N` to target one explicitly.
+that run, it replaces the issue's result JSON in place (keeping any surrounding
+writeup/details) and refreshes the title instead of creating a duplicate. This
+is the normal way to refresh a submission after `backfill` or `rescore`. Pass
+`--new` to force a new issue or `--issue N` to target one explicitly.
 
 The issue form is at
 [New result](https://github.com/knopkem/opencode-bench/issues/new?template=benchmark-result.yml).
