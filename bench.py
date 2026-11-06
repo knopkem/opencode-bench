@@ -2622,6 +2622,38 @@ def validate_submission(data: object) -> list[str]:
                 errors.append("run.wall_ex_self_test_s must equal wall_s - self_test_s")
 
     for key in (
+        "span_s",
+        "agent_s",
+        "ttft_s",
+        "think_s",
+        "output_s",
+        "tool_s",
+        "other_s",
+        "tool_shell_s",
+        "tool_write_s",
+        "tool_read_s",
+        "tool_other_s",
+        "tokens_per_step",
+    ):
+        value = run.get(key)
+        if value is not None and (not _is_number(value) or value < 0):
+            errors.append(f"run.{key} must be a non-negative number or null")
+    for key in (
+        "think_share",
+        "output_share",
+        "tool_share",
+        "ttft_share",
+        "other_share",
+        "self_test_share",
+        "cache_hit_rate",
+    ):
+        value = run.get(key)
+        if value is not None and (
+            not _is_number(value) or value < 0 or value > 1
+        ):
+            errors.append(f"run.{key} must be between 0 and 1 or null")
+
+    for key in (
         "self_test_runs",
         "self_test_failures",
         "retries",
@@ -2774,9 +2806,9 @@ def submission_to_row(submission: dict) -> dict:
     )
     wall = float(run.get("wall_s") or 0)
     self_test = run.get("self_test_s")
-    self_test_share = (
-        max(0.0, float(self_test) / wall) if self_test is not None and wall else None
-    )
+    self_test_share = run.get("self_test_share")
+    if self_test_share is None and self_test is not None and wall:
+        self_test_share = max(0.0, float(self_test) / wall)
     major = sum(
         tier_counts[tier]["total"] - tier_counts[tier]["pass"] for tier in ("P1",)
     )
@@ -2812,6 +2844,22 @@ def submission_to_row(submission: dict) -> dict:
         "fatal": fatal,
         "eligible": bool(run.get("eligible")),
         "wall_s": wall,
+        "span_s": run.get("span_s"),
+        "agent_s": run.get("agent_s"),
+        "ttft_s": run.get("ttft_s"),
+        "think_s": run.get("think_s"),
+        "output_s": run.get("output_s"),
+        "tool_s": run.get("tool_s"),
+        "other_s": run.get("other_s"),
+        "tool_shell_s": run.get("tool_shell_s"),
+        "tool_write_s": run.get("tool_write_s"),
+        "tool_read_s": run.get("tool_read_s"),
+        "tool_other_s": run.get("tool_other_s"),
+        "think_share": run.get("think_share"),
+        "output_share": run.get("output_share"),
+        "tool_share": run.get("tool_share"),
+        "ttft_share": run.get("ttft_share"),
+        "other_share": run.get("other_share"),
         "wall_ex_self_test_s": run.get("wall_ex_self_test_s"),
         "self_test_s": self_test,
         "self_test_runs": run.get("self_test_runs"),
@@ -2835,14 +2883,18 @@ def submission_to_row(submission: dict) -> dict:
         "mean_request_tokens": run.get("mean_request_tokens"),
         "gen_tokens_per_s": run.get("gen_tokens_per_s"),
         "gen_tokens_per_s_median": run.get("gen_tokens_per_s_median"),
-        "tokens_per_step": (
-            (run.get("input_tokens") or 0)
-            + (run.get("output_tokens") or 0)
-            + (run.get("reasoning_tokens") or 0)
-        )
-        / run["steps"]
-        if run.get("steps")
-        else None,
+        "tokens_per_step": run.get("tokens_per_step")
+        or (
+            (
+                (run.get("input_tokens") or 0)
+                + (run.get("output_tokens") or 0)
+                + (run.get("reasoning_tokens") or 0)
+            )
+            / run["steps"]
+            if run.get("steps")
+            else None
+        ),
+        "cache_hit_rate": run.get("cache_hit_rate"),
         "cost_usd": run.get("cost_usd"),
         "source": "community",
         "issue": submission.get("issue"),
@@ -2931,6 +2983,23 @@ def submission_template() -> dict:
             "rep": 1,
             "outcome": None,
             "wall_s": None,
+            "span_s": None,
+            "agent_s": None,
+            "ttft_s": None,
+            "think_s": None,
+            "output_s": None,
+            "tool_s": None,
+            "other_s": None,
+            "tool_shell_s": None,
+            "tool_write_s": None,
+            "tool_read_s": None,
+            "tool_other_s": None,
+            "think_share": None,
+            "output_share": None,
+            "tool_share": None,
+            "ttft_share": None,
+            "other_share": None,
+            "self_test_share": None,
             "wall_ex_self_test_s": None,
             "self_test_s": None,
             "self_test_runs": 0,
@@ -2960,6 +3029,8 @@ def submission_template() -> dict:
             "mean_request_tokens": None,
             "gen_tokens_per_s": None,
             "gen_tokens_per_s_median": None,
+            "tokens_per_step": None,
+            "cache_hit_rate": None,
             "cost_usd": None,
             "hardware": None,
             "notes": None,
@@ -3034,6 +3105,23 @@ def submission_from_score(meta: dict, *, hardware: str | None = None) -> dict:
         "rep": meta.get("rep", 1),
         "outcome": meta.get("outcome"),
         "wall_s": meta.get("wall_s"),
+        "span_s": meta.get("span_s"),
+        "agent_s": meta.get("agent_s"),
+        "ttft_s": meta.get("ttft_s"),
+        "think_s": meta.get("think_s"),
+        "output_s": meta.get("output_s"),
+        "tool_s": meta.get("tool_s"),
+        "other_s": meta.get("other_s"),
+        "tool_shell_s": meta.get("tool_shell_s"),
+        "tool_write_s": meta.get("tool_write_s"),
+        "tool_read_s": meta.get("tool_read_s"),
+        "tool_other_s": meta.get("tool_other_s"),
+        "think_share": meta.get("think_share"),
+        "output_share": meta.get("output_share"),
+        "tool_share": meta.get("tool_share"),
+        "ttft_share": meta.get("ttft_share"),
+        "other_share": meta.get("other_share"),
+        "self_test_share": meta.get("self_test_share"),
         "wall_ex_self_test_s": meta.get("wall_ex_self_test_s"),
         "self_test_s": meta.get("self_test_s"),
         "self_test_runs": meta.get("self_test_runs"),
@@ -3061,6 +3149,8 @@ def submission_from_score(meta: dict, *, hardware: str | None = None) -> dict:
         "mean_request_tokens": meta.get("mean_request_tokens"),
         "gen_tokens_per_s": meta.get("gen_tokens_per_s"),
         "gen_tokens_per_s_median": meta.get("gen_tokens_per_s_median"),
+        "tokens_per_step": meta.get("tokens_per_step"),
+        "cache_hit_rate": meta.get("cache_hit_rate"),
         "cost_usd": meta.get("cost_usd"),
         "hardware": (hardware if hardware is not None else meta.get("hardware")) or None,
         "notes": None,
