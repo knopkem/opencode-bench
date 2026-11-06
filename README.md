@@ -48,6 +48,7 @@ exits and is never visible to the model.
 ./bench.py rescore --run RUN_ID  # re-run build+tests on an existing workdir
 ./bench.py backfill --all        # recompute effort/token metrics on existing runs
 ./bench.py report                # table plus failed test names
+python3 -m unittest discover -s tests  # metric/scoring regression tests
 ```
 
 Docker/OrbStack must be running (`docker info`). `--engine podman` uses the same
@@ -201,8 +202,8 @@ runs/<run_id>/
 
 `./bench.py report` prints:
 
-- model, thinking/variant, quality, wall time, compactions, minor issues and
-  eligibility;
+- model, thinking/variant, quality, wall time, wall excluding self-test,
+  self-test share, retries, compactions, minor issues and eligibility;
 - a `Failures` section with the failed test names;
 - a pointer to `results.csv` and the per-run artifacts.
 
@@ -212,8 +213,10 @@ directory is persisted under `runs/<run_id>/opencode-data`, so the compaction
 count survives after the agent container exits.
 
 `results.csv` keeps `wall_s` as numeric seconds and adds `variant`, `thinking`,
-`reasoning_effort` and `compactions`. Console/report displays format wall time
-as `HH:MM:SS`.
+`reasoning_effort`, `compactions`, `self_test_s`, `wall_ex_self_test_s`,
+`retries`, `retry_s` and `gen_tokens_per_s_median`. Console/report displays
+format wall time as `HH:MM:SS`. An optional free-text `hardware` note can be
+attached with `./bench.py run --hardware "..."`.
 
 Each run also records `steps` (assistant steps in `agent.log`),
 `files_changed` (files added, removed or rewritten relative to the seed, ignoring
@@ -243,7 +246,11 @@ timestamps in `opencode-data/opencode.db`:
 | `think_s` | explicit reasoning before the first output/tool block |
 | `output_s` | model writing code, text and tool-call arguments |
 | `tool_s` | shell/build/test/Playwright/file-write execution |
-| `other_s` | startup, gaps, compaction calls and completion grace |
+| `self_test_s` | shell test/Playwright/browser-test execution (subset of `tool_s`) |
+| `build_tool_s` | build/typecheck command execution (subset of `tool_s`) |
+| `wall_ex_self_test_s` | `wall_s - self_test_s`; the “work” wall basis |
+| `retries` / `retry_s` | provider errors/retries; counted in wall and `other_s`, excluded from think/output and tok/s |
+| `other_s` | startup, gaps, compaction calls, provider retry time and completion grace |
 | `max_request_tokens` | largest per-request prompt size (input + cache reads/writes) |
 | `mean_request_tokens` | mean per-request prompt size |
 
@@ -256,7 +263,15 @@ window even when no compaction occurred. The context limit applies to one
 request, not to the run total. `max_request_tokens` and `mean_request_tokens`
 report the per-request prompt size (input + cache reads/writes), which is the
 relevant context-pressure metric. Derived fields include `think_share`,
-`tool_share`, `gen_tokens_per_s`, `tokens_per_step` and `cache_hit_rate`.
+`tool_share`, `self_test_share`, `gen_tokens_per_s`,
+`gen_tokens_per_s_median`, `tokens_per_step` and `cache_hit_rate`.
+
+`gen_tokens_per_s` is aggregate `(output + reasoning) / (think + output)` over
+successful attempts only. `gen_tokens_per_s_median` is the median per-step rate
+and is the more robust number when a provider stalls or retries. The
+think/output boundary is heuristic, but tok/s uses their sum, so it is stable;
+the per-step median is included as a second check. Both rates are
+hardware-dependent.
 
 Reasoning-token counts are provider-reported. A run can show a large `think_s`
 with `reasoning_tokens = 0`; in that case the **time split is authoritative** and
@@ -264,6 +279,11 @@ the token count only means the provider did not report reasoning usage. The
 leaderboard uses time-based shares for cross-provider comparisons and labels the
 token breakdown as reported. `gen_tokens_per_s` is hardware-dependent for local
 models.
+
+Provider errors/retries are reported separately: they count in `wall_s` and
+`other_s`, but their zero-token attempts are excluded from `think_s`,
+`output_s` and `gen_tokens_per_s`. This prevents a stalled 359-second retry from
+making a healthy run look 25% slower.
 
 `./bench.py backfill --all` recomputes these fields from existing artifacts
 (`agent.log` and `opencode.db`) without Docker or the OpenCode CLI. It updates
@@ -299,32 +319,41 @@ Runs are scored and ranked by:
 
 ```
 score = 80% quality + 15% speed + 5% compactions
-speed = fastest wall / run wall
+speed = fastest eligible wall / run wall, capped at 1.0
 compactions = 1 / (1 + count)
 ```
 
-Quality carries the most weight, then wall time, then compactions. Runs that
-fail eligibility stay on the board but keep only 75% of their score, so they
-rank below quality runs instead of being hidden. Ties break on quality, wall
-time, compactions and run ID. The page also shows the raw quality, P0/P1/P2
-counts, `HH:MM:SS` wall time, compaction count and eligibility for each run.
+Only **eligible** runs set the speed baseline; a fast failed run cannot flatten
+everyone else's scores. Quality carries the most weight, then wall time, then
+compactions. Runs that fail eligibility stay on the board but keep only 75% of
+their score, so they rank below quality runs instead of being hidden. Ties break
+on quality, wall time, compactions and run ID. The page also shows the raw
+quality, P0/P1/P2 counts, `HH:MM:SS` wall time, compaction count and eligibility
+for each run.
+
+The **Wall / work** cell shows total wall and a sub-line with wall excluding
+self-test execution, self-test time/runs and provider retries. The **Wall
+basis** selector switches the score between total wall and wall excluding
+self-test; each basis has its own eligible baseline and speed cap. This makes
+the verification trade-off visible without silently changing the benchmark.
 
 Each row has one **Effort** column: a stacked bar (TTFT, thinking, model output,
 tool execution, other), coloured percentages underneath, then peak request
-tokens and generation tok/s. The colour legend is above the table; hover the
-effort cell for the full breakdown with per-bucket time and peak/mean request
-tokens, or click it for the larger detail dialog with step distribution, cache
-hit rate and cost. A collapsible **Model medians** table below the main table
-aggregates tokens and effort by model/variant. Missing metrics render as `—`.
-The token breakdown is provider-reported, so a thinking phase with zero
-reasoning tokens is annotated rather than shown as no thinking.
+tokens and median generation tok/s. The colour legend is above the table; hover
+the effort cell for the full breakdown with per-bucket time and peak/mean request
+tokens, or click it for the larger detail dialog with self-test/build/retry time,
+step distribution, cache hit rate and cost. A collapsible **Model medians** table
+below the main table aggregates tokens, work wall, self-test share and tok/s by
+model/variant. Missing metrics render as `—`. The token breakdown is
+provider-reported, so a thinking phase with zero reasoning tokens is annotated
+rather than shown as no thinking.
 
-The leaderboard has **Provider** and **Reasoning** filter drop-downs. It opens
-sorted by **Score**, highest first. Click any sortable column header to sort by
-it, and click again to reverse the direction. `Started` sorts newest first and
-`Wall` sorts fastest first by default. Rank numbers follow the current filtered
-and sorted view. Filter and sort choices are remembered in the browser, so the
-30-second live refresh keeps them.
+The leaderboard has **Provider**, **Reasoning** and **Wall basis** drop-downs. It
+opens sorted by **Score**, highest first. Click any sortable column header to
+sort by it, and click again to reverse the direction. `Started` sorts newest
+first and `Wall` sorts fastest first by default. Rank numbers follow the current
+filtered and sorted view. Filter, sort and wall-basis choices are remembered in
+the browser, so the 30-second live refresh keeps them.
 
 ## Scoring
 
@@ -347,7 +376,10 @@ one arbitrary score.
 
 `wall_s` includes the model's own browser testing. A model that debugs and
 fails loses on both quality and time; one that debugs and passes trades time for
-quality.
+quality. The leaderboard reports self-test time and offers a wall basis that
+excludes it, because a thorough model can otherwise lose to a lucky model that
+skipped verification. Provider errors/retries remain in total wall but are
+excluded from tok/s and shown separately.
 
 `COMPLETION.md` stops the run after a 60-second grace period. Watchdogs are
 4 hours hard and 30 minutes without output. They are safety valves, not scoring
@@ -378,6 +410,7 @@ launch.
 
 ```
 bench.py                     orchestrator
+tests/test_bench.py          metric/scoring regression tests
 docker/agent.Dockerfile      Playwright + Chromium + OpenCode 2 image
 docker/entrypoint.sh         config copy + preinstalled node_modules
 docker/serve.mjs             static server for the built app
