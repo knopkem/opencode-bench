@@ -100,7 +100,9 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 
 - `ttft_s`, `think_s`, `output_s`, `tool_s` and `other_s` are **sums across all
   assistant requests**, not per-request values. `ttft_s / steps` is the average
-  time to first token; shares are relative to `wall_s`.
+  time to first token; shares are relative to `wall_s`. TTFT covers queueing,
+  prefill and any unstreamed reasoning before the first content block; do not
+  present it as a pure prefill benchmark.
 - Token fields are cumulative across assistant steps and include cache reads and
   writes. `total_tokens` can therefore exceed the model's context window without
   any compaction. Compaction depends on one request's context, not the run total.

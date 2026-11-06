@@ -249,7 +249,7 @@ timestamps in `opencode-data/opencode.db`:
 
 | field | meaning |
 |---|---|
-| `ttft_s` | sum over all assistant requests of request start → first model token (prefill/queue); divide by `steps` for the per-request average |
+| `ttft_s` | sum over all assistant requests of request start → first content block (queue, prefill, unstreamed reasoning); divide by `steps` for the per-request average |
 | `think_s` | explicit reasoning before the first output/tool block |
 | `output_s` | model writing code, text and tool-call arguments |
 | `tool_s` | shell/build/test/Playwright/file-write execution |
@@ -417,10 +417,13 @@ the verification trade-off visible without silently changing the benchmark.
 
 Each row has one **Effort** column: a stacked bar (TTFT, thinking, model output,
 tool execution, other), coloured percentages underneath, then peak request
-tokens and median generation tok/s. The colour legend is above the table; hover
-the effort cell for the full breakdown with per-bucket time and peak/mean request
-tokens, or click it for the larger detail dialog with self-test/build/retry time,
-step distribution, cache hit rate and cost. A collapsible **Model medians** table
+tokens and median generation tok/s. TTFT is measured to the first visible
+content block; it includes queueing, prefill and any reasoning the provider does
+not stream, so it is not a pure prefill benchmark. The colour legend is above
+the table; hover the effort cell for the full breakdown with per-bucket time,
+TTFT per step and peak/mean request tokens, or click it for the larger detail
+dialog with self-test/build/retry time, step distribution, cache hit rate and
+cost. A collapsible **Model medians** table
 below the main table aggregates tokens, work wall, self-test share and tok/s by
 model/variant. Missing metrics render as `—`. The token breakdown is
 provider-reported, so a thinking phase with zero reasoning tokens is annotated
