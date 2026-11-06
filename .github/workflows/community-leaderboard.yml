@@ -2,7 +2,10 @@ name: Community leaderboard
 
 on:
   issues:
-    types: [opened, edited, reopened, closed, labeled, unlabeled]
+    # Creation emits both `opened` and `labeled` when the issue form or
+    # `gh issue create --label` applies `benchmark-result`. Trigger on
+    # `labeled` only so a new submission starts exactly one build.
+    types: [edited, reopened, closed, labeled, unlabeled]
   push:
     branches: [main]
     paths:

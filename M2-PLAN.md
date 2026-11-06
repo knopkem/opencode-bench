@@ -11,7 +11,7 @@ truth; the workflow does not commit generated files.
 
 ```
 Issue form (JSON block, `benchmark-result` label)
-        │  opened / edited / reopened / closed / labeled / unlabeled
+        │  labeled / edited / reopened / closed / unlabeled
         ▼
 GitHub Actions
         │  gh issue list --label benchmark-result --state open
@@ -281,7 +281,10 @@ Withdrawal options, documented in README:
 
 Triggers:
 
-- `issues`: `opened`, `edited`, `reopened`, `closed`, `labeled`, `unlabeled`.
+- `issues`: `labeled`, `edited`, `reopened`, `closed`, `unlabeled`.
+  `opened` is intentionally omitted: issue forms and `gh issue create --label`
+  emit both `opened` and `labeled`, and importing on `labeled` alone avoids a
+  duplicate cancelled build.
 - `push` to `main` for `bench.py`, `submissions/**` and the workflow itself.
 - `workflow_dispatch`.
 - Daily `schedule` to reconcile deleted issues and missed events.
