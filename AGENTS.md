@@ -10,9 +10,13 @@
   sees. `tasks/spriteforge-lite/tests/` is the hidden Playwright suite.
   `tasks/spriteforge-lite/reference/` is a working implementation used only to
   validate the suite; never expose it to the model.
-- `runs/`, `results.csv`, `report.md` and `leaderboard.html` are generated
-  artifacts. Do not hand-edit per-run workdirs or generated reports; fix the
-  source (`bench.py`, `PROMPT.md`, seed, hidden tests) and regenerate.
+- `submissions/` holds the public result schema, template and example;
+  `.github/ISSUE_TEMPLATE/` holds the result form and
+  `.github/workflows/community-leaderboard.yml` builds/deploys the public page.
+- `runs/`, `results.csv`, `report.md`, `leaderboard.html` and `docs/` are
+  generated artifacts. Do not hand-edit per-run workdirs or generated reports;
+  fix the source (`bench.py`, `PROMPT.md`, seed, hidden tests, submissions,
+  templates) and regenerate.
 
 ## Commands
 
@@ -33,6 +37,14 @@ Run from the repo root:
 - `./bench.py report` / `./bench.py leaderboard` — all-run views. The default
   `leaderboard` command serves and opens the page; `--write` only writes
   `leaderboard.html`.
+- `./bench.py submit --run RUN_ID --print` — turn a run into the community
+  result JSON block. `--gh` creates the labeled issue; `--check FILE` validates
+  offline; `--template` prints the skeleton.
+- `./bench.py site --issues issues.json --output docs` — build the public page
+  from `gh issue list` JSON. Writes `docs/index.html` and
+  `docs/data/results.json`; no network or Docker.
+- `./bench.py moderate --issue N --hide|--show` — add or remove the `hidden`
+  label on a community result.
 - `./bench.py preview --run RUN_ID` — serve a built app on `127.0.0.1:4173`.
 
 `docker info` must succeed for build/run/check/rescore; `check` and `models`
@@ -53,6 +65,31 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
   server, and `npm run test:e2e` covers only the public smoke tests.
 - Hidden tests and the reference are mounted only after the agent exits. Never
   copy either into the seed, `PROMPT.md`, the image, or an agent workdir.
+
+## Community leaderboard invariants
+
+- The public page is built from **open** issues labeled `benchmark-result` that
+  do **not** have `hidden`. Issues are the source of truth; the workflow does
+  not commit generated files.
+- The submission format is exactly one fenced `json` block with
+  `"schema": "opencode-bench/result@1"`. `submissions/schema.json` documents it;
+  `validate_submission()` is the authoritative check.
+- Never trust submitted `quality`, `eligible`, `test_ok` or hidden-test totals.
+  Recompute/compare them. The current suite is `EXPECTED = {"P0": 5, "P1": 9,
+  "P2": 6}`; changing the suite requires updating the schema/template/example
+  and old submissions become non-comparable.
+- CI owns `submitter`, `issue`, `issue_url`, `submitted_at` and
+  `evidence.level`. `verified` is a manual maintainer badge, not a replay.
+  Any issue edit clears `verified`; maintainers re-add it after review.
+- `hidden` is the reversible moderation switch. `needs-attention` is automatic
+  for validation failures. Do not auto-remove `hidden`.
+- `bench.py site` / `submit` are stdlib-only and must not require Docker or the
+  OpenCode CLI. The workflow uses `gh issue list` JSON and never executes issue
+  content as code.
+- The Pages workflow needs `contents: read`, `issues: write`, `pages: write`
+  and `id-token: write`. Do not add `contents: write` or bot commits.
+- One-time repo setup: Pages source “GitHub Actions”; labels `benchmark-result`,
+  `verified`, `hidden`, `needs-attention`.
 
 ## Effort metrics
 
@@ -107,6 +144,15 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - `watchdog: exit` alone is not success. Interpret finished runs with `outcome`
   (`complete`, `gave_up`, `incomplete`, `timeout`, `stalled`, `error`),
   `COMPLETION.md` and `files_changed`.
+- For community/site changes, run
+  `./bench.py submit --check submissions/examples/issue-1.json`,
+  `./bench.py site --issues tests/fixtures/issues.json --output /tmp/site`,
+  `./bench.py site --issues tests/fixtures/issues-invalid.json --output
+  /tmp/site-bad --errors /tmp/errors.json`, `python3 -m unittest discover -s
+  tests`, and `actionlint .github/workflows/community-leaderboard.yml`.
+- The public page is generated into `docs/` and is **not committed**. Do not
+  hand-edit it; fix `bench.py`, the issue template/schema, or the workflow and
+  rebuild.
 
 ## Operational gotchas
 

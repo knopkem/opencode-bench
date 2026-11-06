@@ -5,6 +5,9 @@ Run with: python3 -m unittest discover -s tests
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
 import sqlite3
 import sys
@@ -207,6 +210,136 @@ class SessionMetricTests(unittest.TestCase):
 
         self.assertEqual(usage["steps"], 2)
         self.assertAlmostEqual(usage["gen_tokens_per_s_median"], 75.0, places=6)
+
+
+class CommunitySubmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixtures = ROOT / "tests" / "fixtures"
+        self.example = json.loads(
+            (ROOT / "submissions" / "examples" / "issue-1.json").read_text()
+        )
+
+    def test_example_validates(self) -> None:
+        self.assertEqual(bench.validate_submission(self.example), [])
+
+    def test_schema_is_valid_json(self) -> None:
+        schema = json.loads((ROOT / "submissions" / "schema.json").read_text())
+        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertEqual(schema["properties"]["schema"]["const"], bench.SUBMISSION_SCHEMA)
+
+    def test_extract_block(self) -> None:
+        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
+        data, errors = bench.extract_result_block(issue["body"])
+        self.assertEqual(errors, [])
+        self.assertEqual(data["run_id"], self.example["run_id"])
+
+    def test_bad_counts_rejected(self) -> None:
+        bad = json.loads(json.dumps(self.example))
+        bad["run"]["counts"]["P0"]["pass"] = 4
+        bad["run"]["counts"]["P1"]["pass"] = 9
+        bad["run"]["counts"]["P2"]["pass"] = 6
+        errors = bench.validate_submission(bad)
+        self.assertTrue(any("quality" in error or "eligible" in error for error in errors))
+
+        bad["run"]["self_test_s"] = 100
+        bad["run"]["wall_ex_self_test_s"] = 10
+        errors = bench.validate_submission(bad)
+        self.assertTrue(any("wall_ex_self_test_s" in error for error in errors))
+
+    def test_hidden_submission_is_not_rendered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "site"
+            errors = Path(temp) / "errors.json"
+            args = argparse.Namespace(
+                issues=str(self.fixtures / "issues-hidden.json"),
+                output=str(out),
+                errors=str(errors),
+                include_hidden=False,
+            )
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(bench.cmd_site(args), 0)
+            results = json.loads((out / "data" / "results.json").read_text())
+            self.assertEqual(results, [])
+            self.assertTrue((out / "index.html").exists())
+
+    def test_verified_submission_is_rendered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "site"
+            args = argparse.Namespace(
+                issues=str(self.fixtures / "issues-verified.json"),
+                output=str(out),
+                errors=None,
+                include_hidden=False,
+            )
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(bench.cmd_site(args), 0)
+            results = json.loads((out / "data" / "results.json").read_text())
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["evidence"]["level"], "verified")
+            self.assertEqual(results[0]["source"], "community")
+
+    def test_duplicate_prefers_verified(self) -> None:
+        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
+        newer = json.loads(json.dumps(issue))
+        newer["number"] = 10
+        newer["createdAt"] = "2026-11-05T10:00:00Z"
+        newer["url"] = "https://github.com/knopkem/opencode-bench/issues/10"
+        verified = json.loads(json.dumps(issue))
+        verified["number"] = 11
+        verified["createdAt"] = "2026-11-04T10:00:00Z"
+        verified["url"] = "https://github.com/knopkem/opencode-bench/issues/11"
+        verified["labels"].append({"name": "verified"})
+        with tempfile.TemporaryDirectory() as temp:
+            issues_path = Path(temp) / "issues.json"
+            issues_path.write_text(json.dumps([newer, verified]))
+            out = Path(temp) / "site"
+            args = argparse.Namespace(
+                issues=str(issues_path),
+                output=str(out),
+                errors=None,
+                include_hidden=False,
+            )
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(bench.cmd_site(args), 0)
+            results = json.loads((out / "data" / "results.json").read_text())
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["issue"], 11)
+            self.assertEqual(results[0]["evidence"]["level"], "verified")
+
+    def test_invalid_submission_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "site"
+            errors_path = Path(temp) / "errors.json"
+            args = argparse.Namespace(
+                issues=str(self.fixtures / "issues-invalid.json"),
+                output=str(out),
+                errors=str(errors_path),
+                include_hidden=False,
+            )
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(bench.cmd_site(args), 0)
+            errors = json.loads(errors_path.read_text())
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["issue"], 2)
+            self.assertTrue(errors[0]["errors"])
+
+    def test_row_conversion_keeps_metrics(self) -> None:
+        normalized = bench.normalize_submission(self.example)
+        row = bench.submission_to_row(normalized)
+        self.assertEqual(row["run_id"], self.example["run_id"])
+        self.assertEqual(row["quality"], 1.0)
+        self.assertTrue(row["eligible"])
+        self.assertEqual(row["wall_s"], 1136)
+        self.assertEqual(row["self_test_runs"], 28)
+        self.assertEqual(row["source"], "community")
 
 
 if __name__ == "__main__":

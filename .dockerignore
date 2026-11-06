@@ -1,6 +1,7 @@
 runs/
 results.csv
 report.md
+docs/
 **/node_modules/
 **/dist/
 **/test-results/

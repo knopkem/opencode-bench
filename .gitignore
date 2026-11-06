@@ -3,6 +3,7 @@ results.csv
 results.csv.lock
 report.md
 leaderboard.html
+docs/
 **/node_modules/
 **/dist/
 **/test-results/

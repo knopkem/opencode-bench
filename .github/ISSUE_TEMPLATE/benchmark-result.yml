@@ -1,0 +1,112 @@
+name: Benchmark result
+description: Submit a completed opencode-bench run to the live community leaderboard.
+title: "[Result] "
+labels: ["benchmark-result"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submit **one completed run**. The page is built from open issues labeled
+        `benchmark-result`; edits are re-read and the page is rebuilt automatically.
+
+        The preferred method is:
+
+        ```bash
+        ./bench.py submit --run RUN_ID --print
+        ```
+
+        Paste the printed JSON block below, or use `./bench.py submit --run RUN_ID --gh`
+        to create this issue directly.
+
+        If you are an LLM agent, follow
+        [submissions/TEMPLATE.md](https://github.com/knopkem/opencode-bench/blob/main/submissions/TEMPLATE.md):
+        fill fields from the actual run, use `null` for unknown values, and do not
+        invent hardware or timings. Keep exactly one fenced `json` block.
+
+  - type: textarea
+    id: result
+    attributes:
+      label: Result JSON
+      description: 'One fenced json block with schema "opencode-bench/result@1".'
+      render: json
+      value: |
+        ```json
+        {
+          "schema": "opencode-bench/result@1",
+          "run_id": "YYYYMMDDTHHMMSSZ-provider-model-variant-r1",
+          "started_at": "YYYY-MM-DDTHH:MM:SSZ",
+          "harness": {
+            "commit": null,
+            "opencode_version": null,
+            "suite": "spriteforge-lite",
+            "hidden_tests": {"P0": 5, "P1": 9, "P2": 6}
+          },
+          "model": {
+            "ref": "provider/model",
+            "name": null,
+            "provider_type": "unknown",
+            "params_b": null,
+            "quantization": null,
+            "weights_gb": null,
+            "context_tokens": null
+          },
+          "run": {
+            "variant": "default",
+            "thinking": "unknown",
+            "reasoning_effort": null,
+            "rep": 1,
+            "outcome": "complete",
+            "wall_s": null,
+            "wall_ex_self_test_s": null,
+            "self_test_s": null,
+            "self_test_runs": 0,
+            "self_test_failures": 0,
+            "build_tool_s": null,
+            "dev_tool_s": null,
+            "retries": 0,
+            "retry_s": 0,
+            "compactions": 0,
+            "build_ok": false,
+            "typecheck_ok": false,
+            "test_ok": false,
+            "counts": {
+              "P0": {"pass": 0, "total": 5},
+              "P1": {"pass": 0, "total": 9},
+              "P2": {"pass": 0, "total": 6}
+            },
+            "quality": null,
+            "eligible": false,
+            "steps": 0,
+            "input_tokens": null,
+            "output_tokens": null,
+            "reasoning_tokens": null,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "compaction_tokens": null,
+            "total_tokens": null,
+            "max_request_tokens": null,
+            "mean_request_tokens": null,
+            "gen_tokens_per_s": null,
+            "gen_tokens_per_s_median": null,
+            "cost_usd": null,
+            "hardware": null,
+            "notes": null
+          },
+          "evidence": {
+            "level": "self-reported",
+            "report_url": null,
+            "score_sha256": null,
+            "notes": null
+          }
+        }
+        ```
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: This run used the unmodified current hidden test suite and I did not edit score.json.
+          required: true

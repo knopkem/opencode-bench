@@ -1,0 +1,135 @@
+name: Community leaderboard
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed, labeled, unlabeled]
+  push:
+    branches: [main]
+    paths:
+      - bench.py
+      - submissions/**
+      - .github/workflows/community-leaderboard.yml
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+  issues: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: community-leaderboard
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: |
+      github.event_name != 'issues' ||
+      contains(github.event.issue.labels.*.name, 'benchmark-result') ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'benchmark-result') ||
+      github.event.label.name == 'hidden'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'issues' && github.event.repository.default_branch || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch open submissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --label benchmark-result \
+            --state open \
+            --limit 1000 \
+            --json number,title,body,url,author,createdAt,updatedAt,labels \
+            > "$RUNNER_TEMP/issues.json"
+
+      - name: Build public leaderboard
+        run: |
+          python3 bench.py site \
+            --issues "$RUNNER_TEMP/issues.json" \
+            --output docs \
+            --errors "$RUNNER_TEMP/errors.json"
+
+      - name: Moderate triggering issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          number = os.environ["ISSUE_NUMBER"]
+          errors_path = Path(os.environ["RUNNER_TEMP"]) / "errors.json"
+          errors = json.loads(errors_path.read_text()) if errors_path.exists() else []
+          match = next((item for item in errors if item.get("issue") == int(number)), None)
+
+          if os.environ.get("EVENT_ACTION") == "edited":
+              subprocess.run(
+                  ["gh", "issue", "edit", number, "--remove-label", "verified"],
+                  check=False,
+              )
+
+          if match:
+              lines = [
+                  "<!-- opencode-bench-bot -->",
+                  "The result block did not validate:",
+                  "",
+              ]
+              lines.extend(f"- `{error}`" for error in match.get("errors") or [])
+              lines += [
+                  "",
+                  "Fix the issue body and the page will rebuild automatically.",
+              ]
+              body_path = Path(os.environ["RUNNER_TEMP"]) / "comment.md"
+              body_path.write_text("\n".join(lines) + "\n")
+              subprocess.run(
+                  [
+                      "gh", "issue", "comment", number,
+                      "--body-file", str(body_path),
+                      "--edit-last", "--create-if-none",
+                  ],
+                  check=False,
+              )
+              subprocess.run(
+                  ["gh", "issue", "edit", number, "--add-label", "needs-attention"],
+                  check=False,
+              )
+          else:
+              subprocess.run(
+                  ["gh", "issue", "edit", number, "--remove-label", "needs-attention"],
+                  check=False,
+              )
+          PY
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
