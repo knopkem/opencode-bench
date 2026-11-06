@@ -163,3 +163,31 @@ existing v4 paragraph. No code/semantics deviations.
 prompt clarifications: none; all §4.1 texts applied verbatim.
 
 open questions: none.
+
+### WP2 Reference
+
+commands run:
+
+```bash
+cd tasks/locker/reference && go vet ./... && go test ./...
+docker run ... opencode-bench-locker:latest go build -trimpath -o /out/locker ./cmd/locker
+docker run ... python3 -B .../run.py --binary /bin-under-test/locker \
+  --manifest .../manifest.json --seed 20261106 --output /out/ref.json
+```
+
+results: `go vet` and `go test` pass (`protocol`, `server`, `store`). Linux build
+succeeds. Full suite against the new binary: existing 51/51 pass, new
+placeholder cases 0/18 fail with `case not implemented yet`, as expected between
+packages. Manual HTTP probe: batch copy/delete returns 200 and the copy is
+readable; failed `IfMatch` returns 412; `batch` on an object path returns 400.
+
+deviations from HARD-TASK-V4-PLAN.md: the nine `LOCKER_FAULT` switches from
+§5.6 are implemented with the mutant campaign in WP7 rather than WP2; WP2's gate
+does not exercise them. Added `internal/store/batch_test.go` and
+`internal/protocol/batch_test.go` covering working-copy order, manifest-byte
+stability on 412, rename chains, absent-key delete, copy/source independence,
+`errWriter` attribution, parser limits and every malformed shape.
+
+prompt clarifications: none.
+
+open questions: none.

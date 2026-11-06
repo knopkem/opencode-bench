@@ -149,6 +149,10 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	query := r.URL.Query()
+	if _, ok := query["batch"]; ok {
+		s.serveBatch(w, r, bucket, query)
+		return
+	}
 	if _, ok := query["uploadId"]; ok {
 		writeError(w, r, http.StatusBadRequest, "InvalidArgument", "uploadId is not valid on a bucket")
 		return
@@ -171,6 +175,29 @@ func (s *Server) serveBucket(w http.ResponseWriter, r *http.Request, bucket stri
 	default:
 		writeError(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "method not allowed")
 	}
+}
+
+func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, bucket string, query url.Values) {
+	for _, forbidden := range []string{"list-type", "prefix", "delimiter", "max-keys", "continuation-token", "uploads", "uploadId", "partNumber"} {
+		if _, ok := query[forbidden]; ok {
+			writeError(w, r, http.StatusBadRequest, "InvalidArgument", "batch cannot be combined with other parameters")
+			return
+		}
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "batch requires POST")
+		return
+	}
+	ops, err := protocol.ParseBatch(http.MaxBytesReader(w, r.Body, 1<<20), 32)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "InvalidArgument", err.Error())
+		return
+	}
+	if err := s.store.Batch(bucket, ops); err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -346,6 +373,10 @@ func decodeToken(value string) (tokenState, error) {
 
 func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	query := r.URL.Query()
+	if _, ok := query["batch"]; ok {
+		writeError(w, r, http.StatusBadRequest, "InvalidArgument", "batch is only valid on a bucket")
+		return
+	}
 	uploads := hasKey(query, "uploads")
 	uploadID := query.Get("uploadId")
 	partValue, hasPart := query["partNumber"]
@@ -622,6 +653,8 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, r, http.StatusConflict, "BucketNotEmpty", "the bucket is not empty")
 	case errors.Is(err, store.ErrIncomplete), errors.Is(err, store.ErrInvalid):
 		writeError(w, r, http.StatusBadRequest, "InvalidArgument", err.Error())
+	case errors.Is(err, store.ErrPrecondition):
+		writeError(w, r, http.StatusPreconditionFailed, "PreconditionFailed", "a batch precondition failed")
 	default:
 		writeError(w, r, http.StatusInternalServerError, "InternalError", "internal storage error")
 	}

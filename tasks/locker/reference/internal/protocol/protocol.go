@@ -5,11 +5,15 @@
 package protocol
 
 import (
+	"encoding/xml"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"locker/internal/store"
 )
 
 // ErrInvalidRange means the Range header is malformed or unsatisfiable. Both
@@ -124,4 +128,73 @@ func etagMatches(value, etag string) bool {
 	// The public subset is one quoted ETag. Accepting the unquoted form as
 	// well is harmless and avoids rejecting well-meaning clients.
 	return strings.Trim(value, `"`) == strings.Trim(etag, `"`)
+}
+
+// batchXML is the wire shape of a batch request. The ",any" tag is required so
+// an unknown operation element is collected and rejected instead of ignored.
+type batchXML struct {
+	XMLName xml.Name `xml:"Batch"`
+	Ops     []opXML  `xml:",any"`
+}
+
+type opXML struct {
+	XMLName xml.Name
+	Source  *string `xml:"Source"`
+	Target  *string `xml:"Target"`
+	Key     *string `xml:"Key"`
+	IfMatch *string `xml:"IfMatch"`
+}
+
+// ParseBatch decodes and validates one batch request body.
+func ParseBatch(r io.Reader, maxOps int) ([]store.BatchOp, error) {
+	var request batchXML
+	if err := xml.NewDecoder(r).Decode(&request); err != nil {
+		return nil, err
+	}
+	if len(request.Ops) == 0 || len(request.Ops) > maxOps {
+		return nil, errors.New("invalid operation count")
+	}
+	ops := make([]store.BatchOp, 0, len(request.Ops))
+	for _, item := range request.Ops {
+		ifMatch := ""
+		if item.IfMatch != nil {
+			if !validIfMatch(*item.IfMatch) {
+				return nil, errors.New("invalid IfMatch")
+			}
+			ifMatch = *item.IfMatch
+		}
+		switch item.XMLName.Local {
+		case "Copy", "Rename":
+			if item.Source == nil || item.Target == nil ||
+				*item.Source == "" || *item.Target == "" ||
+				*item.Source == *item.Target || item.Key != nil {
+				return nil, errors.New("invalid copy/rename operation")
+			}
+			kind := "copy"
+			if item.XMLName.Local == "Rename" {
+				kind = "rename"
+			}
+			ops = append(ops, store.BatchOp{
+				Kind:    kind,
+				Source:  *item.Source,
+				Target:  *item.Target,
+				IfMatch: ifMatch,
+			})
+		case "Delete":
+			if item.Key == nil || *item.Key == "" || item.Source != nil || item.Target != nil {
+				return nil, errors.New("invalid delete operation")
+			}
+			ops = append(ops, store.BatchOp{Kind: "delete", Key: *item.Key, IfMatch: ifMatch})
+		default:
+			return nil, errors.New("unknown batch operation")
+		}
+	}
+	return ops, nil
+}
+
+func validIfMatch(value string) bool {
+	if value == "*" {
+		return true
+	}
+	return len(value) >= 3 && value[0] == '"' && value[len(value)-1] == '"'
 }

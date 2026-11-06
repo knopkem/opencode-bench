@@ -24,6 +24,8 @@ var (
 	ErrBucketNotEmpty = errors.New("bucket not empty")
 	ErrIncomplete     = errors.New("incomplete request body")
 	ErrInvalid        = errors.New("invalid argument")
+	// ErrPrecondition reports a failed IfMatch or an absent batch Source.
+	ErrPrecondition = errors.New("precondition failed")
 )
 
 // Object is one immutable, published object version.
@@ -322,7 +324,11 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, declared int64, co
 	}()
 
 	digest := md5.New()
-	size, err := io.Copy(io.MultiWriter(temp, digest), body)
+	ew := &errWriter{w: temp}
+	size, err := io.Copy(io.MultiWriter(ew, digest), body)
+	if ew.err != nil {
+		return Object{}, ew.err
+	}
 	if err != nil {
 		return Object{}, ErrIncomplete
 	}
@@ -443,6 +449,68 @@ func (s *Store) DeleteObject(bucketName, key string) error {
 	return nil
 }
 
+// BatchOp is one validated batch operation. Kind is "copy", "rename" or
+// "delete". Source/Target are used by copy and rename; Key by delete.
+// IfMatch is "" when absent, "*" or a quoted ETag otherwise.
+type BatchOp struct {
+	Kind    string
+	Source  string
+	Target  string
+	Key     string
+	IfMatch string
+}
+
+// Batch applies ops in order to a working copy of the bucket and publishes
+// the result as a single manifest replacement, or changes nothing.
+func (s *Store) Batch(bucketName string, ops []BatchOp) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bucket, ok := s.snapshot.Buckets[bucketName]
+	if !ok {
+		return ErrNoSuchBucket
+	}
+	working := cloneBucket(bucket) // shallow copy of the Objects map
+	now := time.Now().UTC()
+	for _, op := range ops {
+		switch op.Kind {
+		case "copy", "rename":
+			src, ok := working.Objects[op.Source]
+			if !ok || !ifMatchOK(op.IfMatch, src.ETag) {
+				return ErrPrecondition
+			}
+			dst := src        // shares Blob, Size, ETag, ContentType
+			dst.ModTime = now // Last-Modified is the batch commit time
+			working.Objects[op.Target] = dst
+			if op.Kind == "rename" {
+				delete(working.Objects, op.Source)
+			}
+		case "delete":
+			cur, ok := working.Objects[op.Key]
+			if op.IfMatch != "" && (!ok || !ifMatchOK(op.IfMatch, cur.ETag)) {
+				return ErrPrecondition
+			}
+			delete(working.Objects, op.Key)
+		default:
+			return ErrInvalid
+		}
+	}
+	buckets := cloneBuckets(s.snapshot.Buckets)
+	buckets[bucketName] = working
+	next := Manifest{Buckets: buckets}
+	if err := s.saveLocked(&next); err != nil {
+		return err
+	}
+	s.snapshot = next
+	return nil
+}
+
+func ifMatchOK(ifMatch, etag string) bool {
+	if ifMatch == "" || ifMatch == "*" {
+		return true
+	}
+	return normalizeETag(ifMatch) == normalizeETag(etag)
+}
+
 // Initiate starts a process-local multipart session.
 func (s *Store) Initiate(bucket, key, contentType string) (string, error) {
 	s.mu.Lock()
@@ -498,7 +566,11 @@ func (s *Store) UploadPart(bucket, key, id string, number int, body io.Reader, d
 		}
 	}()
 	digest := md5.New()
-	size, err := io.Copy(io.MultiWriter(temp, digest), body)
+	ew := &errWriter{w: temp}
+	size, err := io.Copy(io.MultiWriter(ew, digest), body)
+	if ew.err != nil {
+		return "", ew.err
+	}
 	if err != nil || (declared >= 0 && size != declared) {
 		return "", ErrIncomplete
 	}
@@ -600,6 +672,7 @@ func (s *Store) Complete(bucket, key, id string, requested []CompletionPart) (Ob
 		}
 	}()
 	digest := md5.New()
+	ew := &errWriter{w: temp}
 	var size int64
 	for _, number := range numbers {
 		part := upload.Parts[number]
@@ -607,8 +680,11 @@ func (s *Store) Complete(bucket, key, id string, requested []CompletionPart) (Ob
 		if err != nil {
 			return Object{}, err
 		}
-		written, copyErr := io.Copy(io.MultiWriter(temp, digest), file)
+		written, copyErr := io.Copy(io.MultiWriter(ew, digest), file)
 		file.Close()
+		if ew.err != nil {
+			return Object{}, ew.err
+		}
 		if copyErr != nil {
 			return Object{}, copyErr
 		}
@@ -723,6 +799,21 @@ func (s *Store) publishFaultPart(upload *Upload, requested []CompletionPart) {
 		_ = s.commitObject(upload.Bucket, upload.Key, object)
 		return
 	}
+}
+
+// errWriter records the first write error so a storage write failure is not
+// mistaken for an incomplete client body.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
 }
 
 func normalizeETag(value string) string {
