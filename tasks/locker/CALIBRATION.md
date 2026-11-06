@@ -191,3 +191,25 @@ stability on 412, rename chains, absent-key delete, copy/source independence,
 prompt clarifications: none.
 
 open questions: none.
+
+### WP3 State model
+
+commands run:
+
+```bash
+python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'
+```
+
+results: 19/19 oracle and state-model unit tests pass. New
+`tasks/locker/tests/state_model.py` and `test_state_model.py` cover range
+clipping/suffix/416 (including empty objects), conditional precedence, grouped
+pagination, multipart replacement/stale completion/abort, batch working-copy
+order and rollback, structural errors, and the live-upload bucket-delete guard.
+The model was written from `PROMPT.md` and reuses `oracles.py` for range,
+listing and conditional decisions.
+
+deviations from HARD-TASK-V4-PLAN.md: none.
+
+prompt clarifications: none.
+
+open questions: none.
