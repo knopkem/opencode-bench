@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/knopkem/opencode-bench/submissions/schema.json",
+  "title": "opencode-bench community result",
+  "description": "One completed opencode-bench run. Derived fields are revalidated and recomputed by bench.py; CI owns submitter/issue metadata and the evidence level.",
+  "type": "object",
+  "required": ["schema", "run_id", "started_at", "harness", "model", "run", "evidence"],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "opencode-bench/result@1"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^\\d{8}T\\d{6}Z-[A-Za-z0-9._:-]+-r\\d+(?:-\\d+)?$"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "harness": {
+      "type": "object",
+      "required": ["suite", "hidden_tests"],
+      "additionalProperties": true,
+      "properties": {
+        "commit": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-fA-F]{7,40}$"
+        },
+        "opencode_version": {
+          "type": ["string", "null"]
+        },
+        "suite": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hidden_tests": {
+          "type": "object",
+          "required": ["P0", "P1", "P2"],
+          "additionalProperties": false,
+          "properties": {
+            "P0": {"const": 5},
+            "P1": {"const": 9},
+            "P2": {"const": 6}
+          }
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["ref"],
+      "additionalProperties": true,
+      "properties": {
+        "ref": {"type": "string", "minLength": 1},
+        "name": {"type": ["string", "null"]},
+        "provider_type": {
+          "enum": ["local", "cloud", "unknown", null]
+        },
+        "params_b": {"type": ["number", "null"], "minimum": 0},
+        "quantization": {"type": ["string", "null"]},
+        "weights_gb": {"type": ["number", "null"], "minimum": 0},
+        "context_tokens": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "variant",
+        "thinking",
+        "wall_s",
+        "build_ok",
+        "typecheck_ok",
+        "test_ok",
+        "counts",
+        "compactions"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "variant": {"type": "string", "minLength": 1},
+        "thinking": {"enum": ["on", "off", "unknown"]},
+        "reasoning_effort": {"type": ["string", "null"]},
+        "rep": {"type": "integer", "minimum": 1},
+        "outcome": {
+          "enum": ["complete", "gave_up", "incomplete", "timeout", "stalled", "error", null]
+        },
+        "wall_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 18000},
+        "wall_ex_self_test_s": {"type": ["number", "null"], "minimum": 0},
+        "self_test_s": {"type": ["number", "null"], "minimum": 0},
+        "self_test_runs": {"type": ["integer", "null"], "minimum": 0},
+        "self_test_failures": {"type": ["integer", "null"], "minimum": 0},
+        "build_tool_s": {"type": ["number", "null"], "minimum": 0},
+        "dev_tool_s": {"type": ["number", "null"], "minimum": 0},
+        "retries": {"type": ["integer", "null"], "minimum": 0},
+        "retry_s": {"type": ["number", "null"], "minimum": 0},
+        "compactions": {"type": "integer", "minimum": 0},
+        "build_ok": {"type": "boolean"},
+        "typecheck_ok": {"type": "boolean"},
+        "test_ok": {"type": "boolean"},
+        "counts": {
+          "type": "object",
+          "required": ["P0", "P1", "P2"],
+          "additionalProperties": false,
+          "properties": {
+            "P0": {"$ref": "#/$defs/count"},
+            "P1": {"$ref": "#/$defs/count"},
+            "P2": {"$ref": "#/$defs/count"}
+          }
+        },
+        "quality": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "eligible": {"type": ["boolean", "null"]},
+        "steps": {"type": ["integer", "null"], "minimum": 0},
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cache_read_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cache_write_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "compaction_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "total_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "max_request_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "mean_request_tokens": {"type": ["number", "null"], "minimum": 0},
+        "gen_tokens_per_s": {"type": ["number", "null"], "minimum": 0},
+        "gen_tokens_per_s_median": {"type": ["number", "null"], "minimum": 0},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "hardware": {"type": ["string", "null"], "maxLength": 300},
+        "notes": {"type": ["string", "null"]}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["level"],
+      "additionalProperties": true,
+      "properties": {
+        "level": {"enum": ["self-reported", "verified"]},
+        "report_url": {
+          "type": ["string", "null"],
+          "pattern": "^https://"
+        },
+        "score_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-fA-F]{64}$"
+        },
+        "notes": {"type": ["string", "null"]}
+      }
+    },
+    "issue": {"type": "integer"},
+    "issue_url": {"type": "string"},
+    "submitter": {"type": "string"},
+    "submitted_at": {"type": "string"}
+  },
+  "$defs": {
+    "count": {
+      "type": "object",
+      "required": ["pass", "total"],
+      "additionalProperties": false,
+      "properties": {
+        "pass": {"type": "integer", "minimum": 0},
+        "total": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

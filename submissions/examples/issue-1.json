@@ -1,0 +1,72 @@
+{
+  "schema": "opencode-bench/result@1",
+  "run_id": "20261104T171135Z-local-swift-1.5-iq4_xs-default-r1",
+  "started_at": "2026-11-04T17:11:35Z",
+  "harness": {
+    "commit": "2fc7714",
+    "opencode_version": "2.2.5",
+    "suite": "spriteforge-lite",
+    "hidden_tests": {
+      "P0": 5,
+      "P1": 9,
+      "P2": 6
+    }
+  },
+  "model": {
+    "ref": "local/swift-1.5-iq4_xs",
+    "name": "Swift 1.5 Qwen3.8 27B IQ4_XS",
+    "provider_type": "local",
+    "params_b": 27.3,
+    "quantization": "IQ4_XS",
+    "weights_gb": 15.5,
+    "context_tokens": 262144
+  },
+  "run": {
+    "variant": "default",
+    "thinking": "unknown",
+    "reasoning_effort": null,
+    "rep": 1,
+    "outcome": "complete",
+    "wall_s": 1136,
+    "wall_ex_self_test_s": 1136,
+    "self_test_s": null,
+    "self_test_runs": 28,
+    "self_test_failures": null,
+    "build_tool_s": null,
+    "dev_tool_s": null,
+    "retries": 0,
+    "retry_s": 0,
+    "compactions": 0,
+    "build_ok": true,
+    "typecheck_ok": true,
+    "test_ok": true,
+    "counts": {
+      "P0": {"pass": 5, "total": 5},
+      "P1": {"pass": 9, "total": 9},
+      "P2": {"pass": 6, "total": 6}
+    },
+    "quality": 1.0,
+    "eligible": true,
+    "steps": 45,
+    "input_tokens": null,
+    "output_tokens": 80047,
+    "reasoning_tokens": 0,
+    "cache_read_tokens": null,
+    "cache_write_tokens": null,
+    "compaction_tokens": null,
+    "total_tokens": null,
+    "max_request_tokens": null,
+    "mean_request_tokens": null,
+    "gen_tokens_per_s": null,
+    "gen_tokens_per_s_median": null,
+    "cost_usd": 0,
+    "hardware": "LAN llama.cpp server; inference host hardware not captured",
+    "notes": "Clean run after a CUDA fault on the inference server. Single rep; no reasoning-effort variant defined for this model."
+  },
+  "evidence": {
+    "level": "self-reported",
+    "report_url": null,
+    "score_sha256": null,
+    "notes": "Artifacts stayed local; this issue carries the summary."
+  }
+}

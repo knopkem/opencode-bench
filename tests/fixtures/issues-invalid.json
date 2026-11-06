@@ -1,0 +1,18 @@
+[
+  {
+    "number": 2,
+    "title": "[Result] invalid",
+    "body": "```json\n{\"schema\":\"opencode-bench/result@1\",\"run_id\":\"bad\"}\n```\n",
+    "url": "https://github.com/knopkem/opencode-bench/issues/2",
+    "author": {
+      "login": "tester"
+    },
+    "createdAt": "2026-11-04T19:00:00Z",
+    "updatedAt": "2026-11-04T19:00:00Z",
+    "labels": [
+      {
+        "name": "benchmark-result"
+      }
+    ]
+  }
+]

@@ -33,6 +33,7 @@ import sqlite3
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -67,6 +68,15 @@ REASONING_ORDER = {
     "off": 0,
 }
 LEADERBOARD_PATH = ROOT / "leaderboard.html"
+SUBMISSIONS_DIR = ROOT / "submissions"
+DOCS_DIR = ROOT / "docs"
+SUBMISSION_SCHEMA = "opencode-bench/result@1"
+SUBMISSION_SCHEMA_PATH = SUBMISSIONS_DIR / "schema.json"
+SUBMISSION_TEMPLATE_PATH = SUBMISSIONS_DIR / "TEMPLATE.md"
+BENCHMARK_LABEL = "benchmark-result"
+HIDDEN_LABEL = "hidden"
+VERIFIED_LABEL = "verified"
+ATTENTION_LABEL = "needs-attention"
 LEADERBOARD_WEIGHTS = {"quality": 0.80, "wall": 0.15, "compactions": 0.05}
 # Ineligible runs stay on the leaderboard but keep only this fraction of their
 # score, so a low-quality or broken run drops below quality runs instead of
@@ -2465,6 +2475,625 @@ def compaction_count(row: dict) -> int | None:
         return None
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_iso(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _counts_quality(counts: dict) -> tuple[float | None, int | None]:
+    """Return (quality, p0_failures) for a validated counts object."""
+    weighted_total = 0
+    weighted_pass = 0
+    p0_failures = None
+    for tier, expected in EXPECTED.items():
+        item = counts.get(tier) if isinstance(counts, dict) else None
+        if not isinstance(item, dict):
+            return None, None
+        passed = item.get("pass")
+        total = item.get("total")
+        if not _is_int(passed) or not _is_int(total) or total != expected:
+            return None, None
+        if passed < 0 or passed > total:
+            return None, None
+        weighted_total += WEIGHT[tier] * expected
+        weighted_pass += WEIGHT[tier] * passed
+        if tier == "P0":
+            p0_failures = total - passed
+    quality = weighted_pass / weighted_total if weighted_total else None
+    return quality, p0_failures
+
+
+def _counts_test_ok(counts: dict) -> bool | None:
+    statuses = []
+    for tier, expected in EXPECTED.items():
+        item = counts.get(tier) if isinstance(counts, dict) else None
+        if not isinstance(item, dict):
+            return None
+        passed = item.get("pass")
+        if not _is_int(passed) or item.get("total") != expected:
+            return None
+        statuses.append(passed == expected)
+    return all(statuses)
+
+
+def validate_submission(data: object) -> list[str]:
+    """Validate a community submission without trusting its derived fields."""
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["submission must be a JSON object"]
+    if data.get("schema") != SUBMISSION_SCHEMA:
+        errors.append(f"schema must be {SUBMISSION_SCHEMA!r}")
+
+    try:
+        size = len(json.dumps(data, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return ["submission is not JSON-serializable"]
+    if size > 64 * 1024:
+        errors.append("submission is larger than 64 KiB")
+
+    run_id = data.get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(
+        r"\d{8}T\d{6}Z-[A-Za-z0-9._:-]+-r\d+(?:-\d+)?", run_id
+    ):
+        errors.append("run_id must look like 20261104T171135Z-provider-model-r1")
+
+    started_at = _parse_iso(data.get("started_at"))
+    if started_at is None:
+        errors.append("started_at must be an ISO-8601 UTC timestamp")
+
+    harness = data.get("harness")
+    if not isinstance(harness, dict):
+        errors.append("harness must be an object")
+        harness = {}
+    commit = harness.get("commit")
+    if commit is not None and (
+        not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit)
+    ):
+        errors.append("harness.commit must be a 7-40 character hex git commit")
+    suite = harness.get("suite")
+    if not isinstance(suite, str) or not suite.strip():
+        errors.append("harness.suite must be a non-empty string")
+    hidden = harness.get("hidden_tests")
+    if not isinstance(hidden, dict):
+        errors.append("harness.hidden_tests must be an object")
+    else:
+        for tier, expected in EXPECTED.items():
+            item = hidden.get(tier)
+            if not _is_int(item) or item != expected:
+                errors.append(
+                    f"harness.hidden_tests.{tier} must be {expected} for this suite"
+                )
+
+    model = data.get("model")
+    if not isinstance(model, dict):
+        errors.append("model must be an object")
+        model = {}
+    ref = model.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        errors.append("model.ref must be a non-empty provider/model string")
+    if model.get("provider_type") not in (None, "local", "cloud", "unknown"):
+        errors.append("model.provider_type must be local, cloud or unknown")
+    for key in ("params_b", "weights_gb", "context_tokens"):
+        value = model.get(key)
+        if value is not None and (not _is_number(value) or value < 0):
+            errors.append(f"model.{key} must be a non-negative number")
+
+    run = data.get("run")
+    if not isinstance(run, dict):
+        errors.append("run must be an object")
+        run = {}
+
+    wall = run.get("wall_s")
+    if not _is_number(wall) or wall <= 0 or wall > 5 * 3600:
+        errors.append("run.wall_s must be a positive number of seconds (max 5h)")
+
+    self_test_s = run.get("self_test_s")
+    if self_test_s is not None and (
+        not _is_number(self_test_s) or self_test_s < 0
+    ):
+        errors.append("run.self_test_s must be a non-negative number or null")
+    wall_ex = run.get("wall_ex_self_test_s")
+    if wall_ex is not None and (not _is_number(wall_ex) or wall_ex < 0):
+        errors.append("run.wall_ex_self_test_s must be a non-negative number or null")
+    if _is_number(wall) and _is_number(self_test_s):
+        if float(self_test_s) > float(wall):
+            errors.append("run.self_test_s cannot exceed run.wall_s")
+        if _is_number(wall_ex):
+            tolerance = max(2.0, float(wall) * 0.01)
+            if abs(float(wall) - float(self_test_s) - float(wall_ex)) > tolerance:
+                errors.append("run.wall_ex_self_test_s must equal wall_s - self_test_s")
+
+    for key in (
+        "self_test_runs",
+        "self_test_failures",
+        "retries",
+        "compactions",
+        "steps",
+        "rep",
+    ):
+        value = run.get(key)
+        if value is not None and (not _is_int(value) or value < 0):
+            errors.append(f"run.{key} must be a non-negative integer")
+
+    if _is_int(run.get("self_test_runs")) and _is_int(run.get("self_test_failures")):
+        if run["self_test_failures"] > run["self_test_runs"]:
+            errors.append("run.self_test_failures cannot exceed self_test_runs")
+    if _is_number(run.get("retry_s")) and run["retry_s"] > 0:
+        if not _is_int(run.get("retries")) or run["retries"] < 1:
+            errors.append("run.retries must be at least 1 when retry_s > 0")
+
+    build_ok = run.get("build_ok")
+    if not isinstance(build_ok, bool):
+        errors.append("run.build_ok must be boolean")
+        build_ok = False
+
+    counts = run.get("counts")
+    quality, p0_failures = _counts_quality(counts if isinstance(counts, dict) else {})
+    if quality is None or p0_failures is None:
+        errors.append("run.counts must contain P0/P1/P2 pass counts with current totals")
+    else:
+        expected_quality = quality
+        if run.get("quality") is not None:
+            value = run.get("quality")
+            if not _is_number(value) or abs(float(value) - expected_quality) > 0.001:
+                errors.append("run.quality does not match run.counts")
+        expected_eligible = (
+            build_ok and p0_failures == 0 and expected_quality >= 0.80
+        )
+        if run.get("eligible") is not None and bool(run.get("eligible")) != expected_eligible:
+            errors.append("run.eligible does not match counts/build_ok")
+        test_ok = run.get("test_ok")
+        if not isinstance(test_ok, bool):
+            errors.append("run.test_ok must be boolean")
+        elif _counts_test_ok(counts if isinstance(counts, dict) else {}) != test_ok:
+            errors.append("run.test_ok does not match run.counts")
+
+    if not isinstance(run.get("typecheck_ok"), bool):
+        errors.append("run.typecheck_ok must be boolean")
+    if run.get("thinking") not in (None, "on", "off", "unknown"):
+        errors.append("run.thinking must be on, off or unknown")
+    if run.get("outcome") not in (
+        None,
+        "complete",
+        "gave_up",
+        "incomplete",
+        "timeout",
+        "stalled",
+        "error",
+    ):
+        errors.append("run.outcome is not a known outcome")
+
+    for key in (
+        "build_tool_s",
+        "dev_tool_s",
+        "retry_s",
+        "gen_tokens_per_s",
+        "gen_tokens_per_s_median",
+        "total_tokens",
+        "max_request_tokens",
+        "mean_request_tokens",
+        "cost_usd",
+    ):
+        value = run.get(key)
+        if value is not None and (not _is_number(value) or value < 0):
+            errors.append(f"run.{key} must be a non-negative number or null")
+
+    hardware = run.get("hardware")
+    if hardware is not None and (
+        not isinstance(hardware, str) or len(hardware) > 300
+    ):
+        errors.append("run.hardware must be a string of at most 300 characters")
+
+    evidence = data.get("evidence")
+    if not isinstance(evidence, dict):
+        errors.append("evidence must be an object")
+        evidence = {}
+    if evidence.get("level") not in (None, "self-reported", "verified"):
+        errors.append("evidence.level must be self-reported or verified")
+    report_url = evidence.get("report_url")
+    if report_url not in (None, "") and (
+        not isinstance(report_url, str) or not report_url.startswith("https://")
+    ):
+        errors.append("evidence.report_url must be an https:// URL or null")
+    digest = evidence.get("score_sha256")
+    if digest not in (None, "") and (
+        not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+    ):
+        errors.append("evidence.score_sha256 must be a 64-character hex SHA-256")
+
+    return errors
+
+
+def normalize_submission(
+    data: dict,
+    *,
+    issue: dict | None = None,
+    verified: bool = False,
+) -> dict:
+    """Return a JSON copy with recomputed derived fields and issue metadata."""
+    result = json.loads(json.dumps(data))
+    run = result.setdefault("run", {})
+    counts = run.get("counts") or {}
+    quality, p0_failures = _counts_quality(counts)
+    run["quality"] = quality if quality is not None else 0.0
+    build_ok = bool(run.get("build_ok"))
+    run["eligible"] = bool(
+        build_ok and p0_failures == 0 and (quality or 0.0) >= 0.80
+    )
+    wall = float(run.get("wall_s") or 0)
+    self_test = run.get("self_test_s")
+    if run.get("wall_ex_self_test_s") is None:
+        run["wall_ex_self_test_s"] = (
+            max(0.0, wall - float(self_test)) if self_test is not None else wall
+        )
+    result.setdefault("evidence", {})["level"] = (
+        "verified" if verified else "self-reported"
+    )
+    result["source"] = "community"
+    if issue is not None:
+        result["issue"] = issue.get("number")
+        result["issue_url"] = issue.get("url") or issue.get("html_url")
+        author = issue.get("author") or {}
+        result["submitter"] = (
+            author.get("login") if isinstance(author, dict) else str(author or "")
+        )
+        result["submitted_at"] = issue.get("createdAt") or issue.get("created_at")
+    return result
+
+
+def submission_to_row(submission: dict) -> dict:
+    """Convert a normalized submission into the local leaderboard row shape."""
+    run = submission.get("run") or {}
+    model = submission.get("model") or {}
+    counts = run.get("counts") or {}
+    tier_counts = {
+        tier: counts.get(tier) or {"pass": 0, "total": EXPECTED[tier]}
+        for tier in EXPECTED
+    }
+    started = _parse_iso(submission.get("started_at"))
+    timestamp = (
+        started.strftime("%Y%m%dT%H%M%SZ") if started else str(submission.get("run_id", ""))[:16]
+    )
+    wall = float(run.get("wall_s") or 0)
+    self_test = run.get("self_test_s")
+    self_test_share = (
+        max(0.0, float(self_test) / wall) if self_test is not None and wall else None
+    )
+    major = sum(
+        tier_counts[tier]["total"] - tier_counts[tier]["pass"] for tier in ("P1",)
+    )
+    minor = sum(
+        tier_counts[tier]["total"] - tier_counts[tier]["pass"] for tier in ("P2",)
+    )
+    fatal = sum(
+        tier_counts[tier]["total"] - tier_counts[tier]["pass"] for tier in ("P0",)
+    )
+    ref = str(model.get("ref") or "")
+    return {
+        "run_id": submission.get("run_id"),
+        "timestamp": timestamp,
+        "model": ref,
+        "provider": str(model.get("provider") or provider_of(ref)),
+        "hardware": str(run.get("hardware") or ""),
+        "rep": run.get("rep", 1),
+        "goal": "",
+        "variant": run.get("variant") or "default",
+        "thinking": run.get("thinking") or "unknown",
+        "reasoning_effort": run.get("reasoning_effort") or "",
+        "build_ok": bool(run.get("build_ok")),
+        "typecheck_ok": bool(run.get("typecheck_ok")),
+        "p0_pass": tier_counts["P0"]["pass"],
+        "p0_total": tier_counts["P0"]["total"],
+        "p1_pass": tier_counts["P1"]["pass"],
+        "p1_total": tier_counts["P1"]["total"],
+        "p2_pass": tier_counts["P2"]["pass"],
+        "p2_total": tier_counts["P2"]["total"],
+        "quality": float(run.get("quality") or 0.0),
+        "major_issues": major,
+        "minor_issues": minor,
+        "fatal": fatal,
+        "eligible": bool(run.get("eligible")),
+        "wall_s": wall,
+        "wall_ex_self_test_s": run.get("wall_ex_self_test_s"),
+        "self_test_s": self_test,
+        "self_test_runs": run.get("self_test_runs"),
+        "self_test_failures": run.get("self_test_failures"),
+        "build_tool_s": run.get("build_tool_s"),
+        "dev_tool_s": run.get("dev_tool_s"),
+        "self_test_share": self_test_share,
+        "retries": run.get("retries"),
+        "retry_s": run.get("retry_s"),
+        "compactions": run.get("compactions", 0),
+        "outcome": run.get("outcome"),
+        "steps": run.get("steps"),
+        "input_tokens": run.get("input_tokens"),
+        "output_tokens": run.get("output_tokens"),
+        "reasoning_tokens": run.get("reasoning_tokens"),
+        "cache_read_tokens": run.get("cache_read_tokens"),
+        "cache_write_tokens": run.get("cache_write_tokens"),
+        "compaction_tokens": run.get("compaction_tokens"),
+        "total_tokens": run.get("total_tokens"),
+        "max_request_tokens": run.get("max_request_tokens"),
+        "mean_request_tokens": run.get("mean_request_tokens"),
+        "gen_tokens_per_s": run.get("gen_tokens_per_s"),
+        "gen_tokens_per_s_median": run.get("gen_tokens_per_s_median"),
+        "tokens_per_step": (
+            (run.get("input_tokens") or 0)
+            + (run.get("output_tokens") or 0)
+            + (run.get("reasoning_tokens") or 0)
+        )
+        / run["steps"]
+        if run.get("steps")
+        else None,
+        "cost_usd": run.get("cost_usd"),
+        "source": "community",
+        "issue": submission.get("issue"),
+        "issue_url": submission.get("issue_url"),
+        "submitter": submission.get("submitter"),
+        "submitted_at": submission.get("submitted_at"),
+        "evidence_level": (submission.get("evidence") or {}).get("level"),
+        "notes": run.get("notes") or "",
+    }
+
+
+def extract_result_block(body: object) -> tuple[dict | None, list[str]]:
+    """Extract exactly one opencode-bench result block from an issue body."""
+    if not isinstance(body, str):
+        return None, ["issue body is missing"]
+    blocks = re.findall(
+        r"```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```", body, re.IGNORECASE | re.DOTALL
+    )
+    candidates: list[dict] = []
+    parse_errors: list[str] = []
+    for text in blocks:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            if "opencode-bench/result" in text:
+                parse_errors.append(f"invalid JSON block: {exc}")
+            continue
+        if isinstance(parsed, dict) and parsed.get("schema") == SUBMISSION_SCHEMA:
+            candidates.append(parsed)
+    if len(candidates) == 1:
+        return candidates[0], []
+    if len(candidates) > 1:
+        return None, ["issue contains more than one result block"]
+    if parse_errors:
+        return None, parse_errors
+    try:
+        parsed = json.loads(body.strip())
+    except json.JSONDecodeError:
+        return None, ["issue body does not contain a fenced JSON result block"]
+    if isinstance(parsed, dict) and parsed.get("schema") == SUBMISSION_SCHEMA:
+        return parsed, []
+    return None, [f"JSON block must contain schema {SUBMISSION_SCHEMA!r}"]
+
+
+def _issue_labels(issue: dict) -> set[str]:
+    labels = issue.get("labels") or []
+    names: set[str] = set()
+    for label in labels:
+        if isinstance(label, dict):
+            name = label.get("name")
+        else:
+            name = label
+        if name:
+            names.add(str(name))
+    return names
+
+
+def _submission_block(submission: dict) -> str:
+    return "```json\n" + json.dumps(submission, indent=2) + "\n```\n"
+
+
+def submission_template() -> dict:
+    return {
+        "schema": SUBMISSION_SCHEMA,
+        "run_id": "YYYYMMDDTHHMMSSZ-provider-model-variant-r1",
+        "started_at": "YYYY-MM-DDTHH:MM:SSZ",
+        "harness": {
+            "commit": None,
+            "opencode_version": None,
+            "suite": "spriteforge-lite",
+            "hidden_tests": dict(EXPECTED),
+        },
+        "model": {
+            "ref": None,
+            "name": None,
+            "provider_type": "unknown",
+            "params_b": None,
+            "quantization": None,
+            "weights_gb": None,
+            "context_tokens": None,
+        },
+        "run": {
+            "variant": "default",
+            "thinking": "unknown",
+            "reasoning_effort": None,
+            "rep": 1,
+            "outcome": None,
+            "wall_s": None,
+            "wall_ex_self_test_s": None,
+            "self_test_s": None,
+            "self_test_runs": 0,
+            "self_test_failures": 0,
+            "build_tool_s": None,
+            "dev_tool_s": None,
+            "retries": 0,
+            "retry_s": 0,
+            "compactions": 0,
+            "build_ok": False,
+            "typecheck_ok": False,
+            "test_ok": False,
+            "counts": {
+                tier: {"pass": 0, "total": total}
+                for tier, total in EXPECTED.items()
+            },
+            "eligible": False,
+            "steps": 0,
+            "input_tokens": None,
+            "output_tokens": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "compaction_tokens": None,
+            "total_tokens": None,
+            "max_request_tokens": None,
+            "mean_request_tokens": None,
+            "gen_tokens_per_s": None,
+            "gen_tokens_per_s_median": None,
+            "cost_usd": None,
+            "hardware": None,
+            "notes": None,
+        },
+        "evidence": {
+            "level": "self-reported",
+            "report_url": None,
+            "score_sha256": None,
+            "notes": None,
+        },
+    }
+
+
+def _git_output(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def repo_slug() -> str | None:
+    url = _git_output("remote", "get-url", "origin")
+    if not url:
+        return None
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    return match.group(1) if match else None
+
+
+def _latest_score_path() -> Path | None:
+    if not RUNS_DIR.exists():
+        return None
+    candidates = [
+        path / "score.json"
+        for path in RUNS_DIR.iterdir()
+        if (path / "score.json").exists()
+    ]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def submission_from_score(meta: dict, *, hardware: str | None = None) -> dict:
+    timestamp = str(meta.get("timestamp") or "")
+    try:
+        started = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        started = _parse_iso(timestamp)
+        if started is None:
+            run_id = str(meta.get("run_id") or "")
+            try:
+                started = datetime.strptime(
+                    run_id[:15], "%Y%m%dT%H%M%S"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                started = datetime.now(timezone.utc)
+    score_path = Path(str(meta.get("_score_path") or ""))
+    digest = None
+    if score_path.is_file():
+        digest = hashlib.sha256(score_path.read_bytes()).hexdigest()
+    run = {
+        "variant": meta.get("variant") or "default",
+        "thinking": meta.get("thinking") or "unknown",
+        "reasoning_effort": meta.get("reasoning_effort"),
+        "rep": meta.get("rep", 1),
+        "outcome": meta.get("outcome"),
+        "wall_s": meta.get("wall_s"),
+        "wall_ex_self_test_s": meta.get("wall_ex_self_test_s"),
+        "self_test_s": meta.get("self_test_s"),
+        "self_test_runs": meta.get("self_test_runs"),
+        "self_test_failures": meta.get("self_test_failures"),
+        "build_tool_s": meta.get("build_tool_s"),
+        "dev_tool_s": meta.get("dev_tool_s"),
+        "retries": meta.get("retries"),
+        "retry_s": meta.get("retry_s"),
+        "compactions": meta.get("compactions", 0),
+        "build_ok": bool(meta.get("build_ok")),
+        "typecheck_ok": bool(meta.get("typecheck_ok")),
+        "test_ok": bool(meta.get("test_ok")),
+        "counts": meta.get("counts") or {},
+        "quality": meta.get("quality"),
+        "eligible": meta.get("eligible"),
+        "steps": meta.get("steps"),
+        "input_tokens": meta.get("input_tokens"),
+        "output_tokens": meta.get("output_tokens"),
+        "reasoning_tokens": meta.get("reasoning_tokens"),
+        "cache_read_tokens": meta.get("cache_read_tokens"),
+        "cache_write_tokens": meta.get("cache_write_tokens"),
+        "compaction_tokens": meta.get("compaction_tokens"),
+        "total_tokens": meta.get("total_tokens"),
+        "max_request_tokens": meta.get("max_request_tokens"),
+        "mean_request_tokens": meta.get("mean_request_tokens"),
+        "gen_tokens_per_s": meta.get("gen_tokens_per_s"),
+        "gen_tokens_per_s_median": meta.get("gen_tokens_per_s_median"),
+        "cost_usd": meta.get("cost_usd"),
+        "hardware": (hardware if hardware is not None else meta.get("hardware")) or None,
+        "notes": None,
+    }
+    return {
+        "schema": SUBMISSION_SCHEMA,
+        "run_id": meta.get("run_id"),
+        "started_at": started.isoformat().replace("+00:00", "Z"),
+        "harness": {
+            "commit": _git_output("rev-parse", "--short=12", "HEAD"),
+            "opencode_version": os.environ.get("OPENCODE_BENCH_OPENCODE_VERSION"),
+            "suite": "spriteforge-lite",
+            "hidden_tests": dict(EXPECTED),
+        },
+        "model": {
+            "ref": meta.get("model"),
+            "name": meta.get("model"),
+            "provider_type": "unknown",
+            "params_b": None,
+            "quantization": None,
+            "weights_gb": None,
+            "context_tokens": None,
+        },
+        "run": run,
+        "evidence": {
+            "level": "self-reported",
+            "report_url": None,
+            "score_sha256": digest,
+            "notes": None,
+        },
+    }
+
+
 def leaderboard_entries(rows: list[dict]) -> list[dict]:
     weights = LEADERBOARD_WEIGHTS
     parsed: list[dict] = []
@@ -2771,8 +3400,14 @@ def write_leaderboard() -> Path:
         return _write_leaderboard_unlocked()
 
 
-def _write_leaderboard_unlocked() -> Path:
-    rows = _valid_result_rows(_read_result_rows_unlocked())
+def render_leaderboard(
+    rows: list[dict],
+    output_path: Path = LEADERBOARD_PATH,
+    *,
+    public: bool = False,
+    title: str = "opencode-bench leaderboard",
+    subtitle: str = "Build-and-play benchmark",
+) -> Path:
     entries = leaderboard_entries(rows)
     escaped = html.escape
 
@@ -2860,11 +3495,32 @@ def _write_leaderboard_unlocked() -> Path:
         hardware_line = (
             f'<div class="hardware">{hardware}</div>' if hardware else ""
         )
+        evidence = str(row.get("evidence_level") or "self-reported")
+        issue_url = str(row.get("issue_url") or "")
+        issue_number = row.get("issue")
+        submitter = str(row.get("submitter") or "")
+        source_cell = ""
+        if public:
+            evidence_class = "verified" if evidence == "verified" else "reported"
+            evidence_label = (
+                "maintainer-checked" if evidence == "verified" else "self-reported"
+            )
+            issue_link = (
+                f'<a href="{escaped(issue_url)}" rel="noreferrer">#{escaped(str(issue_number))}</a>'
+                if issue_url and issue_number is not None
+                else '<span class="muted">—</span>'
+            )
+            source_cell = (
+                f'<td class="source">{issue_link}'
+                f'<div><span class="evidence {evidence_class}">{evidence_label}</span></div>'
+                + (f'<div class="submitter">{escaped(submitter)}</div>' if submitter else "")
+                + "</td>"
+            )
         self_test_s = entry.get("self_test_s")
         self_test_runs = int(entry.get("self_test_runs") or 0)
         retries = int(entry.get("retries") or 0)
         wall_sub_parts = [f"work {format_duration(entry['wall_work'])}"]
-        if self_test_s is not None:
+        if self_test_s is not None or self_test_runs:
             wall_sub_parts.append(
                 f"test {format_optional_duration(self_test_s)} · {self_test_runs} runs"
             )
@@ -2898,6 +3554,8 @@ def _write_leaderboard_unlocked() -> Path:
                     thinking_label(row),
                     started,
                     str(row.get("run_id", "")),
+                    str(row.get("submitter", "")),
+                    str(row.get("evidence_level", "")),
                 ]
             ).lower()
         )
@@ -2962,6 +3620,7 @@ def _write_leaderboard_unlocked() -> Path:
             f'<td><div class="score"{score_note}><span class="bar" style="width:{max(0.0, min(100.0, entry["score"])):.1f}%"></span>'
             f'<b>{entry["score"]:.1f}</b></div></td>'
             f'<td class="model"><div>{model}</div>{hardware_line}<div class="runid">{run_id}</div></td>'
+            f"{source_cell}"
             f'<td class="started" title="{escaped(started_full)}">{started}</td>'
             f'<td>{variant}</td>'
             f'<td>{thinking}</td>'
@@ -2975,8 +3634,17 @@ def _write_leaderboard_unlocked() -> Path:
             f"</tr>"
         )
 
+    source_header = "<th>Source</th>" if public else ""
     if not entries:
-        table = '<p class="empty">No runs yet. Start with <code>./bench.py run --model ...</code>.</p>'
+        table = (
+            '<p class="empty">No runs yet. '
+            + (
+                'Submit one with <code>./bench.py submit --run RUN_ID --gh</code>.'
+                if public
+                else 'Start with <code>./bench.py run --model ...</code>.'
+            )
+            + "</p>"
+        )
     else:
         table = (
             '<div class="table-wrap"><table>'
@@ -2984,6 +3652,7 @@ def _write_leaderboard_unlocked() -> Path:
             "<th>#</th>"
             '<th data-sort="score" data-type="number" data-default-dir="desc">Score</th>'
             '<th data-sort="model" data-type="text" data-default-dir="asc">Model / run</th>'
+            f"{source_header}"
             '<th data-sort="started" data-type="number" data-default-dir="desc">Started (UTC)</th>'
             '<th data-sort="variant" data-type="text" data-default-dir="asc">Variant</th>'
             '<th data-sort="thinking" data-type="number" data-default-dir="desc">Thinking</th>'
@@ -3060,6 +3729,14 @@ tbody tr:nth-child(3) .rank { color:#b07d4f; }
 .wall-sub { color:var(--muted); font-size:11px; margin-top:2px; white-space:nowrap; }
 .hardware { color:var(--muted); font-size:11px; margin-top:2px; max-width:360px;
             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.source { white-space:nowrap; }
+.source a { color:var(--accent); text-decoration:none; }
+.source a:hover { text-decoration:underline; }
+.evidence { display:inline-block; margin-top:3px; padding:1px 7px; border-radius:999px;
+            font-size:10px; text-transform:uppercase; letter-spacing:.05em; }
+.evidence.reported { background:rgba(240,180,41,.15); color:var(--warn); }
+.evidence.verified { background:rgba(62,207,142,.15); color:var(--good); }
+.submitter { color:var(--muted); font-size:11px; margin-top:2px; }
 .retry-badge { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:999px;
                background:rgba(240,180,41,.15); color:var(--warn); font-size:10px; }
 .quality { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:700;
@@ -3142,19 +3819,34 @@ footer { color:var(--muted); margin-top:18px; font-size:13px; }
 code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
 @media (max-width:700px) { body { padding:18px; } h1 { font-size:22px; } }
 """
+    footer_text = (
+        'Community results are self-reported unless marked '
+        '<span class="evidence verified">maintainer-checked</span>. Wall time is '
+        'hardware-dependent; compare only similar setups. tok/s excludes failed '
+        'or retried attempts. Generated from labeled GitHub issues by '
+        '<code>./bench.py site</code>. '
+        '<a href="https://github.com/knopkem/opencode-bench/blob/main/submissions/TEMPLATE.md">'
+        'Submission template</a>.'
+        if public
+        else 'Generated by <code>./bench.py leaderboard</code>. That command '
+        'serves the page and opens it in the browser; use <code>--write</code> '
+        'to write the file only. Raw data: <code>results.csv</code>. '
+        'Effort/token fields can be rebuilt from existing run artifacts with '
+        '<code>./bench.py backfill --all</code>.'
+    )
     text = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>opencode-bench leaderboard</title>
+<title>{escaped(title)}</title>
 <style>{css}</style>
 </head>
 <body>
 <header>
   <div>
-    <h1>opencode-bench leaderboard</h1>
-    <p class="sub">Build-and-play benchmark · updated {escaped(updated)}</p>
+    <h1>{escaped(title)}</h1>
+    <p class="sub">{escaped(subtitle)} · updated {escaped(updated)}</p>
   </div>
   <div class="cards">{cards_html}</div>
 </header>
@@ -3209,10 +3901,7 @@ code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padd
 </dialog>
 <div id="hover-tip" class="hover-tip" hidden></div>
 <footer>
-  Generated by <code>./bench.py leaderboard</code>. That command serves the page
-  and opens it in the browser; use <code>--write</code> to write the file only.
-  Raw data: <code>results.csv</code>. Effort/token fields can be rebuilt from
-  existing run artifacts with <code>./bench.py backfill --all</code>.
+  {footer_text}
 </footer>
 <script>
 const search = document.getElementById('filter');
@@ -3573,8 +4262,13 @@ if (new URLSearchParams(location.search).get('live') === '1') {{
 </body>
 </html>
 """
-    atomic_write_text(LEADERBOARD_PATH, text)
-    return LEADERBOARD_PATH
+    atomic_write_text(output_path, text)
+    return output_path
+
+
+def _write_leaderboard_unlocked() -> Path:
+    rows = _valid_result_rows(_read_result_rows_unlocked())
+    return render_leaderboard(rows, LEADERBOARD_PATH)
 
 
 class LeaderboardHandler(BaseHTTPRequestHandler):
@@ -3619,6 +4313,246 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
         print("")
     finally:
         server.server_close()
+    return 0
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    if args.template:
+        print(_submission_block(submission_template()).rstrip())
+        return 0
+
+    if args.check:
+        if args.check == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                text = Path(args.check).read_text(encoding="utf-8")
+            except OSError as exc:
+                eprint(f"error: cannot read {args.check}: {exc}")
+                return 1
+        data, errors = extract_result_block(text)
+        if data is not None:
+            errors = validate_submission(data)
+        if errors:
+            for error in errors:
+                eprint(f"error: {error}")
+            return 2
+        print("ok")
+        return 0
+
+    if args.run:
+        run_path = Path(args.run)
+        score_path = (
+            run_path / "score.json"
+            if run_path.is_dir()
+            else RUNS_DIR / args.run / "score.json"
+        )
+    else:
+        score_path = _latest_score_path()
+    if score_path is None or not score_path.is_file():
+        eprint("error: no score.json found; pass --run RUN_ID")
+        return 1
+    try:
+        meta = json.loads(score_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        eprint(f"error: cannot read {score_path}: {exc}")
+        return 1
+    meta["_score_path"] = str(score_path)
+    data = submission_from_score(meta, hardware=args.hardware)
+    errors = validate_submission(data)
+    if errors:
+        for error in errors:
+            eprint(f"error: {error}")
+        return 2
+    normalized = normalize_submission(data)
+    block = _submission_block(normalized)
+    if not args.gh:
+        print(block, end="")
+        return 0
+
+    repo = args.repo or repo_slug()
+    if not repo:
+        eprint("error: cannot infer GitHub repository; pass --repo OWNER/REPO")
+        return 1
+    model = str((normalized.get("model") or {}).get("ref") or "")
+    run = normalized.get("run") or {}
+    title = (
+        f"[Result] {model} — {float(run.get('quality') or 0):.2f} — "
+        f"{format_duration(run.get('wall_s') or 0)}"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            body_path = Path(temp) / "issue.md"
+            body_path.write_text(block, encoding="utf-8")
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "create",
+                    "--repo",
+                    repo,
+                    "--title",
+                    title,
+                    "--body-file",
+                    str(body_path),
+                    "--label",
+                    BENCHMARK_LABEL,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+    except OSError as exc:
+        eprint(f"error: gh is not available: {exc}")
+        return 1
+    if result.returncode != 0:
+        eprint(result.stderr.strip() or "error: gh issue create failed")
+        return result.returncode
+    print(result.stdout.strip())
+    return 0
+
+
+def cmd_site(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(Path(args.issues).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        eprint(f"error: cannot read {args.issues}: {exc}")
+        return 1
+    if isinstance(payload, dict) and isinstance(payload.get("issues"), list):
+        issues = payload["issues"]
+    elif isinstance(payload, list):
+        issues = []
+        for item in payload:
+            if isinstance(item, list):
+                issues.extend(item)
+            else:
+                issues.append(item)
+    else:
+        eprint("error: issues JSON must be an array")
+        return 1
+
+    errors: list[dict] = []
+    chosen: dict[str, tuple[dict, dict]] = {}
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        labels = _issue_labels(issue)
+        if HIDDEN_LABEL in labels and not args.include_hidden:
+            continue
+        body = issue.get("body")
+        data, block_errors = extract_result_block(body)
+        if data is None:
+            errors.append(
+                {
+                    "issue": issue.get("number"),
+                    "url": issue.get("url"),
+                    "errors": block_errors,
+                }
+            )
+            continue
+        submit_errors = validate_submission(data)
+        if submit_errors:
+            errors.append(
+                {
+                    "issue": issue.get("number"),
+                    "url": issue.get("url"),
+                    "errors": submit_errors,
+                }
+            )
+            continue
+        submission = normalize_submission(
+            data,
+            issue=issue,
+            verified=VERIFIED_LABEL in labels,
+        )
+        row = submission_to_row(submission)
+        run_id = str(row.get("run_id") or "")
+        previous = chosen.get(run_id)
+        if previous is None:
+            chosen[run_id] = (submission, row)
+            continue
+        old_sub = previous[0]
+        old_verified = (old_sub.get("evidence") or {}).get("level") == "verified"
+        new_verified = (submission.get("evidence") or {}).get("level") == "verified"
+        old_key = (
+            old_verified,
+            str(old_sub.get("submitted_at") or ""),
+            int(old_sub.get("issue") or 0),
+        )
+        new_key = (
+            new_verified,
+            str(submission.get("submitted_at") or ""),
+            int(submission.get("issue") or 0),
+        )
+        if new_key > old_key:
+            chosen[run_id] = (submission, row)
+
+    submissions = [item[0] for item in chosen.values()]
+    rows = [item[1] for item in chosen.values()]
+    submissions.sort(key=lambda item: (str(item.get("started_at") or ""), str(item.get("run_id") or "")))
+    output_dir = Path(args.output or DOCS_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    page = render_leaderboard(
+        rows,
+        output_dir / "index.html",
+        public=True,
+        title="opencode-bench community leaderboard",
+        subtitle="Community submissions · self-reported unless verified",
+    )
+    data_dir = output_dir / "data"
+    data_dir.mkdir(exist_ok=True)
+    atomic_write_text(
+        data_dir / "results.json",
+        json.dumps(submissions, indent=2) + "\n",
+    )
+    (output_dir / ".nojekyll").write_text("", encoding="utf-8")
+    if args.errors:
+        errors_path = Path(args.errors)
+        errors_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            errors_path,
+            json.dumps(errors, indent=2) + "\n",
+        )
+    print(
+        f"site {page} ({len(rows)} submission(s), {len(errors)} error(s))"
+    )
+    for error in errors:
+        eprint(f"issue #{error.get('issue')}: {'; '.join(error.get('errors') or [])}")
+    return 0
+
+
+def cmd_moderate(args: argparse.Namespace) -> int:
+    if bool(args.hide) == bool(args.show):
+        eprint("error: pass exactly one of --hide or --show")
+        return 2
+    repo = args.repo or repo_slug()
+    if not repo:
+        eprint("error: cannot infer GitHub repository; pass --repo OWNER/REPO")
+        return 1
+    flag = "--add-label" if args.hide else "--remove-label"
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(args.issue),
+                "--repo",
+                repo,
+                flag,
+                HIDDEN_LABEL,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        eprint(f"error: gh is not available: {exc}")
+        return 1
+    if result.returncode != 0:
+        eprint(result.stderr.strip() or "error: gh issue edit failed")
+        return result.returncode
+    print(result.stdout.strip() or f"issue #{args.issue} {HIDDEN_LABEL}={args.hide}")
     return 0
 
 
@@ -3857,6 +4791,52 @@ def make_parser() -> argparse.ArgumentParser:
     )
     leaderboard.add_argument("--port", type=int, default=4174)
     leaderboard.set_defaults(func=cmd_leaderboard)
+
+    submit = sub.add_parser(
+        "submit", help="turn a run into a community leaderboard issue"
+    )
+    submit.add_argument("--run", default=None, help="run directory name or path")
+    submit.add_argument(
+        "--hardware", default=None, help="optional free-text hardware note"
+    )
+    submit.add_argument(
+        "--print", action="store_true", help="print the JSON block (default)"
+    )
+    submit.add_argument(
+        "--gh", action="store_true", help="create the labeled GitHub issue"
+    )
+    submit.add_argument("--repo", default=None, help="GitHub OWNER/REPO")
+    submit.add_argument(
+        "--check", default=None, metavar="FILE", help="validate an issue body or block"
+    )
+    submit.add_argument(
+        "--template", action="store_true", help="print the JSON skeleton"
+    )
+    submit.set_defaults(func=cmd_submit)
+
+    site = sub.add_parser(
+        "site", help="build the public leaderboard from GitHub issue JSON"
+    )
+    site.add_argument("--issues", required=True, help="path to gh issue list JSON")
+    site.add_argument(
+        "--output", default=str(DOCS_DIR), help="output directory (default: docs)"
+    )
+    site.add_argument(
+        "--errors", default=None, help="write validation errors as JSON"
+    )
+    site.add_argument(
+        "--include-hidden", action="store_true", help="debug: include hidden issues"
+    )
+    site.set_defaults(func=cmd_site)
+
+    moderate = sub.add_parser(
+        "moderate", help="hide or restore a community result issue"
+    )
+    moderate.add_argument("--issue", type=int, required=True)
+    moderate.add_argument("--hide", action="store_true")
+    moderate.add_argument("--show", action="store_true")
+    moderate.add_argument("--repo", default=None, help="GitHub OWNER/REPO")
+    moderate.set_defaults(func=cmd_moderate)
 
     status = sub.add_parser("status", help="show the latest run and live engine status")
     status.add_argument("--config", default=None, help="OpenCode config file or directory")
