@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import sys
 import threading
@@ -207,6 +208,91 @@ def raw_put_payload(bucket: str, key: str, body: bytes, content_type: str) -> by
         headers={"Content-Type": content_type},
         body=body,
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch helpers
+
+
+BatchOp = tuple
+
+
+def batch_xml(ops: list[BatchOp]) -> bytes:
+    parts = ["<Batch>"]
+    for op in ops:
+        kind = op[0]
+        if kind in ("copy", "rename"):
+            _, src, dst, if_match = op
+            tag = "Copy" if kind == "copy" else "Rename"
+            parts.append(f"<{tag}><Source>{xml.sax.saxutils.escape(src)}</Source><Target>{xml.sax.saxutils.escape(dst)}</Target>")
+        else:
+            _, key, if_match = op
+            tag = "Delete"
+            parts.append(f"<Delete><Key>{xml.sax.saxutils.escape(key)}</Key>")
+        if if_match is not None:
+            parts.append(f"<IfMatch>{xml.sax.saxutils.escape(if_match)}</IfMatch>")
+        parts.append(f"</{tag}>")
+    parts.append("</Batch>")
+    return "".join(parts).encode("utf-8")
+
+
+def batch(port: int, bucket: str, ops: list[BatchOp], *, timeout: float = 60.0) -> Response:
+    return h.request(
+        port,
+        "POST",
+        h.bucket_path(bucket) + "?batch",
+        body=batch_xml(ops),
+        headers={"Content-Type": "application/xml"},
+        timeout=timeout,
+    )
+
+
+def raw_batch(port: int, path: str, body: bytes, *, timeout: float = 60.0) -> Response:
+    return h.request(
+        port,
+        "POST",
+        path,
+        body=body,
+        headers={"Content-Type": "application/xml"},
+        timeout=timeout,
+    )
+
+
+def expect_error(response: Response, status: int, code: str, label: str) -> None:
+    expect(response, status, label)
+    root = h.parse_xml(response.body)
+    check(
+        root.tag == "Error" and h.text(root, "Code") == code,
+        f"{label}: expected <Error><Code>{code}</Code>, got {response.body[:200]!r}",
+    )
+
+
+def bucket_snapshot(port: int, bucket: str) -> dict[str, tuple[bytes, str, str]]:
+    """key -> (body, etag, content-type) for every listed key."""
+    contents, _prefixes = h.collect_listing(port, bucket)
+    out = {}
+    for key, size, etag in contents:
+        response = expect(h.get_object(port, bucket, key), 200, f"snapshot GET {key}")
+        check(
+            len(response.body) == size and response.header("etag") == etag,
+            f"snapshot listing/GET disagree for {key}",
+        )
+        out[key] = (response.body, etag, response.header("content-type"))
+    return out
+
+
+def expect_absent(port: int, bucket: str, *keys: str, label: str) -> None:
+    for key in keys:
+        expect(h.get_object(port, bucket, key), 404, f"{label}: {key} should be absent")
+
+
+def expect_present(port: int, bucket: str, key: str, body: bytes, etag: str, content_type: str, label: str) -> Response:
+    response = expect(h.get_object(port, bucket, key), 200, label)
+    check(response.body == body, f"{label}: body mismatch")
+    check(response.header("etag") == etag, f"{label}: ETag mismatch")
+    check(response.header("content-length") == str(len(body)), f"{label}: Content-Length mismatch")
+    check(response.header("content-type") == content_type, f"{label}: Content-Type mismatch")
+    return response
 
 
 def check_version(
@@ -1819,6 +1905,799 @@ def p2_perf_family(server: h.Server, limits: Limits) -> dict[str, tuple[bool, st
 
 
 # ---------------------------------------------------------------------------
+# WP4: p1.batch / p2.batch
+
+
+def p1_batch_copy_rename_delete(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "batch")
+    alpha = b"alpha"
+    xray = b"xray"
+    etag = h.md5_etag(alpha)
+    expect(h.put_object(port, "batch", "a", alpha, "text/plain"), 200, "put a")
+    expect(h.put_object(port, "batch", "x", xray, "application/json"), 200, "put x")
+    lm_a = h.parse_http_date(expect(h.head_object(port, "batch", "a"), 200, "head a").header("last-modified"))
+    lm_x = h.parse_http_date(expect(h.head_object(port, "batch", "x"), 200, "head x").header("last-modified"))
+
+    response = batch(
+        port,
+        "batch",
+        [
+            ("copy", "a", "b", None),
+            ("rename", "b", "c", None),
+            ("delete", "a", None),
+            ("copy", "c", "x", None),
+        ],
+    )
+    expect(response, 200, "batch chain")
+    check(len(response.body) == 0, f"batch success body should be empty, got {response.body[:100]!r}")
+    expect_absent(port, "batch", "a", "b", label="after chain")
+
+    c = expect_present(port, "batch", "c", alpha, etag, "text/plain", "get c")
+    expect_present(port, "batch", "x", alpha, etag, "text/plain", "get x")
+    check(c.header("accept-ranges") == "bytes", "copy lost Accept-Ranges")
+    check(
+        h.parse_http_date(c.header("last-modified")) >= lm_a,
+        "copy Last-Modified is older than its source's previous modification",
+    )
+    check(
+        h.parse_http_date(expect(h.head_object(port, "batch", "x"), 200, "head x").header("last-modified")) >= lm_x,
+        "copy-over Last-Modified went backwards",
+    )
+
+    contents, prefixes = h.collect_listing(port, "batch")
+    check(prefixes == [], f"unexpected common prefixes {prefixes}")
+    check(contents == [("c", 5, etag), ("x", 5, etag)], f"listing after chain: {contents}")
+
+    expect(batch(port, "batch", [("delete", "c", None), ("delete", "never-existed", None)]), 200, "delete batch")
+    contents, _prefixes = h.collect_listing(port, "batch")
+    check(contents == [("x", 5, etag)], f"listing after delete batch: {contents}")
+
+
+def p1_batch_preconditions(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "pre")
+    a1, b1 = b"A1", b"B1"
+    expect(h.put_object(port, "pre", "a", a1, "text/plain"), 200, "put a")
+    expect(h.put_object(port, "pre", "b", b1, "text/plain"), 200, "put b")
+    ea = h.md5_etag(a1)
+    eb = h.md5_etag(b1)
+    wrong = h.md5_etag(b"not-this")
+
+    expect(batch(port, "pre", [("copy", "a", "c", ea)]), 200, "copy with matching IfMatch")
+    expect_present(port, "pre", "c", a1, ea, "text/plain", "copy c")
+
+    before = bucket_snapshot(port, "pre")
+    expect_error(
+        batch(port, "pre", [("copy", "a", "d", eb)]),
+        412,
+        "PreconditionFailed",
+        "mismatched copy IfMatch",
+    )
+    expect_absent(port, "pre", "d", label="after mismatched IfMatch")
+    check(bucket_snapshot(port, "pre") == before, "mismatched IfMatch changed the bucket")
+
+    expect(
+        batch(port, "pre", [("copy", "a", "d", None), ("delete", "b", "*")]),
+        200,
+        "copy and wildcard delete",
+    )
+    expect_present(port, "pre", "d", a1, ea, "text/plain", "copy d")
+    expect_absent(port, "pre", "b", label="wildcard delete")
+
+    before = bucket_snapshot(port, "pre")
+    expect_error(
+        batch(port, "pre", [("copy", "missing", "e", None)]),
+        412,
+        "PreconditionFailed",
+        "absent copy source",
+    )
+    expect_absent(port, "pre", "e", label="after absent source")
+    check(bucket_snapshot(port, "pre") == before, "absent source changed the bucket")
+
+    before = bucket_snapshot(port, "pre")
+    expect_error(
+        batch(
+            port,
+            "pre",
+            [
+                ("rename", "a", "f", None),
+                ("copy", "c", "g", None),
+                ("delete", "c", wrong),
+            ],
+        ),
+        412,
+        "PreconditionFailed",
+        "failure in last operation",
+    )
+    expect_present(port, "pre", "a", a1, ea, "text/plain", "a after late failure")
+    expect_absent(port, "pre", "f", "g", label="after late failure")
+    check(bucket_snapshot(port, "pre") == before, "late failure applied partial effects")
+
+    expect(
+        batch(port, "pre", [("copy", "a", "h", None), ("delete", "h", ea)]),
+        200,
+        "working-copy delete",
+    )
+    expect_absent(port, "pre", "h", label="working-copy delete")
+    expect_present(port, "pre", "a", a1, ea, "text/plain", "a after working-copy delete")
+    expect_error(
+        batch(port, "pre", [("copy", "a", "h", None), ("delete", "h", wrong)]),
+        412,
+        "PreconditionFailed",
+        "working-copy stale delete",
+    )
+    expect_absent(port, "pre", "h", label="after stale working-copy delete")
+
+    expect_error(
+        batch(port, "pre", [("delete", "nothing", "*")]),
+        412,
+        "PreconditionFailed",
+        "wildcard delete of absent key",
+    )
+    expect(batch(port, "pre", [("delete", "nothing", None)]), 200, "delete absent without IfMatch")
+
+    expect(batch(port, "pre", [("rename", "a", "a2", "*")]), 200, "rename wildcard")
+    expect_absent(port, "pre", "a", label="after rename wildcard")
+    expect_present(port, "pre", "a2", a1, ea, "text/plain", "a2")
+
+
+def p1_batch_errors(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "err")
+    value = b"A"
+    expect(h.put_object(port, "err", "a", value, "text/plain"), 200, "put a")
+    before = bucket_snapshot(port, "err")
+
+    invalid = [
+        b"<Batch><Copy>",
+        b"<Batch></Batch>",
+        b"<Ops><Delete><Key>a</Key></Delete></Ops>",
+        batch_xml([("delete", f"k{i}", None) for i in range(33)]),
+        b"<Batch><Move><Source>a</Source><Target>b</Target></Move></Batch>",
+        b"<Batch><Copy><Source>a</Source></Copy></Batch>",
+        b"<Batch><Rename><Source></Source><Target>b</Target></Rename></Batch>",
+        b"<Batch><Delete></Delete></Batch>",
+        b"<Batch><Copy><Source>a</Source><Target>a</Target></Copy></Batch>",
+        b"<Batch><Delete><Key>a</Key><IfMatch></IfMatch></Delete></Batch>",
+    ]
+    for index, body in enumerate(invalid):
+        expect_error(raw_batch(port, "/err?batch", body), 400, "InvalidArgument", f"invalid batch {index}")
+        check(bucket_snapshot(port, "err") == before, f"invalid batch {index} changed the bucket")
+
+    good = batch_xml([("delete", "zz", None)])
+    expect_error(
+        raw_batch(port, h.object_path("err", "a") + "?batch", good),
+        400,
+        "InvalidArgument",
+        "batch on an object path",
+    )
+    expect_error(
+        raw_batch(port, "/err?batch&list-type=2", good),
+        400,
+        "InvalidArgument",
+        "batch with listing parameter",
+    )
+    expect_error(
+        raw_batch(port, "/err?batch&uploads", good),
+        400,
+        "InvalidArgument",
+        "batch with multipart parameter",
+    )
+    expect_error(
+        raw_batch(port, "/nobucket-batch-errors?batch", good),
+        404,
+        "NoSuchBucket",
+        "batch on absent bucket",
+    )
+
+    expect(batch(port, "err", [("delete", f"k{i}", None) for i in range(32)]), 200, "32-op boundary")
+    expect_present(port, "err", "a", value, h.md5_etag(value), "text/plain", "a after error cases")
+
+
+def p1_batch_independence(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "ind")
+
+    expect(h.put_object(port, "ind", "a", b"orig", "text/plain"), 200, "put a")
+    expect(batch(port, "ind", [("copy", "a", "b", None)]), 200, "copy a to b")
+    expect(h.put_object(port, "ind", "a", b"new-a", "text/csv"), 200, "overwrite a")
+    expect_present(port, "ind", "b", b"orig", h.md5_etag(b"orig"), "text/plain", "b after a overwrite")
+    expect(h.request(port, "DELETE", h.object_path("ind", "a")), 204, "delete a")
+    expect_present(port, "ind", "b", b"orig", h.md5_etag(b"orig"), "text/plain", "b after a delete")
+
+    big = h.DeterministicBody(65536, seed=5)
+    big_bytes = b"".join(big.chunks())
+    expect(h.put_object(port, "ind", "c", big_bytes, "application/octet-stream"), 200, "put c")
+    expect(batch(port, "ind", [("copy", "c", "d", None)]), 200, "copy c to d")
+    expect(h.request(port, "DELETE", h.object_path("ind", "c")), 204, "delete c")
+    expect_present(port, "ind", "d", big_bytes, h.md5_etag(big_bytes), "application/octet-stream", "d after c delete")
+    ranged = expect(
+        h.get_object(port, "ind", "d", {"Range": "bytes=100-199"}),
+        206,
+        "range on copy",
+    )
+    check(ranged.body == big_bytes[100:200], "range on copy returned the wrong bytes")
+    check(ranged.header("content-range") == "bytes 100-199/65536", "range on copy header mismatch")
+
+    expect(h.put_object(port, "ind", "r0", b"chain", "text/plain"), 200, "put r0")
+    expect(
+        batch(
+            port,
+            "ind",
+            [("rename", "r0", "r1", None), ("rename", "r1", "r2", None), ("rename", "r2", "r3", None)],
+        ),
+        200,
+        "rename chain",
+    )
+    expect_present(port, "ind", "r3", b"chain", h.md5_etag(b"chain"), "text/plain", "r3")
+    expect_absent(port, "ind", "r0", "r1", "r2", label="after rename chain")
+
+    expect(h.put_object(port, "ind", "e", b"", "text/plain"), 200, "put empty")
+    expect(batch(port, "ind", [("copy", "e", "e2", None)]), 200, "copy empty")
+    empty = expect(h.get_object(port, "ind", "e2"), 200, "get empty copy")
+    check(empty.body == b"", "empty copy body mismatch")
+    check(empty.header("content-length") == "0", "empty copy length mismatch")
+    check(empty.header("etag") == h.md5_etag(b""), "empty copy ETag mismatch")
+
+    p1 = b"p" * (5 * 1024)
+    p2 = b"q" * (3 * 1024)
+    uid = initiate(port, "ind", "m", "application/x-parts")
+    e1 = upload_part(port, "ind", "m", uid, 1, p1)
+    e2 = upload_part(port, "ind", "m", uid, 2, p2)
+    expect(complete_upload(port, "ind", "m", uid, [(1, e1), (2, e2)]), 200, "complete m")
+    expect(batch(port, "ind", [("copy", "m", "m2", None)]), 200, "copy multipart object")
+    expect_present(port, "ind", "m2", p1 + p2, h.md5_etag(p1 + p2), "application/x-parts", "m2")
+
+    expect(
+        batch(port, "ind", [("copy", "d", "d1", None), ("copy", "d", "d2", None), ("copy", "d", "d3", None)]),
+        200,
+        "fan-out copies",
+    )
+    expect(h.request(port, "DELETE", h.object_path("ind", "d")), 204, "delete d")
+    expect(h.request(port, "DELETE", h.object_path("ind", "d1")), 204, "delete d1")
+    expect(batch(port, "ind", [("delete", "d2", None)]), 200, "delete d2 by batch")
+    expect_present(port, "ind", "d3", big_bytes, h.md5_etag(big_bytes), "application/octet-stream", "d3 after fan-out")
+
+    server.restart()
+    port = server.port
+    assert port is not None
+    expect_present(port, "ind", "b", b"orig", h.md5_etag(b"orig"), "text/plain", "b after restart")
+    expect_present(port, "ind", "d3", big_bytes, h.md5_etag(big_bytes), "application/octet-stream", "d3 after restart")
+    expect_present(port, "ind", "r3", b"chain", h.md5_etag(b"chain"), "text/plain", "r3 after restart")
+    expect_present(port, "ind", "e2", b"", h.md5_etag(b""), "text/plain", "e2 after restart")
+    expect_present(port, "ind", "m2", p1 + p2, h.md5_etag(p1 + p2), "application/x-parts", "m2 after restart")
+    expect_absent(port, "ind", "a", "c", "d", "d1", "d2", "r0", label="after restart")
+
+
+def p1_batch_cross_feature(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "xf")
+    body = h.DeterministicBody(1000, seed=7)
+    payload = b"".join(body.chunks())
+    etag = h.md5_etag(payload)
+
+    expect(h.put_object(port, "xf", "a", payload, "application/x-test"), 200, "put a")
+    expect(batch(port, "xf", [("copy", "a", "b", None)]), 200, "copy a to b")
+
+    ranged = expect(h.get_object(port, "xf", "b", {"Range": "bytes=10-19"}), 206, "range on b")
+    check(ranged.body == payload[10:20], "range body mismatch")
+    check(ranged.header("content-range") == "bytes 10-19/1000", "range Content-Range mismatch")
+    check(ranged.header("etag") == etag, "range ETag mismatch")
+
+    not_modified = expect(h.get_object(port, "xf", "b", {"If-None-Match": etag}), 304, "If-None-Match on b")
+    check(not_modified.body == b"", "304 response had a body")
+    check(not_modified.header("etag") == etag, "304 response lost the ETag")
+
+    expect(h.get_object(port, "xf", "b", {"If-Match": h.md5_etag(b"other")}), 412, "If-Match on b")
+
+    head = expect(h.head_object(port, "xf", "b"), 200, "HEAD b")
+    check(head.body == b"", "HEAD b had a body")
+    check(head.header("etag") == etag, "HEAD ETag mismatch")
+    check(head.header("content-length") == "1000", "HEAD Content-Length mismatch")
+    check(head.header("content-type") == "application/x-test", "HEAD Content-Type mismatch")
+
+    unsatisfiable = expect(h.get_object(port, "xf", "b", {"Range": "bytes=1000-"}), 416, "range past end")
+    check(unsatisfiable.header("content-range") == "bytes */1000", "416 Content-Range mismatch")
+
+    contents, _prefixes = h.collect_listing(port, "xf")
+    check(contents == [("a", 1000, etag), ("b", 1000, etag)], f"listing after copy: {contents}")
+
+    uid = initiate(port, "xf", "m", "text/plain")
+    part_etag = upload_part(port, "xf", "m", uid, 1, b"part-one")
+    expect(h.put_object(port, "xf", "m", b"plain", "text/plain"), 200, "put m")
+    expect(batch(port, "xf", [("rename", "m", "m-old", None)]), 200, "rename m")
+    parts = list_parts(port, "xf", "m", uid)
+    check(
+        [(item["number"], item["etag"], item["size"]) for item in parts] == [(1, part_etag, len(b"part-one"))],
+        f"session parts changed by rename: {parts}",
+    )
+    expect(complete_upload(port, "xf", "m", uid, [(1, part_etag)]), 200, "complete after rename")
+    expect_present(port, "xf", "m", b"part-one", h.md5_etag(b"part-one"), "text/plain", "m after complete")
+    expect_present(port, "xf", "m-old", b"plain", h.md5_etag(b"plain"), "text/plain", "m-old")
+
+    expect(h.put_object(port, "xf", "n", b"n0", "text/plain"), 200, "put n")
+    uid2 = initiate(port, "xf", "n", "text/plain")
+    part_etag2 = upload_part(port, "xf", "n", uid2, 1, b"n-part")
+    expect(batch(port, "xf", [("delete", "n", None)]), 200, "delete n")
+    expect_absent(port, "xf", "n", label="after delete n")
+    expect(complete_upload(port, "xf", "n", uid2, [(1, part_etag2)]), 200, "complete after delete")
+    expect_present(port, "xf", "n", b"n-part", h.md5_etag(b"n-part"), "text/plain", "n after complete")
+
+    expect(
+        batch(
+            port,
+            "xf",
+            [("delete", "m-old", None), ("delete", "m", None), ("delete", "n", None), ("delete", "a", None), ("delete", "b", None)],
+        ),
+        200,
+        "empty the bucket",
+    )
+    contents, _prefixes = h.collect_listing(port, "xf")
+    check(contents == [], f"bucket should be empty, got {contents}")
+    expect(h.delete_bucket(port, "xf"), 204, "delete empty bucket")
+
+
+def _run_parallel(calls: list[Callable[[], Response]], timeout: float) -> list[Response]:
+    results: list[Response | None] = [None] * len(calls)
+    errors: list[BaseException | None] = [None] * len(calls)
+    barrier = threading.Barrier(len(calls))
+
+    def runner(index: int, func: Callable[[], Response]) -> None:
+        try:
+            barrier.wait(timeout=10)
+            results[index] = func()
+        except BaseException as exc:  # noqa: BLE001
+            errors[index] = exc
+
+    threads = [threading.Thread(target=runner, args=(index, func), daemon=True) for index, func in enumerate(calls)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=timeout)
+    for thread in threads:
+        check(not thread.is_alive(), "concurrent request thread hung")
+    for error in errors:
+        if error is not None:
+            raise error
+    return [result for result in results if result is not None]
+
+
+def p1_batch_atomic_visibility(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "vis")
+    body_a = bytes((index * 7 + 3) % 251 for index in range(2048))
+    body_b = bytes((index * 11 + 5) % 251 for index in range(2048))
+    expect(h.put_object(port, "vis", "a", body_a, "text/plain"), 200, "put a")
+    expect(h.put_object(port, "vis", "b", body_b, "text/plain"), 200, "put b")
+    etag_a = h.md5_etag(body_a)
+    etag_b = h.md5_etag(body_b)
+
+    errors: list[str] = []
+    swaps = [0]
+    reads = [0]
+    writer_done = threading.Event()
+    barrier = threading.Barrier(5)
+
+    def writer() -> None:
+        try:
+            barrier.wait(timeout=10)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not errors:
+                response = batch(
+                    port,
+                    "vis",
+                    [("rename", "a", "tmp", None), ("rename", "b", "a", None), ("rename", "tmp", "b", None)],
+                    timeout=5,
+                )
+                if response.status != 200:
+                    errors.append(f"swap batch returned {response.status}: {response.body[:200]!r}")
+                    return
+                swaps[0] += 1
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"writer: {exc}")
+        finally:
+            writer_done.set()
+
+    def reader() -> None:
+        try:
+            barrier.wait(timeout=10)
+            while not writer_done.is_set() and not errors:
+                page = h.list_page(port, "vis", timeout=5)
+                keys = sorted(key for key, _size, _etag in page.contents)
+                if keys != ["a", "b"]:
+                    errors.append(f"listing saw keys {keys}")
+                    return
+                if any(size != 2048 for _key, size, _etag in page.contents):
+                    errors.append("listing saw a wrong size")
+                    return
+                if {etag for _key, _size, etag in page.contents} != {etag_a, etag_b}:
+                    errors.append("listing saw a mixed or missing ETag set")
+                    return
+                if page.prefixes:
+                    errors.append(f"listing saw prefixes {page.prefixes}")
+                    return
+                response = h.get_object(port, "vis", "a", timeout=5)
+                if response.status != 200:
+                    errors.append(f"GET a returned {response.status}")
+                    return
+                if response.body not in (body_a, body_b):
+                    errors.append("GET a returned half of a version")
+                    return
+                if response.header("etag") != h.md5_etag(response.body):
+                    errors.append("GET a headers do not describe its body")
+                    return
+                if response.header("content-length") != "2048":
+                    errors.append("GET a Content-Length mismatch")
+                    return
+                reads[0] += 1
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"reader: {exc}")
+
+    threads = [threading.Thread(target=writer, daemon=True)]
+    threads.extend(threading.Thread(target=reader, daemon=True) for _ in range(4))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=float(limits["request_deadline_s"]) + 10)
+    for thread in threads:
+        check(not thread.is_alive(), "atomic-visibility thread hung")
+
+    check(not errors, f"atomic visibility violation: {errors[:3]}")
+    check(swaps[0] >= 5 and reads[0] >= 20, f"too few operations completed in 3 s (swaps={swaps[0]}, reads={reads[0]})")
+
+    final_a = expect(h.get_object(port, "vis", "a"), 200, "final GET a")
+    final_b = expect(h.get_object(port, "vis", "b"), 200, "final GET b")
+    expected = (body_a, body_b) if swaps[0] % 2 == 0 else (body_b, body_a)
+    check((final_a.body, final_b.body) == expected, "final state does not match the swap parity")
+
+
+def _concurrent_batches_round(port: int, limits: Limits, bucket: str) -> None:
+    timeout = float(limits["request_deadline_s"])
+    make_buckets(port, bucket)
+
+    body_a = b"A" * 64
+    body_b = b"B" * 64
+    expect(h.put_object(port, bucket, "a", body_a, "text/plain"), 200, "round1 put a")
+    expect(h.put_object(port, bucket, "b", body_b, "text/plain"), 200, "round1 put b")
+    r1, r2 = _run_parallel(
+        [
+            lambda: batch(port, bucket, [("rename", "a", "b", None)], timeout=timeout),
+            lambda: batch(port, bucket, [("rename", "b", "a", None)], timeout=timeout),
+        ],
+        timeout + 10,
+    )
+    for index, response in enumerate((r1, r2)):
+        check(response.status < 500, f"round1 batch {index} returned {response.status}")
+        expect(response, 200, f"round1 batch {index}")
+    snapshot = bucket_snapshot(port, bucket)
+    allowed = [
+        {"a": (body_a, h.md5_etag(body_a), "text/plain")},
+        {"b": (body_b, h.md5_etag(body_b), "text/plain")},
+    ]
+    check(snapshot in allowed, f"round1 final snapshot is not a serial outcome: {snapshot}")
+
+    body_x = b"X" * 32
+    body_y = b"Y" * 32
+    expect(h.put_object(port, bucket, "x", body_x, "text/plain"), 200, "round2 put x")
+    expect(h.put_object(port, bucket, "y", body_y, "text/plain"), 200, "round2 put y")
+    ex = h.md5_etag(body_x)
+    s1, s2 = _run_parallel(
+        [
+            lambda: batch(
+                port,
+                bucket,
+                [("copy", "x", "z", ex), ("delete", "y", "*")],
+                timeout=timeout,
+            ),
+            lambda: batch(
+                port,
+                bucket,
+                [("delete", "y", "*"), ("copy", "x", "w", None)],
+                timeout=timeout,
+            ),
+        ],
+        timeout + 10,
+    )
+    for index, response in enumerate((s1, s2)):
+        check(response.status < 500, f"round2 batch {index} returned {response.status}")
+    statuses = sorted((s1.status, s2.status))
+    check(statuses == [200, 412], f"round2 expected one 200 and one 412, got {statuses}")
+    expect_absent(port, bucket, "y", label="round2 y")
+    if s1.status == 200:
+        expect_present(port, bucket, "z", body_x, ex, "text/plain", "round2 z")
+        expect_absent(port, bucket, "w", label="round2 w")
+    else:
+        expect_present(port, bucket, "w", body_x, ex, "text/plain", "round2 w")
+        expect_absent(port, bucket, "z", label="round2 z")
+
+    bodies = [f"K{index}".encode() for index in range(4)]
+    for index, body in enumerate(bodies):
+        expect(h.put_object(port, bucket, f"k{index}", body, "text/plain"), 200, f"round3 put k{index}")
+
+    stop = threading.Event()
+    reader_errors: list[str] = []
+    reader_stats = {"reads": 0, "saw200": False}
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                response = h.get_object(port, bucket, "shared", timeout=timeout)
+                if response.status == 404 and not reader_stats["saw200"]:
+                    continue
+                if response.status != 200:
+                    reader_errors.append(f"GET shared returned {response.status}")
+                    return
+                reader_stats["saw200"] = True
+                if response.body not in bodies:
+                    reader_errors.append("GET shared returned a mixed body")
+                    return
+                if response.header("etag") != h.md5_etag(response.body):
+                    reader_errors.append("GET shared headers do not describe its body")
+                    return
+                reader_stats["reads"] += 1
+        except BaseException as exc:  # noqa: BLE001
+            reader_errors.append(f"reader: {exc}")
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    def worker(index: int) -> list[Response]:
+        responses = []
+        for _ in range(10):
+            responses.append(
+                batch(
+                    port,
+                    bucket,
+                    [("copy", f"k{index}", "shared", None), ("copy", "shared", f"own{index}", None)],
+                    timeout=timeout,
+                )
+            )
+        return responses
+
+    worker_calls: list[Callable[[], Response]] = []
+    batches: list[Response] = []
+    worker_threads = [threading.Thread(target=lambda index=index: batches.extend(worker(index)), daemon=True) for index in range(4)]
+    for thread in worker_threads:
+        thread.start()
+    for thread in worker_threads:
+        thread.join(timeout=timeout * 4 + 10)
+    stop.set()
+    reader_thread.join(timeout=10)
+    for thread in worker_threads:
+        check(not thread.is_alive(), "round3 worker hung")
+    check(not reader_thread.is_alive(), "round3 reader hung")
+    check(not reader_errors, f"round3 reader violation: {reader_errors[:3]}")
+    check(len(batches) == 40, f"round3 expected 40 batches, got {len(batches)}")
+    for index, response in enumerate(batches):
+        check(response.status < 500, f"round3 batch {index} returned {response.status}")
+        expect(response, 200, f"round3 batch {index}")
+    for index, body in enumerate(bodies):
+        expect_present(port, bucket, f"own{index}", body, h.md5_etag(body), "text/plain", f"round3 own{index}")
+    shared = expect(h.get_object(port, bucket, "shared"), 200, "round3 shared")
+    check(shared.body in bodies and shared.header("etag") == h.md5_etag(shared.body), "round3 shared is not a whole version")
+
+    body_k0 = bodies[0]
+    late = b"late"
+    b1, b2 = _run_parallel(
+        [
+            lambda: batch(port, bucket, [("rename", "k0", "k0b", None)], timeout=timeout),
+            lambda: h.put_object(port, bucket, "k0", late, "text/plain", timeout=timeout),
+        ],
+        timeout + 10,
+    )
+    check(b1.status < 500 and b2.status < 500, "round4 returned a 5xx")
+    expect(b1, 200, "round4 batch")
+    expect(b2, 200, "round4 PUT")
+    restricted = {
+        key: value
+        for key, value in bucket_snapshot(port, bucket).items()
+        if key in ("k0", "k0b")
+    }
+    allowed4 = [
+        {"k0b": (late, h.md5_etag(late), "text/plain")},
+        {
+            "k0b": (body_k0, h.md5_etag(body_k0), "text/plain"),
+            "k0": (late, h.md5_etag(late), "text/plain"),
+        },
+    ]
+    check(restricted in allowed4, f"round4 snapshot is not a serial outcome: {restricted}")
+
+
+def p1_batch_concurrent_batches(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    for suffix in ("1", "2"):
+        _concurrent_batches_round(port, limits, f"cc{suffix}")
+
+
+# ---------------------------------------------------------------------------
+# WP4: p2.batch
+
+
+def p2_batch_kill_during_swap(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "ks")
+    body_a = bytes((index * 3 + 1) % 251 for index in range(4096))
+    body_b = bytes((index * 13 + 7) % 251 for index in range(4096))
+    expect(h.put_object(port, "ks", "a", body_a, "text/plain"), 200, "put a")
+    expect(h.put_object(port, "ks", "b", body_b, "text/plain"), 200, "put b")
+    rng = random.Random(int(limits["fixture_seed"]) * 31 + 7)
+
+    for trial in range(int(limits["crash_trials"])):
+        kill_flag = threading.Event()
+        problems: list[str] = []
+
+        def writer() -> None:
+            while not kill_flag.is_set():
+                try:
+                    response = batch(
+                        port,
+                        "ks",
+                        [("rename", "a", "tmp", None), ("rename", "b", "a", None), ("rename", "tmp", "b", None)],
+                        timeout=5,
+                    )
+                except Exception:  # noqa: BLE001 - the kill closes the connection
+                    return
+                if response.status != 200 and not kill_flag.is_set():
+                    problems.append(f"trial {trial}: swap batch returned {response.status}")
+                    return
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        time.sleep(rng.uniform(0.02, 0.25))
+        kill_flag.set()
+        server.stop(kill=True)
+        thread.join(timeout=10)
+        check(not thread.is_alive(), f"trial {trial}: writer hung after the kill")
+        check(not problems, f"trial {trial}: {problems}")
+
+        server.restart()
+        port = server.port
+        assert port is not None
+        page = h.list_page(port, "ks")
+        keys = sorted(key for key, _size, _etag in page.contents)
+        check(keys == ["a", "b"], f"trial {trial}: keys after recovery are {keys}")
+        check(all(size == 4096 for _key, size, _etag in page.contents), f"trial {trial}: wrong size after recovery")
+        first_a = expect(h.get_object(port, "ks", "a"), 200, f"trial {trial}: GET a")
+        first_b = expect(h.get_object(port, "ks", "b"), 200, f"trial {trial}: GET b")
+        for label, response in (("a", first_a), ("b", first_b)):
+            check(response.body in (body_a, body_b), f"trial {trial}: {label} is not a complete version")
+            check(response.header("etag") == h.md5_etag(response.body), f"trial {trial}: {label} ETag mismatch")
+            check(response.header("content-length") == "4096", f"trial {trial}: {label} length mismatch")
+        check(first_a.body != first_b.body, f"trial {trial}: both keys hold the same body")
+
+        expect(
+            batch(
+                port,
+                "ks",
+                [("rename", "a", "tmp", None), ("rename", "b", "a", None), ("rename", "tmp", "b", None)],
+            ),
+            200,
+            f"trial {trial}: swap after recovery",
+        )
+        second_a = expect(h.get_object(port, "ks", "a"), 200, f"trial {trial}: GET a after swap")
+        second_b = expect(h.get_object(port, "ks", "b"), 200, f"trial {trial}: GET b after swap")
+        check(
+            (second_a.body, second_b.body) == (first_b.body, first_a.body),
+            f"trial {trial}: swap after recovery did not swap the versions",
+        )
+
+
+def p2_batch_kill_after_ack(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "ka")
+    for index in range(int(limits["crash_trials"])):
+        size = 1024 + index * 900
+        p_body = bytes((offset * 5 + index) % 251 for offset in range(size))
+        q_body = bytes((offset * 9 + index + 3) % 251 for offset in range(size))
+        p_key = f"p{index}"
+        q_key = f"q{index}"
+        c_key = f"c{index}"
+        r_key = f"r{index}"
+        expect(h.put_object(port, "ka", p_key, p_body, "text/plain"), 200, f"put {p_key}")
+        expect(h.put_object(port, "ka", q_key, q_body, "text/plain"), 200, f"put {q_key}")
+        expect(
+            batch(
+                port,
+                "ka",
+                [
+                    ("copy", p_key, c_key, None),
+                    ("rename", q_key, r_key, None),
+                    ("delete", p_key, "*"),
+                ],
+            ),
+            200,
+            f"trial {index}: acknowledged batch",
+        )
+        server.stop(kill=True)
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(port, "ka", c_key, p_body, h.md5_etag(p_body), "text/plain", f"trial {index}: c")
+        expect_present(port, "ka", r_key, q_body, h.md5_etag(q_body), "text/plain", f"trial {index}: r")
+        expect_absent(port, "ka", p_key, q_key, label=f"trial {index}: sources")
+        contents, _prefixes = h.collect_listing(port, "ka")
+        keys = {key for key, _size, _etag in contents}
+        check(c_key in keys and r_key in keys, f"trial {index}: listing lost an acknowledged key")
+        check(p_key not in keys and q_key not in keys, f"trial {index}: listing kept a deleted source")
+
+
+def p2_batch_blob_lifetime(server: h.Server, limits: Limits) -> None:
+    port = server.port
+    assert port is not None
+    make_buckets(port, "bl")
+    big_body = h.DeterministicBody(65536, seed=9)
+    big = b"".join(big_body.chunks())
+
+    expect(h.put_object(port, "bl", "a", b"A", "text/plain"), 200, "put a")
+    expect(batch(port, "bl", [("copy", "a", "b", None)]), 200, "copy a to b")
+    expect(h.request(port, "DELETE", h.object_path("bl", "a")), 204, "delete a")
+    expect_present(port, "bl", "b", b"A", h.md5_etag(b"A"), "text/plain", "b after a delete")
+    server.restart()
+    port = server.port
+    assert port is not None
+    expect_present(port, "bl", "b", b"A", h.md5_etag(b"A"), "text/plain", "b after restart")
+
+    expect(batch(port, "bl", [("rename", "b", "c", None)]), 200, "rename b to c")
+    expect(h.put_object(port, "bl", "c", b"C2", "text/plain"), 200, "overwrite c")
+    server.restart()
+    port = server.port
+    assert port is not None
+    expect_present(port, "bl", "c", b"C2", h.md5_etag(b"C2"), "text/plain", "c after overwrite restart")
+    expect_absent(port, "bl", "b", label="b after overwrite")
+
+    expect(h.put_object(port, "bl", "c", big, "application/octet-stream"), 200, "put big c")
+    expect(batch(port, "bl", [("copy", "c", "d", None)]), 200, "copy c to d")
+    expect(h.request(port, "DELETE", h.object_path("bl", "c")), 204, "delete big c")
+    gated = h.GatedUpload(port, h.object_path("bl", "u"), 65536)
+    try:
+        gated.wait_interim()
+        gated.send(big[:30000])
+        server.stop(kill=True)
+    finally:
+        gated.close()
+    server.restart()
+    port = server.port
+    assert port is not None
+    expect_present(port, "bl", "d", big, h.md5_etag(big), "application/octet-stream", "d after interrupted upload")
+    ranged = expect(h.get_object(port, "bl", "d", {"Range": "bytes=0-9"}), 206, "range on d")
+    check(ranged.body == big[:10], "range on d returned the wrong bytes")
+    expect_absent(port, "bl", "u", label="interrupted upload")
+
+    expect(
+        batch(port, "bl", [("copy", "d", "d1", None), ("copy", "d", "d2", None), ("copy", "d", "d3", None)]),
+        200,
+        "fan-out from d",
+    )
+    expect(h.request(port, "DELETE", h.object_path("bl", "d")), 204, "delete d")
+    expect(h.request(port, "DELETE", h.object_path("bl", "d1")), 204, "delete d1")
+    expect(batch(port, "bl", [("delete", "d2", None)]), 200, "delete d2")
+    server.restart()
+    port = server.port
+    assert port is not None
+    expect_present(port, "bl", "d3", big, h.md5_etag(big), "application/octet-stream", "d3 after fan-out restart")
+
+    expect(batch(port, "bl", [("rename", "d3", "d4", None)]), 200, "rename d3 to d4")
+    expect(h.put_object(port, "bl", "d4", b"small", "text/plain"), 200, "overwrite d4")
+    server.restart()
+    port = server.port
+    assert port is not None
+    expect_present(port, "bl", "d4", b"small", h.md5_etag(b"small"), "text/plain", "d4 after overwrite restart")
+    expect_absent(port, "bl", "d3", label="d3 after rename")
+    contents, _prefixes = h.collect_listing(port, "bl")
+    check(contents == [("d4", 5, h.md5_etag(b"small"))], f"final blob-lifetime listing: {contents}")
+
+
+# ---------------------------------------------------------------------------
 # Registry and execution
 
 
@@ -1899,24 +2778,22 @@ CASE_FUNCS: dict[str, dict[str, CaseFunc]] = {
     },
     "p2.perf": {},
     "p1.batch": {
-        case: _not_implemented
-        for case in (
-            "copy-rename-delete",
-            "preconditions",
-            "errors",
-            "independence",
-            "cross-feature",
-            "atomic-visibility",
-            "concurrent-batches",
-        )
+        "copy-rename-delete": p1_batch_copy_rename_delete,
+        "preconditions": p1_batch_preconditions,
+        "errors": p1_batch_errors,
+        "independence": p1_batch_independence,
+        "cross-feature": p1_batch_cross_feature,
+        "atomic-visibility": p1_batch_atomic_visibility,
+        "concurrent-batches": p1_batch_concurrent_batches,
     },
     "p1.histories": {
         case: _not_implemented
         for case in ("objects", "multipart", "listing", "restart", "concurrent")
     },
     "p2.batch": {
-        case: _not_implemented
-        for case in ("kill-during-swap", "kill-after-ack", "blob-lifetime")
+        "kill-during-swap": p2_batch_kill_during_swap,
+        "kill-after-ack": p2_batch_kill_after_ack,
+        "blob-lifetime": p2_batch_blob_lifetime,
     },
     "p2.faults": {
         case: _not_implemented

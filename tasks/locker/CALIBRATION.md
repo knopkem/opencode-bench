@@ -213,3 +213,31 @@ deviations from HARD-TASK-V4-PLAN.md: none.
 prompt clarifications: none.
 
 open questions: none.
+
+### WP4 Batch cases
+
+commands run:
+
+```bash
+# build reference for Linux, then 10x each family in the pinned image
+for fam in p1.batch p2.batch; do
+  for i in $(seq 1 10); do
+    docker run ... run.py --binary /bin-under-test/locker --family "$fam" \
+      --output "/out/$fam-$i.json"
+  done
+done
+```
+
+results: `p1.batch` 7/7 and `p2.batch` 3/3 in all 10 consecutive diagnostic
+runs each (20/20 runs, zero flakes). Seed binary: `p1.batch` 0/7 and
+`p2.batch` 0/3; every case fails with 405 `MethodNotAllowed` from
+`POST /b?batch`, so no assertion is vacuous.
+
+deviations from HARD-TASK-V4-PLAN.md: added a shared `expect_present` assertion
+helper and a `_run_parallel` barrier helper; atomic-visibility uses the plan's
+dedicated writer plus four readers with their own loop rather than the generic
+helper. No semantic deviations.
+
+prompt clarifications: none.
+
+open questions: none.
