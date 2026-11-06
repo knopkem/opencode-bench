@@ -36,9 +36,14 @@ def main() -> int:
         print(f"error: {binary} is not an executable file", file=sys.stderr)
         return 2
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    fixed_seed = manifest.get("seed")
+    if args.seed is not None and fixed_seed is not None and args.seed != fixed_seed:
+        print(
+            f"error: fixtures are fixed at seed {fixed_seed}; refusing to relabel as {args.seed}",
+            file=sys.stderr,
+        )
+        return 2
     result = test_runner.run_suite(binary, manifest, family=args.family)
-    if args.seed is not None:
-        result["seed"] = args.seed
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

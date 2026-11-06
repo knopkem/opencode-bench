@@ -1494,7 +1494,13 @@ def run_tests(
     expected_cases = sum(len(family["cases"]) for family in manifest["families"])
     missing = expected_cases - sum(len(cases) for cases in tests.values())
     all_ok = proc.returncode == 0 and failed == 0 and missing == 0
+    # The runner exits 0 only when every case passed and 1 when some failed;
+    # any other code (crash, kill) or a contradicting exit code is not admissible.
+    admitted = (proc.returncode == 0 and failed == 0 and missing == 0) or (
+        proc.returncode == 1 and (failed > 0 or missing > 0)
+    )
     return {
+        "result_valid": admitted,
         "test_ok": all_ok,
         "tests": tests,
         "result": data,
@@ -2092,7 +2098,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         build,
         goal=args.goal,
         manifest=manifest,
-        result_valid=tests.get("result") is not None,
+        result_valid=tests.get("result_valid", tests.get("result") is not None),
     )
     tier_cases = {
         tier: {
@@ -2437,7 +2443,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         build,
         goal=meta.get("goal", "balanced"),
         manifest=manifest,
-        result_valid=tests.get("result") is not None,
+        result_valid=tests.get("result_valid", tests.get("result") is not None),
     )
     tier_cases = {
         tier: {
@@ -5386,7 +5392,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--reps", type=int, default=1)
     run.add_argument("--goal", choices=["speed", "quality", "balanced"], default="balanced")
-    run.add_argument("--timeout", type=int, default=18 * 60, help="hard wall timeout (default 18 min)")
+    run.add_argument("--timeout", type=int, default=60 * 60, help="hard wall timeout (default 60 min)")
     run.add_argument("--idle-timeout", type=int, default=5 * 60, help="no-output timeout (default 5 min)")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--no-preflight", action="store_true")

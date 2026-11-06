@@ -715,6 +715,12 @@ def p1_multipart_concurrent_replace(server: h.Server, limits: Limits) -> None:
     )
     if replaced.status == 200:
         check(replaced.header("etag") == h.md5_etag(replacement), "replacement ETag mismatch")
+    # Replacement-first makes the old ETag stale (400); completion-first
+    # consumes the session so the replacement finds no upload (404).
+    check(
+        (response.status, replaced.status) in ((200, 404), (400, 200)),
+        f"impossible outcome pair: completion {response.status}, replacement {replaced.status}",
+    )
 
     if response.status == 200:
         readback = expect(h.get_object(port, "multi", "key"), 200, "race readback")
@@ -1012,10 +1018,12 @@ def p1_multipart_list_during_abort(server: h.Server, limits: Limits) -> None:
         aborted = outcome["abort"]
         assert isinstance(aborted, Response)
         expect(aborted, 204, "abort during part/list race")
+        part_status = None
         if "part" in outcome:
             part_response = outcome["part"]
             assert isinstance(part_response, Response)
-            check(part_response.status in (200, 404), f"part upload returned {part_response.status}")
+            part_status = part_response.status
+            check(part_status in (200, 404), f"part upload returned {part_status}")
         elif "part_error" in outcome:
             fail(f"part upload raised: {outcome['part_error']}")
         check("list" in outcome, f"list raised: {outcome.get('list_error')}")
@@ -1024,7 +1032,11 @@ def p1_multipart_list_during_abort(server: h.Server, limits: Limits) -> None:
         check(listed.status in (200, 404), f"list during abort returned {listed.status}")
         if listed.status == 200:
             root = h.parse_xml(listed.body)
-            check(len(root.findall("Part")) == 1, "list raced past abort and returned an empty part list")
+            numbers = [int(h.text(part, "PartNumber")) for part in root.findall("Part")]
+            allowed = [[1]]
+            if part_status == 200:
+                allowed.append([1, 2])
+            check(numbers in allowed, f"list returned incoherent parts {numbers} (part upload {part_status})")
     finally:
         gate.close()
     expect_object(h.get_object(port, "multi", "key"), old, "text/plain", "object after abort race")
@@ -1403,12 +1415,19 @@ def p1_concurrency_progress(server: h.Server, limits: Limits) -> None:
         gate.wait_interim(timeout=float(limits["progress_deadline_s"]))
         gate.send(prefix)
         deadline = time.monotonic() + float(limits["progress_deadline_s"])
-        response = h.get_object(port, "concurrent", "held", timeout=max(1.0, deadline - time.monotonic()))
-        expect_object(response, old, "text/plain", "old object during stalled upload")
-        response = h.put_object(port, "concurrent", "unrelated", b"independent", "text/plain")
-        expect(response, 200, "unrelated PUT during stalled upload")
-        response = h.get_object(port, "concurrent", "unrelated")
-        expect_object(response, b"independent", "text/plain", "unrelated GET")
+
+        def remaining() -> float:
+            return max(0.5, deadline - time.monotonic())
+
+        try:
+            response = h.get_object(port, "concurrent", "held", timeout=remaining())
+            expect_object(response, old, "text/plain", "old object during stalled upload")
+            response = h.put_object(port, "concurrent", "unrelated", b"independent", "text/plain", timeout=remaining())
+            expect(response, 200, "unrelated PUT during stalled upload")
+            response = h.get_object(port, "concurrent", "unrelated", timeout=remaining())
+            expect_object(response, b"independent", "text/plain", "unrelated GET")
+        except (TimeoutError, OSError) as exc:
+            fail(f"no progress within {limits['progress_deadline_s']}s while an upload was stalled: {exc}")
         response = gate.finish(rest)
         expect(response, 200, "gated upload completion")
     finally:
@@ -1735,7 +1754,7 @@ def p2_perf_family(server: h.Server, limits: Limits) -> dict[str, tuple[bool, st
     assert port is not None
     try:
         make_buckets(port, "perf")
-        body = h.DeterministicBody(int(limits["stream_bytes"]), seed=1)
+        body = h.DeterministicBody(int(limits["stream_bytes"]), seed=int(limits.get("fixture_seed", 1)))
         deadline = time.monotonic() + float(limits["operation_deadline_s"])
         response = h.stream_request(
             port,
@@ -1918,7 +1937,8 @@ def run_family(binary: str, family: dict, limits: Limits) -> dict:
 
 
 def run_suite(binary: str, manifest: dict, *, family: str | None = None) -> dict:
-    limits = manifest["limits"]
+    limits = dict(manifest["limits"])
+    limits["fixture_seed"] = manifest.get("seed", 1)
     selected = [
         item for item in manifest["families"] if family is None or item["id"] == family
     ]

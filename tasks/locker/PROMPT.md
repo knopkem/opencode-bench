@@ -12,7 +12,7 @@ subcase; P1 and P2 are the real challenge.
 
 ## Budget and priorities
 
-- Aim for about **12 minutes** of work. The hard cap is **18 minutes**, with a
+- Aim for about **12 minutes** of work. The hard cap is **60 minutes**, with a
   **5-minute** no-output timeout. Stop and write `COMPLETION.md` when you are
   done or when time is nearly up.
 - Prioritise in this order: **P0** (the seed baseline), then **P1** protocol and

@@ -58,15 +58,23 @@ def main() -> int:
     args = parser.parse_args()
     failed = False
     for label, fault, family, case, func, overrides in CONTROLS:
-        limits = dict(overrides)
-        detected = False
+        # Baseline: the unfaulted binary must pass, else a "detection" is meaningless.
+        try:
+            with h.Server(args.binary) as server:
+                func(server, dict(overrides))
+        except Exception as exc:  # noqa: BLE001
+            failed = True
+            print(f"BASELINE  {family}/{case}: unfaulted binary failed ({type(exc).__name__}: {exc})")
+            continue
         try:
             with h.Server(args.binary, env={"LOCKER_FAULT": fault}) as server:
-                func(server, limits)
-        except Exception as exc:  # noqa: BLE001 - any failure is detection here
-            detected = True
-            print(f"detected  {family}/{case}: {label} ({type(exc).__name__}: {exc})")
-        if not detected:
+                func(server, dict(overrides))
+        except h.CaseFailure as exc:
+            print(f"detected  {family}/{case}: {label} ({exc})")
+        except Exception as exc:  # noqa: BLE001
+            failed = True
+            print(f"ERROR     {family}/{case}: {label} failed for a non-assertion reason ({type(exc).__name__}: {exc})")
+        else:
             failed = True
             print(f"MISSED    {family}/{case}: {label} passed despite the injected fault")
     return 1 if failed else 0

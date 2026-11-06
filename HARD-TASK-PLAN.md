@@ -25,7 +25,7 @@ Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
   multipart/concurrency/parameter subcases; the same binary then scored 40/49
   (quality ≈0.857). A fresh v2 model run adapted and scored 48/49. Suite v3
   adds two bounded multipart list/complete/abort races, bringing the catalog to
-  51 cases; a fresh v3 run scored 50/51 but hit the 18-minute hard wall cap.
+  51 cases; a fresh v3 run scored 50/51 but hit the then-current 18-minute hard wall cap (now 60 minutes).
   Only combined multipart parameter validation remained. See
   `tasks/locker/CALIBRATION.md`.
 - Harness: Locker builds `bin/locker`, mounts the workdir read-only for the
@@ -81,7 +81,7 @@ These are the constraints that drive every decision below.
 
 ### Minimum cost and time
 
-- Target **12–15 minutes** of agent wall time, **18-minute hard cap**, **5-minute
+- Target **12–15 minutes** of agent wall time, **60-minute hard cap**, **5-minute
   idle timeout**. The model is told to aim for 12 minutes and prioritise P0,
   then P1, then P2.
 - Target **under ~$2 per frontier-model run**. Start with **two frontier models
@@ -784,7 +784,7 @@ docker/locker.Dockerfile
 
    ```bash
    ./bench.py run --model provider/model \
-     --timeout 1080 --idle-timeout 300 --reps 2
+     --timeout 3600 --idle-timeout 300 --reps 2
    ```
 
 5. Inspect `score.json`, `test.log`, `results.json`, `COMPLETION.md` and

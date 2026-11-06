@@ -28,7 +28,7 @@ The hidden suite is black-box and is mounted only after the agent exits.
 ./bench.py models --provider NAME
 ./bench.py run --model provider/model
 ./bench.py run --model provider/model --variant all --keep-going
-./bench.py run --model provider/model --timeout 1080 --idle-timeout 300 --reps 2
+./bench.py run --model provider/model --timeout 3600 --idle-timeout 300 --reps 2
 ./bench.py status
 ./bench.py preview --run RUN_ID  # run the built bin/locker server
 ./bench.py leaderboard           # serve + open locker-leaderboard.html
@@ -44,7 +44,7 @@ CLI shape.
 
 ## Budget and grading
 
-The prompt asks for roughly 12 minutes of work, with an 18-minute hard cap and
+The prompt asks for roughly 12 minutes of work, with an 60-minute hard cap and
 a 5-minute idle timeout. The model gets the same seed, toolchain and time
 budget every run.
 

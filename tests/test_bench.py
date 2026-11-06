@@ -226,6 +226,48 @@ class LockerScoringTests(unittest.TestCase):
             bench.EXPECTED,
         )
 
+    def _run_tests_with(self, returncode: int, failing: bool) -> dict:
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        result = {
+            "schema": "opencode-bench/locker-tests@1",
+            "suite_version": self.manifest["suite_version"],
+            "seed": self.manifest["seed"],
+            "diagnostic": False,
+            "tests": [
+                {
+                    "id": f["id"],
+                    "title": f["title"],
+                    "cases": [
+                        {"id": c, "ok": not (failing and f["id"] == "p1.range"), "duration": 0, "error": None}
+                        for c in f["cases"]
+                    ],
+                }
+                for f in self.manifest["families"]
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "results.json").write_text(json.dumps(result))
+
+            def fake(*args, **kwargs):
+                (run_dir / "results.json").write_text(json.dumps(result))
+                return mock.Mock(returncode=returncode)
+
+            with mock.patch.object(bench, "run_command", fake):
+                return bench.run_tests(
+                    run_dir, run_dir, engine="docker", image="x", dry_run=False, manifest=self.manifest
+                )
+
+    def test_abnormal_exit_is_not_admitted(self) -> None:
+        self.assertTrue(self._run_tests_with(0, False)["result_valid"])
+        self.assertTrue(self._run_tests_with(1, True)["result_valid"])
+        self.assertFalse(self._run_tests_with(137, False)["result_valid"])
+        self.assertFalse(self._run_tests_with(1, False)["result_valid"])
+
     def test_fractional_family_credit(self) -> None:
         tests = self.all_pass()
         tests["p1.range"]["bounds"] = False

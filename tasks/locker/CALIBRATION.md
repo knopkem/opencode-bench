@@ -101,7 +101,7 @@ On v3 that binary scores 48/51 (quality ≈0.970), still eligible.
 A fresh v3 model run scored **50/51** (quality 0.99). It fixed the session-list
 races; its only failure was combined multipart parameter validation
 (`GET ...?uploadId=...&partNumber=...` returned 200 instead of 400). However,
-the run hit the **18-minute hard wall cap** (`outcome: timeout`, no
+the run hit the **18-minute hard wall cap** (since raised to 60 minutes) (`outcome: timeout`, no
 `COMPLETION.md`) after 33 steps. The task is therefore score-saturated for this
 model and at the budget boundary: further hardening should add a genuinely
 different interaction dimension or change the timeout/eligibility policy, not
