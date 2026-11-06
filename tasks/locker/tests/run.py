@@ -28,6 +28,13 @@ def main() -> int:
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--family", default=None, help="author-only diagnostic family")
+    parser.add_argument("--scratch", default=None, help="tmpfs for the p2.faults family")
+    parser.add_argument(
+        "--generator-seed",
+        type=int,
+        default=None,
+        help="author-only history generator seed (marks the result diagnostic)",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -43,7 +50,38 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    result = test_runner.run_suite(binary, manifest, family=args.family)
+
+    includes_faults = args.family is None or args.family == "p2.faults"
+    scratch_error: str | None = None
+    if includes_faults:
+        required = int(manifest["limits"]["fault_fs_bytes"])
+        message = (
+            f"error: p2.faults requires --scratch pointing at a tmpfs of {required} bytes"
+        )
+        if args.scratch is None:
+            scratch_error = "infrastructure: no scratch filesystem"
+            print(message, file=sys.stderr)
+        else:
+            try:
+                stats = os.statvfs(args.scratch)
+                total = stats.f_frsize * stats.f_blocks
+                writable = os.access(args.scratch, os.W_OK)
+            except OSError as exc:
+                scratch_error = f"infrastructure: scratch size unavailable ({exc})"
+                print(message, file=sys.stderr)
+            else:
+                if abs(total - required) > 1048576 or not writable:
+                    scratch_error = f"infrastructure: scratch size {total}"
+                    print(message, file=sys.stderr)
+
+    result = test_runner.run_suite(
+        binary,
+        manifest,
+        family=args.family,
+        scratch=args.scratch,
+        scratch_error=scratch_error,
+        generator_seed=args.generator_seed,
+    )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +101,8 @@ def main() -> int:
             if not case["ok"]:
                 print(f"  FAIL {case['id']}: {case['error']}", file=sys.stderr)
     print(f"passed {total - failed}/{total} subcases", file=sys.stderr)
+    if scratch_error is not None:
+        return 3
     return 0 if failed == 0 else 1
 
 

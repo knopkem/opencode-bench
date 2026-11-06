@@ -1435,6 +1435,8 @@ def run_tests(
         "--rm",
         "--network",
         "none",
+        "--tmpfs",
+        f"/scratch:rw,size={manifest['limits']['fault_fs_bytes']}",
         "-v",
         f"{workdir}:/app:ro",
         "-v",
@@ -1459,16 +1461,23 @@ def run_tests(
         str(manifest.get("seed", 1)),
         "--output",
         "/out/results.json",
+        "--scratch",
+        "/scratch",
     ]
     proc = run_command(command, log_path=run_dir / "test.log", dry_run=dry_run)
     if dry_run:
         return {"test_ok": True, "tests": {}, "result": None, "error": None, "exit_code": 0}
+    infra_error = (
+        "hidden runner reported missing test infrastructure (scratch filesystem)"
+        if proc.returncode == 3
+        else None
+    )
     if not result_file.exists():
         return {
             "test_ok": False,
             "tests": {},
             "result": None,
-            "error": "results.json missing (suite failed to start)",
+            "error": infra_error or "results.json missing (suite failed to start)",
             "exit_code": proc.returncode,
         }
     try:
@@ -1478,7 +1487,7 @@ def run_tests(
             "test_ok": False,
             "tests": {},
             "result": None,
-            "error": f"invalid results.json: {exc}",
+            "error": infra_error or f"invalid results.json: {exc}",
             "exit_code": proc.returncode,
         }
     tests, error = validate_locker_result(data, manifest)
@@ -1487,7 +1496,7 @@ def run_tests(
             "test_ok": False,
             "tests": {},
             "result": data if isinstance(data, dict) else None,
-            "error": error or "invalid results.json",
+            "error": infra_error or error or "invalid results.json",
             "exit_code": proc.returncode,
         }
     failed = sum(1 for cases in tests.values() for ok in cases.values() if not ok)
@@ -1504,7 +1513,7 @@ def run_tests(
         "test_ok": all_ok,
         "tests": tests,
         "result": data,
-        "error": None if all_ok else f"{failed} failed and {missing} missing subcases",
+        "error": None if all_ok else (infra_error or f"{failed} failed and {missing} missing subcases"),
         "exit_code": proc.returncode,
     }
 
@@ -2371,6 +2380,36 @@ def cmd_check(args: argparse.Namespace) -> int:
                 problems.append(f"image smoke failed: {smoke.stdout}{smoke.stderr}")
             else:
                 versions = smoke.stdout.strip().replace("\n", ", ")
+                fs = manifest["limits"]["fault_fs_bytes"]
+                probe = [
+                    args.engine,
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--tmpfs",
+                    f"/scratch:rw,size={fs}",
+                    args.image,
+                    "python3",
+                    "-c",
+                    f"import os,sys; s=os.statvfs('/scratch'); t=s.f_frsize*s.f_blocks; "
+                    f"sys.exit(0 if abs(t-{fs})<=1048576 else 3)",
+                ]
+                try:
+                    probe_proc = subprocess.run(
+                        probe,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    problems.append("image fault tmpfs probe timed out")
+                else:
+                    if probe_proc.returncode != 0:
+                        problems.append(
+                            "image cannot mount the fault-injection tmpfs at the frozen size"
+                        )
 
     if problems:
         for problem in problems:

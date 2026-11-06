@@ -12,6 +12,7 @@ import os
 import random
 import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -2698,6 +2699,207 @@ def p2_batch_blob_lifetime(server: h.Server, limits: Limits) -> None:
 
 
 # ---------------------------------------------------------------------------
+# WP5: p2.faults
+
+
+def _fault_body(size: int, seed: int) -> bytes:
+    return b"".join(h.DeterministicBody(size, seed=seed).chunks())
+
+
+def _scratch_server(binary: str, limits: Limits) -> h.Server:
+    root = tempfile.mkdtemp(prefix="locker-fault-", dir=limits.get("scratch_dir"))
+    return h.Server(
+        binary,
+        root=root,
+        env={"TMPDIR": root, "TMP": root, "TEMP": root},
+    ).start()
+
+
+def oversized_put(
+    port: int,
+    path: str,
+    total: int,
+    content_type: str = "application/octet-stream",
+) -> tuple[int | None, str]:
+    """Stream `total` bytes with a declared length over a raw socket.
+
+    Returns (status, detail); status is None when the connection was reset or
+    closed before a status line.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=60)
+    try:
+        head = (
+            f"PUT {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            f"Content-Type: {content_type}\r\nContent-Length: {total}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(head)
+        sent = 0
+        chunk = bytes(1 << 20)
+        try:
+            while sent < total:
+                sock.sendall(chunk)
+                sent += len(chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+        try:
+            status, _headers, _body = h.read_raw_response(sock, time.monotonic() + 60)
+            return status, f"status {status} after {sent} bytes"
+        except (ConnectionError, OSError, CaseFailure) as exc:
+            return None, f"no status after {sent} bytes: {exc}"
+    finally:
+        sock.close()
+
+
+def check_failed_cleanly(status: int | None, detail: str, label: str) -> None:
+    check(
+        status is None or status >= 500,
+        f"{label}: oversized write must fail with 5xx or a closed connection, got {detail}",
+    )
+
+
+def p2_faults_put_preserves_old(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        old = _fault_body(1024 * 1024, seed=13)
+        etag = h.md5_etag(old)
+        expect(h.put_object(port, "fx", "k", old, "text/x-old"), 200, "put old k")
+
+        status, detail = oversized_put(
+            port, h.object_path("fx", "k"), int(limits["fault_write_bytes"]), "text/x-new"
+        )
+        check_failed_cleanly(status, detail, "put-preserves-old")
+
+        expect_present(port, "fx", "k", old, etag, "text/x-old", "old k after failed write")
+        head = expect(h.head_object(port, "fx", "k"), 200, "HEAD k after failed write")
+        check(head.body == b"", "HEAD k had a body")
+        check(head.header("etag") == etag, "HEAD k ETag mismatch")
+        check(head.header("content-length") == "1048576", "HEAD k Content-Length mismatch")
+        contents, _prefixes = h.collect_listing(port, "fx")
+        check(contents == [("k", 1048576, etag)], f"listing after failed write: {contents}")
+
+        expect(h.request(port, "GET", "/health"), 200, "health after failed write")
+        expect(h.put_object(port, "fx", "other", b"ok", "text/plain"), 200, "unrelated write")
+
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(port, "fx", "k", old, etag, "text/x-old", "old k after restart")
+        expect_present(port, "fx", "other", b"ok", h.md5_etag(b"ok"), "text/plain", "other after restart")
+    finally:
+        server.close()
+
+
+def p2_faults_space_released(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        small_size = 8 * 1024 * 1024
+        small = _fault_body(small_size, seed=17)
+        small_etag = h.md5_etag(small)
+        expect(h.put_object(port, "fx", "base", b"base", "text/plain"), 200, "put base")
+
+        for round_index, fill_key in enumerate(("fill", "fill2")):
+            for attempt in range(2):
+                status, detail = oversized_put(
+                    port,
+                    h.object_path("fx", "big"),
+                    int(limits["fault_write_bytes"]),
+                )
+                check_failed_cleanly(status, detail, f"round {round_index} attempt {attempt}")
+                expect(h.get_object(port, "fx", "big"), 404, f"big after failed write {attempt}")
+            response = expect(
+                h.put_object(port, "fx", fill_key, small, "application/octet-stream"),
+                200,
+                f"8 MiB PUT {fill_key}",
+            )
+            check(response.header("etag") == small_etag, f"{fill_key} ETag mismatch")
+            got = expect(h.get_object(port, "fx", fill_key), 200, f"GET {fill_key}")
+            check(len(got.body) == small_size, f"{fill_key} length mismatch")
+            check(got.header("etag") == small_etag, f"{fill_key} readback ETag mismatch")
+            if round_index == 0:
+                expect(h.request(port, "DELETE", h.object_path("fx", fill_key)), 204, "delete fill")
+
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(port, "fx", "fill2", small, small_etag, "application/octet-stream", "fill2 after restart")
+        expect_present(port, "fx", "base", b"base", h.md5_etag(b"base"), "text/plain", "base after restart")
+    finally:
+        server.close()
+
+
+def p2_faults_multipart_staging(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        uid = initiate(port, "fx", "mp", "application/x-mp")
+        e1 = upload_part(port, "fx", "mp", uid, 1, b"part-one")
+
+        status, detail = oversized_put(
+            port,
+            multipart_path("fx", "mp", uid, 2),
+            int(limits["fault_write_bytes"]),
+        )
+        check_failed_cleanly(status, detail, "multipart-staging")
+
+        parts = list_parts(port, "fx", "mp", uid)
+        check(
+            [(item["number"], item["etag"]) for item in parts] == [(1, e1)],
+            f"failed part left a phantom part: {parts}",
+        )
+        e2 = upload_part(port, "fx", "mp", uid, 2, b"part-two")
+        expect(complete_upload(port, "fx", "mp", uid, [(1, e1), (2, e2)]), 200, "complete mp")
+        expect_present(
+            port, "fx", "mp", b"part-onepart-two", h.md5_etag(b"part-onepart-two"),
+            "application/x-mp", "mp after completion",
+        )
+
+        small = _fault_body(8 * 1024 * 1024, seed=19)
+        expect(
+            h.put_object(port, "fx", "after", small, "application/octet-stream"),
+            200,
+            "8 MiB write after failed part",
+        )
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(
+            port, "fx", "mp", b"part-onepart-two", h.md5_etag(b"part-onepart-two"),
+            "application/x-mp", "mp after restart",
+        )
+        after = expect(h.get_object(port, "fx", "after"), 200, "after after restart")
+        check(after.header("etag") == h.md5_etag(small), "after ETag mismatch")
+    finally:
+        server.close()
+
+
+FAULT_CASES: dict[str, Callable[[str, Limits], None]] = {
+    "put-preserves-old": p2_faults_put_preserves_old,
+    "space-released": p2_faults_space_released,
+    "multipart-staging": p2_faults_multipart_staging,
+}
+
+
+def _run_fault_case(
+    binary: str, func: Callable[[str, Limits], None], limits: Limits
+) -> tuple[bool, float, str | None]:
+    start = time.monotonic()
+    try:
+        func(binary, limits)
+        return True, time.monotonic() - start, None
+    except Exception as exc:  # noqa: BLE001
+        return False, time.monotonic() - start, _error_text(exc)
+
+
+# ---------------------------------------------------------------------------
 # Registry and execution
 
 
@@ -2795,10 +2997,7 @@ CASE_FUNCS: dict[str, dict[str, CaseFunc]] = {
         "kill-after-ack": p2_batch_kill_after_ack,
         "blob-lifetime": p2_batch_blob_lifetime,
     },
-    "p2.faults": {
-        case: _not_implemented
-        for case in ("put-preserves-old", "space-released", "multipart-staging")
-    },
+    "p2.faults": {},
 }
 
 
@@ -2830,6 +3029,18 @@ def run_family(binary: str, family: dict, limits: Limits) -> dict:
             results.append(
                 {"id": case_id, "ok": ok, "duration": duration, "error": error}
             )
+    elif family["id"] == "p2.faults":
+        scratch_error = limits.get("scratch_error")
+        for case_id in family["cases"]:
+            if scratch_error:
+                results.append(
+                    {"id": case_id, "ok": False, "duration": 0.0, "error": scratch_error}
+                )
+                continue
+            ok, duration, error = _run_fault_case(binary, FAULT_CASES[case_id], limits)
+            results.append(
+                {"id": case_id, "ok": ok, "duration": duration, "error": error}
+            )
     else:
         functions = CASE_FUNCS[family["id"]]
         for case_id in family["cases"]:
@@ -2841,9 +3052,23 @@ def run_family(binary: str, family: dict, limits: Limits) -> dict:
     return {"id": family["id"], "title": family["title"], "cases": results}
 
 
-def run_suite(binary: str, manifest: dict, *, family: str | None = None) -> dict:
+def run_suite(
+    binary: str,
+    manifest: dict,
+    *,
+    family: str | None = None,
+    scratch: str | None = None,
+    scratch_error: str | None = None,
+    generator_seed: int | None = None,
+) -> dict:
     limits = dict(manifest["limits"])
     limits["fixture_seed"] = manifest.get("seed", 1)
+    if scratch is not None:
+        limits["scratch_dir"] = scratch
+    if scratch_error is not None:
+        limits["scratch_error"] = scratch_error
+    if generator_seed is not None:
+        limits["generator_seed"] = generator_seed
     selected = [
         item for item in manifest["families"] if family is None or item["id"] == family
     ]
@@ -2856,6 +3081,6 @@ def run_suite(binary: str, manifest: dict, *, family: str | None = None) -> dict
         "schema": "opencode-bench/locker-tests@1",
         "suite_version": manifest["suite_version"],
         "seed": manifest.get("seed", 1),
-        "diagnostic": family is not None,
+        "diagnostic": family is not None or generator_seed is not None,
         "tests": tests,
     }

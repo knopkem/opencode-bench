@@ -267,6 +267,9 @@ class LockerScoringTests(unittest.TestCase):
         self.assertTrue(self._run_tests_with(1, True)["result_valid"])
         self.assertFalse(self._run_tests_with(137, False)["result_valid"])
         self.assertFalse(self._run_tests_with(1, False)["result_valid"])
+        missing_scratch = self._run_tests_with(3, False)
+        self.assertFalse(missing_scratch["result_valid"])
+        self.assertIn("scratch", missing_scratch["error"])
 
     def test_fractional_family_credit(self) -> None:
         tests = self.all_pass()

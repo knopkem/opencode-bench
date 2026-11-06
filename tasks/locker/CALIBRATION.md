@@ -241,3 +241,35 @@ helper. No semantic deviations.
 prompt clarifications: none.
 
 open questions: none.
+
+### WP5 Faults
+
+commands run:
+
+```bash
+# 10x in the pinned image with the frozen tmpfs
+docker run ... --tmpfs /scratch:rw,size=33554432 ... run.py \
+  --scratch /scratch --family p2.faults --output /out/faults-$i.json
+# full run without --tmpfs/--scratch
+docker run ... run.py --binary ... --output /out/results.json
+./bench.py check
+python3 -m unittest discover -s tests
+python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'
+```
+
+results: `p2.faults` 3/3 in all 10 runs. A full run without `--scratch` exits
+3, writes `results.json`, and marks all three faults cases
+`infrastructure: no scratch filesystem` while every other family runs.
+`./bench.py check` passes the tmpfs preflight; unit tests 13/13 and 19/19.
+Seed binary on the fault family: 0/3 — `put-preserves-old` publishes a torn
+body, `space-released` leaves the failed 48 MiB write on the final path so the
+next 8 MiB PUT is 500 ENOSPC, and `multipart-staging` is 501.
+
+deviations from HARD-TASK-V4-PLAN.md: the tmpfs probe uses `args.engine` instead
+of the literal `docker`; the faults family receives its infrastructure error via
+`run_suite(scratch_error=...)` so it can mark the three cases without starting a
+server.
+
+prompt clarifications: none.
+
+open questions: none.
