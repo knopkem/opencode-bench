@@ -471,6 +471,15 @@ results:
 - Harness end-to-end: `./bench.py rescore` on the v3-era local-model workdir
   completed with the v5 suite at 38/65 challenge subcases, scored 31/58,
   quality **0.60**, gate pass, not eligible.
+- Fresh local-model checks on 2026-11-07 were not valid calibration runs. The
+  first attempt completed four exploration steps, began a `write` tool, and
+  then produced no further event until the five-minute idle watchdog stopped
+  it with zero files changed. The immediate retry made zero model steps and
+  failed with `provider.transport: ECONNREFUSED`, showing that the local
+  Strata provider was unavailable. Neither run measures Locker quality. The
+  seed `AGENTS.md` now tells candidates to work incrementally and keep the
+  tree buildable, reducing the chance that a local model emits one very large
+  unresponsive tool call.
 
 prompt clarifications: the operational-failure paragraph now names multipart
 completion and batch publication explicitly; that text is the only public

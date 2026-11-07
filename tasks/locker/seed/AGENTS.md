@@ -31,6 +31,9 @@ but keep the CLI and HTTP contract and the command names above.
 
 ## Repository rules
 
+- Work incrementally: prefer focused edits and small new files over replacing
+  an entire large file in one step. Keep the tree buildable as you go and run
+  the Go tests or build after meaningful changes.
 - Do not add a web UI, browser tests, Node tooling or a database engine.
 - Do not special-case the public smoke checks; implement the documented
   behavior generally.
