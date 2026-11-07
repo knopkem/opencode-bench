@@ -90,7 +90,7 @@ class ManifestTests(unittest.TestCase):
             self.assertTrue(family["title"].startswith(f"[{family['tier']}]"))
             self.assertEqual(len(family["cases"]), len(set(family["cases"])))
         self.assertEqual(family_counts, manifest["tiers"])
-        self.assertEqual(counts, {"P0": 8, "P1": 42, "P2": 19})
+        self.assertEqual(counts, {"P0": 8, "P1": 42, "P2": 23})
         limits = manifest["limits"]
         self.assertLess(limits["server_rss_bytes"], limits["stream_bytes"])
 

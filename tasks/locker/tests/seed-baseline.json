@@ -1,6 +1,6 @@
 {
   "schema": "opencode-bench/locker-seed-baseline@1",
-  "suite_version": "locker-v4",
+  "suite_version": "locker-v5",
   "seed": 20261106,
   "description": "Per-subcase results of the untouched seed. Cases the seed passes are a regression gate; only cases the seed fails count toward quality.",
   "source": "untouched tasks/locker/seed run through the hidden suite",
@@ -54,7 +54,7 @@
     },
     "p1.concurrency": {
       "coherent": false,
-      "no-lost-writes": false,
+      "no-lost-writes": true,
       "progress": true,
       "churn-replace": false,
       "churn-delete": false
@@ -104,7 +104,11 @@
     "p2.faults": {
       "put-preserves-old": false,
       "space-released": false,
-      "multipart-staging": false
+      "multipart-staging": false,
+      "put-commit-cleanup": false,
+      "batch-operational-rollback": false,
+      "multipart-completion-operational": false,
+      "part-replacement-preserves-old": false
     }
   }
 }

@@ -183,6 +183,10 @@ func TestOpenAcceptsKnownFaults(t *testing.T) {
 		"stale-snapshot-clone",
 		"metadata-before-blob",
 		"metadata-before-blob-amp",
+		"keep-blob-on-commit-error",
+		"batch-presave-effect",
+		"consume-upload-on-complete-error",
+		"wrong-op-status",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("LOCKER_FAULT", name)

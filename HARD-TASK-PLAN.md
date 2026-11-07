@@ -1,7 +1,7 @@
 # Hard-task benchmark plan — Locker
 
-Status: packages A–E implemented on `hard_task`; model calibration (package F)
-pending.
+Status: packages A–E and the locker-v5 operational-fault hardening are
+implemented on `hard_task`; model calibration (package F) is pending.
 Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
 
 ## Implementation status
@@ -9,31 +9,38 @@ Branch: `hard_task` (SpriteForge and its leaderboard stay on `main`).
 - v4 hardening (atomic same-bucket batch, full-disk fault family, generated
   histories against an independent state model, realistic mutant campaign) is
   implemented and frozen; `HARD-TASK-V4-PLAN.md` is the build record.
-- Frozen suite: `locker-v4`, 16 families, 69 subcases (P0 8 / P1 42 / P2 19),
-  fixture seed `20261106`.
+- v5 extends the fault family with operational-failure recovery for metadata
+  commit, batch publication, multipart completion and part replacement; it is
+  locally validated and `tasks/locker/CALIBRATION.md` records the evidence.
+- Current suite: `locker-v5`, 16 families, 73 subcases (P0 8 / P1 42 / P2 23),
+  fixture seed `20261106`. v4 results are not comparable.
 - Frozen limits: 134,217,728-byte stream fixture; 100,663,296-byte server
   `VmHWM` cap; 180 s large-workload deadline; 10 s progress deadline; 60 s
   request deadline; 15 s startup deadline; 6 bounded crash trials; 32 batch
   operations; 33,554,432-byte fault filesystem; 50,331,648-byte oversized
   write.
-- Reference: 69/69 subcases on macOS and in the pinned Linux image. Five timed
-  Linux runs had a 19.6 s median wall time; 210 consecutive diagnostic
+- v4 reference: 69/69 subcases on macOS and in the pinned Linux image. Five
+  timed Linux runs had a 19.6 s median wall time; 210 consecutive diagnostic
   race/crash/fault runs were clean; all 13 realistic mutants were detected
   10/10 (both amplified variants 10/10); a 200-seed history sweep passed
   1000/1000.
-- Seed baseline: all 8 P0 subcases pass and the build succeeds. Credit is P1
-  range 0/4, conditional 0/4, multipart 0/11, listing 0/6, concurrency 2/5;
-  P2 overwrite 4/4, multipart 0/3, isolation 0/3, perf 1/3, batch 0/7,
-  histories 0/5, faults 0/3. Total 15/69 and quality 0.1333; always ineligible.
-  The seed is deliberately naive, so the overwrite passes are measured rather
-  than assumed away.
+- v5 reference: 73/73 subcases in five timed pinned-image runs (median 21.40 s);
+  `p2.faults` 7/7 in 10 consecutive runs; all 20 negative controls detected
+  naturally 10/10. The full evidence is under `## locker-v5` in
+  `tasks/locker/CALIBRATION.md`.
+- v5 seed baseline: all 8 P0 subcases pass and the build succeeds. Credit is
+  P1 concurrency 2/5; P2 overwrite 4/4 and perf 1/3. Total 15/73, no-op quality
+  0.0, always ineligible. The seed is deliberately naive; its passing overwrite,
+  concurrency and streaming subcases are measured rather than assumed away.
 - Hardening: a first local model run saturated v1 (39/39). Suite v2 added ten
   multipart/concurrency/parameter subcases; the same binary then scored 40/49
   (quality ≈0.857). A fresh v2 model run adapted and scored 48/49. Suite v3
   added two bounded multipart list/complete/abort races (51 cases); a fresh v3
   run scored 50/51 but hit the then-current 18-minute hard wall cap (now 60
   minutes). Suite v4 adds batch, fault, history and mutant dimensions
-  (69 cases). See `tasks/locker/CALIBRATION.md`.
+  (69 cases). Suite v5 extends operational-failure recovery to post-body
+  commits, batches, multipart completion and part replacement (73 cases). See
+  `tasks/locker/CALIBRATION.md`.
 - Harness: Locker builds `bin/locker`, mounts the workdir read-only for the
   hidden suite, rejects diagnostic/malformed results, scores fixed-denominator
   family fractions and writes `results-locker.csv`, `report-locker.md` and

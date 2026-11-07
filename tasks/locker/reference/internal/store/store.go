@@ -331,16 +331,70 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, declared int64, co
 	digest := md5.New()
 	ew := &errWriter{w: temp}
 	size, err := io.Copy(io.MultiWriter(ew, digest), body)
+	writeErr := ew.err
 	ignoreWrite := s.fault == "ignore-write-error"
 	if ignoreWrite {
 		err = nil
 		ew.err = nil
 	}
-	if ew.err != nil {
+	if writeErr != nil {
+		if s.fault == "ignore-write-error" {
+			// Author-only negative control: acknowledge a body that was not
+			// completely stored. Drop the partial staging data, publish an
+			// empty blob with the declared size and a whole-zero digest, and
+			// return success so the evaluator can reject the torn version.
+			publishSize := declared
+			if publishSize < 0 {
+				publishSize = size
+			}
+			temp.Close()
+			os.Remove(tempName)
+			cleanup = false
+			fakeDigest := md5.New()
+			zeros := make([]byte, 1<<20)
+			for remaining := publishSize; remaining > 0; {
+				n := int64(len(zeros))
+				if remaining < n {
+					n = remaining
+				}
+				fakeDigest.Write(zeros[:int(n)])
+				remaining -= n
+			}
+			empty, err := os.CreateTemp(s.blobDir, "ignored-*")
+			if err != nil {
+				return Object{}, err
+			}
+			emptyName := empty.Name()
+			if err := empty.Close(); err != nil {
+				os.Remove(emptyName)
+				return Object{}, err
+			}
+			name, err := randomName()
+			if err != nil {
+				os.Remove(emptyName)
+				return Object{}, err
+			}
+			if err := os.Rename(emptyName, filepath.Join(s.blobDir, name)); err != nil {
+				os.Remove(emptyName)
+				return Object{}, err
+			}
+			object := Object{
+				Blob:        name,
+				Size:        publishSize,
+				ETag:        quotedMD5(hex.EncodeToString(fakeDigest.Sum(nil))),
+				ContentType: contentType,
+				ModTime:     time.Now().UTC(),
+			}
+			if err := s.commitObject(bucket, key, object); err != nil {
+				s.discardNewBlob(name)
+				return Object{}, err
+			}
+			return object, nil
+		}
 		if s.fault == "leak-temp-on-error" {
 			cleanup = false
 		}
-		return Object{}, ew.err
+		return Object{}, writeErr
 	}
 	if err != nil {
 		return Object{}, ErrIncomplete
@@ -366,6 +420,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, declared int64, co
 		}
 		cleanup = false
 		if err := syncDir(s.blobDir); err != nil {
+			s.discardNewBlob(name)
 			return Object{}, err
 		}
 	}
@@ -397,9 +452,21 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, declared int64, co
 		return object, nil
 	}
 	if err := s.commitObject(bucket, key, object); err != nil {
+		s.discardNewBlob(name)
 		return Object{}, err
 	}
 	return object, nil
+}
+
+// discardNewBlob removes a blob that was just renamed into blobDir but whose
+// publication subsequently failed, so no orphaned immutable blob is left
+// behind. The author-only keep-blob-on-commit-error fault skips the removal
+// so cleanup tests can detect the leak.
+func (s *Store) discardNewBlob(name string) {
+	if s.fault == "keep-blob-on-commit-error" {
+		return
+	}
+	os.Remove(filepath.Join(s.blobDir, name))
 }
 
 func (s *Store) commitObject(bucketName, key string, object Object) error {
@@ -547,6 +614,20 @@ func (s *Store) Batch(bucketName string, ops []BatchOp) error {
 	working := cloneBucket(bucket) // shallow copy of the Objects map
 	now := time.Now().UTC()
 	perOp := s.fault == "per-op-commit"
+	if s.fault == "leak-temp-on-error" {
+		// Simulate a deep-copy batch implementation: stage at least one
+		// referenced source blob into a temp under stageDir before
+		// applying the batch. A write error during staging leaks the temp
+		// exactly like the put/part leak-temp-on-error behavior; every
+		// other outcome cleans it up.
+		staged, err := s.stageBatchSource(bucket, ops)
+		if err != nil {
+			return err
+		}
+		if staged != "" {
+			defer os.Remove(staged)
+		}
+	}
 	for _, op := range ops {
 		switch op.Kind {
 		case "copy", "rename":
@@ -585,11 +666,64 @@ func (s *Store) Batch(bucketName string, ops []BatchOp) error {
 	buckets := cloneBuckets(s.snapshot.Buckets)
 	buckets[bucketName] = working
 	next := Manifest{Buckets: buckets}
+	if s.fault == "batch-presave-effect" {
+		// Expose the working bucket before persisting: if the save then
+		// fails (as under ENOSPC), in-memory state shows partial effects.
+		s.snapshot = next
+	}
 	if err := s.saveLocked(&next); err != nil {
 		return err
 	}
 	s.snapshot = next
 	return nil
+}
+
+// stageBatchSource copies the first referenced source blob of a batch into a
+// temp file under stageDir, mimicking the staging step of a deep-copy batch
+// implementation. It returns the temp path, or "" when no referenced source
+// exists. A copy/write error leaves the partial temp behind and is returned;
+// sync/close errors remove the temp before returning.
+func (s *Store) stageBatchSource(bucket Bucket, ops []BatchOp) (string, error) {
+	for _, op := range ops {
+		if op.Kind != "copy" && op.Kind != "rename" {
+			continue
+		}
+		src, ok := bucket.Objects[op.Source]
+		if !ok {
+			continue
+		}
+		source, err := os.Open(filepath.Join(s.blobDir, src.Blob))
+		if err != nil {
+			return "", err
+		}
+		temp, err := os.CreateTemp(s.stageDir, "batch-*")
+		if err != nil {
+			source.Close()
+			return "", err
+		}
+		tempName := temp.Name()
+		ew := &errWriter{w: temp}
+		_, copyErr := io.Copy(ew, source)
+		source.Close()
+		if ew.err != nil || copyErr != nil {
+			temp.Close()
+			if ew.err != nil {
+				return tempName, ew.err
+			}
+			return tempName, copyErr
+		}
+		if err := temp.Sync(); err != nil {
+			temp.Close()
+			os.Remove(tempName)
+			return "", err
+		}
+		if err := temp.Close(); err != nil {
+			os.Remove(tempName)
+			return "", err
+		}
+		return tempName, nil
+	}
+	return "", nil
 }
 
 // batchCheckThenAct is an author-only mutant: it evaluates every precondition
@@ -824,9 +958,26 @@ func (s *Store) Complete(bucket, key, id string, requested []CompletionPart) (Ob
 	}
 	sort.Ints(numbers)
 
+	// fail wraps every error returned after validation has passed and
+	// staging has begun. Under the author-only
+	// consume-upload-on-complete-error fault the failed completion consumes
+	// the upload session, simulating session loss on an operational failure.
+	fail := func(err error) (Object, error) {
+		if s.fault == "consume-upload-on-complete-error" {
+			upload.Dead = true
+			s.mu.Lock()
+			if s.uploads[id] == upload {
+				delete(s.uploads, id)
+			}
+			s.mu.Unlock()
+			os.RemoveAll(upload.Dir)
+		}
+		return Object{}, err
+	}
+
 	temp, err := os.CreateTemp(s.stageDir, "complete-*")
 	if err != nil {
-		return Object{}, err
+		return fail(err)
 	}
 	tempName := temp.Name()
 	cleanup := true
@@ -843,34 +994,35 @@ func (s *Store) Complete(bucket, key, id string, requested []CompletionPart) (Ob
 		part := upload.Parts[number]
 		file, err := os.Open(part.Blob)
 		if err != nil {
-			return Object{}, err
+			return fail(err)
 		}
 		written, copyErr := io.Copy(io.MultiWriter(ew, digest), file)
 		file.Close()
 		if ew.err != nil {
-			return Object{}, ew.err
+			return fail(ew.err)
 		}
 		if copyErr != nil {
-			return Object{}, copyErr
+			return fail(copyErr)
 		}
 		size += written
 	}
 	if err := temp.Sync(); err != nil {
-		return Object{}, err
+		return fail(err)
 	}
 	if err := temp.Close(); err != nil {
-		return Object{}, err
+		return fail(err)
 	}
 	name, err := randomName()
 	if err != nil {
-		return Object{}, err
+		return fail(err)
 	}
 	if err := os.Rename(tempName, filepath.Join(s.blobDir, name)); err != nil {
-		return Object{}, err
+		return fail(err)
 	}
 	cleanup = false
 	if err := syncDir(s.blobDir); err != nil {
-		return Object{}, err
+		s.discardNewBlob(name)
+		return fail(err)
 	}
 	object := Object{
 		Blob:        name,
@@ -880,7 +1032,8 @@ func (s *Store) Complete(bucket, key, id string, requested []CompletionPart) (Ob
 		ModTime:     time.Now().UTC(),
 	}
 	if err := s.commitObject(bucket, key, object); err != nil {
-		return Object{}, err
+		s.discardNewBlob(name)
+		return fail(err)
 	}
 
 	upload.Dead = true
@@ -998,7 +1151,11 @@ func knownFault(name string) bool {
 		"phantom-part",
 		"stale-snapshot-clone",
 		"metadata-before-blob",
-		"metadata-before-blob-amp":
+		"metadata-before-blob-amp",
+		"keep-blob-on-commit-error",
+		"batch-presave-effect",
+		"consume-upload-on-complete-error",
+		"wrong-op-status":
 		return true
 	}
 	return false

@@ -60,7 +60,8 @@ Scored behavior covers four surfaces in one product: CLI↔HTTP↔storage
 integration, ordinary HTTP object operations, protocol interactions (range,
 conditional, multipart, listing, same-bucket batch operations), and storage
 behavior (coherent publication, concurrency, restart recovery, key isolation,
-streaming memory, behavior when the data filesystem is full). The tests use
+streaming memory, and operational failures during ordinary, multipart and batch
+publication on a full data filesystem). The tests use
 small fixtures for most cases, one streaming 128 MiB object, and a small data
 filesystem for the full-disk cases. Some tests replay generated sequences of
 ordinary operations and compare every response against the documented
@@ -246,7 +247,10 @@ other values return 400.
   upload session unchanged; release the temporary space the failed write
   consumed so that later writes which fit can succeed; keep serving other
   requests; and after a restart load the committed state. Never acknowledge a
-  write whose bytes were not completely stored.
+  write whose bytes were not completely stored. These rules apply to multipart
+  completion and batch publication as well as ordinary writes: a failed
+  completion leaves its upload session and every other session unchanged, and
+  a failed batch leaves every key and upload session unchanged.
 - On restart, load the committed state. A genuinely new directory starts empty.
   A malformed existing manifest or missing referenced data is an explicit
   startup error; do not silently initialize a fresh store over damaged state.

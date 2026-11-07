@@ -1,8 +1,8 @@
 # Locker implementation and evaluator validation
 
-Status: `locker-v4` is implemented and frozen (see `## locker-v4` below); the
-earlier sections are the v3 history. Paid model calibration is still pending.
-This file is not visible to candidates.
+Status: `locker-v5` is implemented and locally validated (see `## locker-v5`
+below); `## locker-v4` and the earlier sections are historical. Paid model
+calibration is still pending. This file is not visible to candidates.
 
 ## Frozen inputs
 
@@ -399,5 +399,87 @@ deviations from HARD-TASK-V4-PLAN.md: the flake-gate family list names
 `p2.crash`, which does not exist in the v4 catalog; the gate was run over
 `p2.overwrite` and `p2.multipart` (the two crash families) in its place.
 
-open questions: none. Suite is frozen; the only remaining measurement is the
-user's rerun of the saturating local model.
+open questions: none. Suite v4 is frozen; the v5 extension is recorded below.
+
+## locker-v5
+
+Catalog changed from 69 to 73 subcases by extending `p2.faults`; v4 and v5
+results are not comparable. The public prompt now states explicitly that the
+operational-failure rules apply to multipart completion and batch publication:
+failed completion leaves its session (and other sessions) unchanged, and a
+failed batch leaves every key and session unchanged. No resource limit or API
+surface changed.
+
+### Reference and evaluator changes
+
+- `PutObject` and multipart `Complete` now remove a newly renamed immutable
+  blob if post-rename directory sync or manifest commitment fails. The v4
+  reference leaked that blob, so a later fitting write could incorrectly fail
+  with `ENOSPC`.
+- The strict operational-response helper now accepts only a closed connection
+  or exactly 500 with `<Error><Code>InternalError</Code>`; arbitrary 5xx
+  responses no longer satisfy the fault family.
+- New black-box cases:
+  - `put-commit-cleanup`: body staging fits, a large manifest commit does not;
+    old state must survive restart and a fitting write must succeed without
+    first relieving pressure.
+  - `batch-operational-rollback`: both staged-copy failure and manifest-commit
+    failure must leave zero partial effects, preserve live uploads, clean
+    staged data, and recover committed state across restart.
+  - `multipart-completion-operational`: assembly failure, post-assembly commit
+    failure, same-session retry after operational failure, sentinel-session
+    isolation, cleanup, and immediate-restart recovery.
+  - `part-replacement-preserves-old`: an oversized replacement of an existing
+    part must preserve that part's ETag, size and bytes.
+- Harness-owned spacer files outside `--data` create deterministic pressure;
+  the suite never inspects candidate data layout.
+- The private `ignore-write-error` control was corrected to model its intended
+  defect: it now publishes a declared-size, zero-byte-backed version after a
+  storage-write error. Previously it usually failed the subsequent manifest
+  commit, making the control vacuous.
+
+commands run:
+
+```bash
+python3 -m py_compile bench.py tasks/locker/tests/*.py
+python3 -m unittest discover -s tests
+python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'
+./bench.py check
+cd tasks/locker/reference && go vet ./... && go test ./... \
+  && go build -trimpath -o bin/locker ./cmd/locker
+# Linux build and all suite/control runs in opencode-bench-locker:latest,
+# --network none and --tmpfs /scratch:rw,size=33554432
+```
+
+results:
+
+- Static: harness tests 18/18; oracle/state-model tests 19/19;
+  `./bench.py check` passes (16 families, 73 subcases, suite `locker-v5`, 58
+  scored subcases).
+- Reference: `go vet`, `go test`, local/race-enabled tests and the pinned-image
+  Linux build pass.
+- Five timed full reference runs in the pinned image: 73/73 each,
+  `diagnostic: false`; wall times 21.40, 21.40, 35.51, 24.74 and 21.34 s;
+  median **21.40 s** (frozen limit 90 s).
+- `p2.faults`: 7/7 in 10 consecutive diagnostic runs.
+- Negative controls: 20/20 detected naturally 10/10; both amplified controls
+  10/10; 0 missed, 0 errors, 0 skipped.
+- Seed baseline regenerated from the untouched seed in the pinned image:
+  15/73 subcases (P0 8/8; P1 concurrency 2/5; P2 overwrite 4/4 and perf 1/3).
+  Every new fault subcase fails, no-op quality is **0.0**, and the seed is
+  ineligible.
+- Harness end-to-end: `./bench.py rescore` on the v3-era local-model workdir
+  completed with the v5 suite at 38/65 challenge subcases, scored 31/58,
+  quality **0.60**, gate pass, not eligible.
+
+prompt clarifications: the operational-failure paragraph now names multipart
+completion and batch publication explicitly; that text is the only public
+contract addition.
+
+deviations from the v5 implementation plan: none. The post-assembly multipart
+phase deletes its temporary filler keys through valid batches before retrying
+completion so the same controlled scratch filesystem can accommodate the
+successful retry.
+
+open questions: none. Remaining work is paid model calibration, not evaluator
+construction.

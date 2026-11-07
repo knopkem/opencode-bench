@@ -283,7 +283,7 @@ class LockerScoringTests(unittest.TestCase):
         # p2.overwrite is saturated by the seed and is a gate, not a scored family.
         self.assertEqual(score["counts"]["P2"]["total"], 5)
         self.assertAlmostEqual(score["quality"], (11 + 0.75) / 12, places=6)
-        self.assertEqual(score["headroom"]["total"], 55)
+        self.assertEqual(score["headroom"]["total"], 58)
         self.assertEqual(score["fatal"], 0)
         self.assertTrue(score["eligible"])
 
@@ -293,11 +293,11 @@ class LockerScoringTests(unittest.TestCase):
             baseline, {"build_ok": True}, goal="quality", manifest=self.manifest
         )
         self.assertAlmostEqual(score["quality"], 0.0, places=6)
-        self.assertEqual(score["headroom"], {"pass": 0, "total": 55})
+        self.assertEqual(score["headroom"], {"pass": 0, "total": 58})
         self.assertEqual(score["regressions"], 0)
         self.assertTrue(score["gate_ok"])
         self.assertFalse(score["eligible"])
-        self.assertEqual(score["subcases"], {"pass": 6, "total": 61})
+        self.assertEqual(score["subcases"], {"pass": 7, "total": 65})
 
     def test_saturated_family_is_a_gate(self) -> None:
         tests = self.all_pass()
@@ -326,7 +326,7 @@ class LockerScoringTests(unittest.TestCase):
         passed = sum(
             1 for cases in baseline.values() for ok in cases.values() if ok
         )
-        self.assertEqual(passed, 14)
+        self.assertEqual(passed, 15)
 
     def test_seed_baseline_rejects_missing_case(self) -> None:
         data = json.loads(bench.SEED_BASELINE_PATH.read_text(encoding="utf-8"))

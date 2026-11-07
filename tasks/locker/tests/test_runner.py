@@ -7,6 +7,7 @@ only and never imports candidate or reference packages.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -2723,11 +2724,11 @@ def oversized_put(
     path: str,
     total: int,
     content_type: str = "application/octet-stream",
-) -> tuple[int | None, str]:
+) -> tuple[Response | None, str]:
     """Stream `total` bytes with a declared length over a raw socket.
 
-    Returns (status, detail); status is None when the connection was reset or
-    closed before a status line.
+    Returns (response, detail); the response is None when the connection was
+    reset or closed before a complete status line.
     """
     sock = socket.create_connection(("127.0.0.1", port), timeout=60)
     try:
@@ -2746,18 +2747,33 @@ def oversized_put(
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass
         try:
-            status, _headers, _body = h.read_raw_response(sock, time.monotonic() + 60)
-            return status, f"status {status} after {sent} bytes"
+            status, headers, body = h.read_raw_response(sock, time.monotonic() + 60)
+            return Response(status, headers, body), f"status {status} after {sent} bytes"
         except (ConnectionError, OSError, CaseFailure) as exc:
             return None, f"no status after {sent} bytes: {exc}"
     finally:
         sock.close()
 
 
-def check_failed_cleanly(status: int | None, detail: str, label: str) -> None:
+def check_failed_cleanly(response: Response | None, detail: str, label: str) -> None:
+    """An operation under storage pressure must fail operationally: either the
+    connection closes without a response, or the server answers exactly 500
+    with a parseable <Error><Code>InternalError</Code> body. Any other status
+    or body is rejected."""
+    if response is None:
+        return
     check(
-        status is None or status >= 500,
-        f"{label}: oversized write must fail with 5xx or a closed connection, got {detail}",
+        response.status == 500,
+        f"{label}: expected a closed connection or exactly 500 InternalError, "
+        f"got {detail}: {response.body[:160]!r}",
+    )
+    try:
+        root = h.parse_xml(response.body)
+    except CaseFailure:
+        fail(f"{label}: error body is not parseable XML: {response.body[:200]!r}")
+    check(
+        root.tag == "Error" and h.text(root, "Code") == "InternalError",
+        f"{label}: expected <Error><Code>InternalError</Code>, got {response.body[:200]!r}",
     )
 
 
@@ -2777,6 +2793,119 @@ def put_expect(
     return expect(response, 200, label)
 
 
+# ---------------------------------------------------------------------------
+# WP5: p2.faults (locker-v5 operational-failure recovery)
+
+
+def _free_bytes(server: h.Server) -> int:
+    stats = os.statvfs(server.root)
+    return stats.f_bavail * stats.f_frsize
+
+
+def _consume_free_space(server: h.Server, target_free: int, label: str) -> str:
+    """Grow a harness-owned spacer file (outside server.data, on the scratch
+    filesystem) until at most target_free bytes are free.
+
+    Real bytes are written and the fill advances in whole filesystem blocks,
+    so block-size rounding cannot leave the target unattainable.
+    """
+    path = os.path.join(server.root, ".harness-spacer")
+    block = max(int(os.statvfs(server.root).f_bsize), 4096)
+    with open(path, "ab") as handle:
+        while True:
+            deficit = _free_bytes(server) - target_free
+            if deficit <= 0:
+                break
+            try:
+                handle.write(bytes(min(block * 8, deficit)))
+            except OSError:
+                break
+    free = _free_bytes(server)
+    check(free <= target_free, f"{label}: free space {free} still above target {target_free}")
+    return path
+
+
+def _release_spacer(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _fan_out_copies(port: int, bucket: str, source: str, prefix: str, count: int) -> None:
+    """Create `count` tiny copies of `source` through valid 32-op batches so
+    the manifest becomes much larger than any small reserved free tail."""
+    for offset in range(0, count, 32):
+        ops = [
+            ("copy", source, f"{prefix}{index:04d}", None)
+            for index in range(offset, min(offset + 32, count))
+        ]
+        expect(batch(port, bucket, ops), 200, f"fan-out batch at {offset}")
+
+
+def _fan_out_deletes(port: int, bucket: str, prefix: str, count: int) -> None:
+    """Remove the keys created by `_fan_out_copies` so a later retry no longer
+    needs the large manifest that forced the commit failure."""
+    for offset in range(0, count, 32):
+        ops = [
+            ("delete", f"{prefix}{index:04d}", None)
+            for index in range(offset, min(offset + 32, count))
+        ]
+        expect(batch(port, bucket, ops), 200, f"fan-out delete at {offset}")
+
+
+def _fault_request(
+    port: int, method: str, path: str, body: bytes | None = None
+) -> Response | None:
+    """One request where a closed connection without a response is an allowed
+    operational-failure signal and maps to None."""
+    try:
+        return h.request(
+            port,
+            method,
+            path,
+            body=body,
+            headers={"Content-Type": "application/xml"},
+        )
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+def _fault_batch(port: int, bucket: str, ops: list[BatchOp]) -> Response | None:
+    return _fault_request(
+        port, "POST", h.bucket_path(bucket) + "?batch", batch_xml(ops)
+    )
+
+
+def _fault_complete(
+    port: int, bucket: str, key: str, upload_id: str, parts: list[tuple[int, str]]
+) -> Response | None:
+    return _fault_request(
+        port, "POST", multipart_path(bucket, key, upload_id), completion_xml(parts)
+    )
+
+
+def _key_state(
+    port: int, bucket: str, keys: list[str]
+) -> dict[str, tuple[bytes, str, str]]:
+    """Snapshot (body, etag, content-type) for the keys that currently exist."""
+    state = {}
+    for key in keys:
+        response = h.get_object(port, bucket, key)
+        if response.status == 404:
+            continue
+        expect(response, 200, f"snapshot GET {key}")
+        state[key] = (response.body, response.header("etag"), response.header("content-type"))
+    return state
+
+
+def _check_key_state(
+    port: int, bucket: str, state: dict[str, tuple[bytes, str, str]], label: str
+) -> None:
+    for key, (body, etag, content_type) in state.items():
+        expect_present(port, bucket, key, body, etag, content_type, f"{label}: {key}")
+
+
 def p2_faults_put_preserves_old(binary: str, limits: Limits) -> None:
     server = _scratch_server(binary, limits)
     try:
@@ -2787,10 +2916,10 @@ def p2_faults_put_preserves_old(binary: str, limits: Limits) -> None:
         etag = h.md5_etag(old)
         expect(h.put_object(port, "fx", "k", old, "text/x-old"), 200, "put old k")
 
-        status, detail = oversized_put(
+        response, detail = oversized_put(
             port, h.object_path("fx", "k"), int(limits["fault_write_bytes"]), "text/x-new"
         )
-        check_failed_cleanly(status, detail, "put-preserves-old")
+        check_failed_cleanly(response, detail, "put-preserves-old")
 
         expect_present(port, "fx", "k", old, etag, "text/x-old", "old k after failed write")
         head = expect(h.head_object(port, "fx", "k"), 200, "HEAD k after failed write")
@@ -2825,12 +2954,12 @@ def p2_faults_space_released(binary: str, limits: Limits) -> None:
 
         for round_index, fill_key in enumerate(("fill", "fill2")):
             for attempt in range(2):
-                status, detail = oversized_put(
+                response, detail = oversized_put(
                     port,
                     h.object_path("fx", "big"),
                     int(limits["fault_write_bytes"]),
                 )
-                check_failed_cleanly(status, detail, f"round {round_index} attempt {attempt}")
+                check_failed_cleanly(response, detail, f"round {round_index} attempt {attempt}")
                 expect(h.get_object(port, "fx", "big"), 404, f"big after failed write {attempt}")
             response = put_expect(
                 port, "fx", fill_key, small, "application/octet-stream", f"8 MiB PUT {fill_key}"
@@ -2860,12 +2989,12 @@ def p2_faults_multipart_staging(binary: str, limits: Limits) -> None:
         uid = initiate(port, "fx", "mp", "application/x-mp")
         e1 = upload_part(port, "fx", "mp", uid, 1, b"part-one")
 
-        status, detail = oversized_put(
+        response, detail = oversized_put(
             port,
             multipart_path("fx", "mp", uid, 2),
             int(limits["fault_write_bytes"]),
         )
-        check_failed_cleanly(status, detail, "multipart-staging")
+        check_failed_cleanly(response, detail, "multipart-staging")
 
         parts = list_parts(port, "fx", "mp", uid)
         check(
@@ -2897,10 +3026,412 @@ def p2_faults_multipart_staging(binary: str, limits: Limits) -> None:
         server.close()
 
 
+def p2_faults_put_commit_cleanup(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        old = _fault_body(64 * 1024, seed=23)
+        old_etag = h.md5_etag(old)
+        expect(h.put_object(port, "fx", "k", old, "text/x-old"), 200, "put old k")
+        base = b"filler-value"
+        expect(h.put_object(port, "fx", "f/base", base, "text/plain"), 200, "put filler base")
+        _fan_out_copies(port, "fx", "f/base", "f/", 2000)
+
+        def check_fillers(label: str) -> None:
+            contents, _prefixes = h.collect_listing(port, "fx", prefix="f/")
+            check(len(contents) == 2001, f"{label}: filler count {len(contents)} != 2001")
+            for key in ("f/base", "f/0000", "f/1999"):
+                expect_present(
+                    port, "fx", key, base, h.md5_etag(base), "text/plain", f"{label}: {key}"
+                )
+
+        check_fillers("setup")
+        # The 4 MiB body fits staging; the ~2000-key manifest rewrite cannot
+        # fit in the 128 KiB tail that remains.
+        _consume_free_space(server, 4 * 1024 * 1024 + 128 * 1024, "put-commit-cleanup")
+        response, detail = oversized_put(port, h.object_path("fx", "k"), 4 * 1024 * 1024, "text/x-new")
+        if response is not None and response.status == 200:
+            # Full success is an allowed branch; the failure-only cleanup
+            # assertions below do not apply.
+            expected = bytes(4 * 1024 * 1024)
+            expect_present(
+                port, "fx", "k", expected, h.md5_etag(expected), "text/x-new", "committed k"
+            )
+            contents, _prefixes = h.collect_listing(port, "fx", prefix="k")
+            check(contents == [("k", len(expected), h.md5_etag(expected))], "listing after success")
+            expect(h.request(port, "GET", "/health"), 200, "health after success")
+            put_expect(port, "fx", "ok", b"ok", "text/plain", "small write after success")
+            return
+        check_failed_cleanly(response, detail, "put-commit-cleanup")
+
+        expect_present(port, "fx", "k", old, old_etag, "text/x-old", "old k after failed commit")
+        contents, _prefixes = h.collect_listing(port, "fx", prefix="k")
+        check(contents == [("k", len(old), old_etag)], "listing after failed commit")
+        check_fillers("after failed commit")
+        expect(h.request(port, "GET", "/health"), 200, "health after failed commit")
+
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(port, "fx", "k", old, old_etag, "text/x-old", "old k after restart")
+        check_fillers("after restart")
+
+        # While the spacer remains a fitting write must succeed; an
+        # implementation that leaked the renamed staged blob runs out of space.
+        fit = _fault_body(1536 * 1024, seed=31)
+        put_expect(port, "fx", "fit", fit, "application/octet-stream", "fitting write")
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(
+            port, "fx", "fit", fit, h.md5_etag(fit), "application/octet-stream", "fit after restart"
+        )
+        expect_present(port, "fx", "k", old, old_etag, "text/x-old", "old k after final restart")
+    finally:
+        server.close()
+
+
+def p2_faults_batch_operational_rollback(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        large = _fault_body(6 * 1024 * 1024, seed=41)
+        large_etag = h.md5_etag(large)
+        small = {
+            "replace": (b"replace-original", "text/plain"),
+            "move": (b"move-body", "text/plain"),
+            "remove": (b"remove-body", "text/plain"),
+        }
+        expect(h.put_object(port, "fx", "src", large, "application/octet-stream"), 200, "put src")
+        for key, (body, content_type) in small.items():
+            expect(h.put_object(port, "fx", key, body, content_type), 200, f"put {key}")
+        live_id = initiate(port, "fx", "live", "application/x-live")
+        upload_part(port, "fx", "live", live_id, 1, b"live-part-one")
+        live_parts = list_parts(port, "fx", "live", live_id)
+        expect(h.put_object(port, "fx", "f/base", b"filler", "text/plain"), 200, "put filler base")
+        _fan_out_copies(port, "fx", "f/base", "f/", 2000)
+
+        selected = ["src", "replace", "move", "moved", "remove", "copy-target", "fit"]
+        # Trial 1: a metadata-only implementation commits this batch, one that
+        # stages copy data may fail operationally; both branches must be clean.
+        spacer = _consume_free_space(server, 3 * 1024 * 1024, "batch trial 1")
+        before = _key_state(port, "fx", selected)
+        ops = [
+            ("copy", "src", "replace", None),
+            ("rename", "move", "moved", None),
+            ("delete", "remove", None),
+            ("copy", "src", "copy-target", None),
+        ]
+        response = _fault_batch(port, "fx", ops)
+        acknowledged = response is not None and response.status == 200
+        if acknowledged:
+            effects = {
+                "src": (large, large_etag, "application/octet-stream"),
+                "replace": (large, large_etag, "application/octet-stream"),
+                "copy-target": (large, large_etag, "application/octet-stream"),
+                "moved": (small["move"][0], h.md5_etag(small["move"][0]), "text/plain"),
+            }
+            _check_key_state(port, "fx", effects, "trial 1: effects")
+            expect_absent(port, "fx", "move", "remove", label="trial 1: effects")
+        else:
+            check_failed_cleanly(
+                response,
+                f"batch status {response.status if response is not None else 'closed'}",
+                "batch-operational-rollback trial 1",
+            )
+            _check_key_state(port, "fx", before, "trial 1: partial effect")
+            expect_absent(port, "fx", "moved", "copy-target", label="trial 1: partial effect")
+        check(list_parts(port, "fx", "live", live_id) == live_parts, "trial 1: live upload changed")
+        expect(h.request(port, "GET", "/health"), 200, "trial 1: health")
+        server.restart()
+        port = server.port
+        assert port is not None
+        if acknowledged:
+            _check_key_state(port, "fx", effects, "trial 1: effects after restart")
+            expect_absent(port, "fx", "move", "remove", label="trial 1: effects after restart")
+        else:
+            _check_key_state(port, "fx", before, "trial 1: state after restart")
+            expect_absent(port, "fx", "moved", "copy-target", label="trial 1: state after restart")
+        # A fitting write while the spacer remains catches staged copy data
+        # leaked by a failed batch.
+        fit = _fault_body(1024 * 1024, seed=43)
+        put_expect(port, "fx", "fit", fit, "application/octet-stream", "trial 1: fitting write")
+
+        # Trial 2: only ~16 KiB free, so the manifest rewrite itself must fail
+        # and nothing may be half-applied.
+        live2_id = initiate(port, "fx", "live2", "application/x-live2")
+        upload_part(port, "fx", "live2", live2_id, 1, b"live2-part")
+        live2_parts = list_parts(port, "fx", "live2", live2_id)
+        before = _key_state(port, "fx", selected)
+        spacer = _consume_free_space(server, 16 * 1024, "batch trial 2")
+        ops = [
+            ("rename", "fit", "fit2", None),
+            ("delete", "src", None),
+            ("copy", "replace", "copied2", None),
+        ]
+        response = _fault_batch(port, "fx", ops)
+        check_failed_cleanly(
+            response,
+            f"batch status {response.status if response is not None else 'closed'}",
+            "batch-operational-rollback trial 2",
+        )
+        _check_key_state(port, "fx", before, "trial 2: partial effect")
+        expect_absent(port, "fx", "fit2", "copied2", label="trial 2: partial effect")
+        check(list_parts(port, "fx", "live2", live2_id) == live2_parts, "trial 2: live upload changed")
+        expect(h.request(port, "GET", "/health"), 200, "trial 2: health")
+        server.restart()
+        port = server.port
+        assert port is not None
+        _check_key_state(port, "fx", before, "trial 2: state after restart")
+        expect_absent(port, "fx", "fit2", "copied2", label="trial 2: state after restart")
+        _release_spacer(spacer)
+        response = _fault_batch(port, "fx", ops)
+        check(response is not None, "trial 2 retry: no response after spacer release")
+        expect(response, 200, "trial 2 retry")
+        expected = dict(before)
+        expected["fit2"] = expected.pop("fit")
+        expected.pop("src")
+        expected["copied2"] = expected["replace"]
+        _check_key_state(port, "fx", expected, "trial 2 retry: effects")
+        expect_absent(port, "fx", "fit", "src", label="trial 2 retry: effects")
+        server.restart()
+        port = server.port
+        assert port is not None
+        _check_key_state(port, "fx", expected, "trial 2 retry: effects after restart")
+        expect_absent(port, "fx", "fit", "src", label="trial 2 retry: effects after restart")
+    finally:
+        server.close()
+
+
+def p2_faults_multipart_completion_operational(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        old = _fault_body(64 * 1024, seed=47)
+        old_etag = h.md5_etag(old)
+        expect(h.put_object(port, "fx", "mp", old, "application/x-old"), 200, "put old mp")
+        body = h.DeterministicBody(10 * 1024 * 1024, seed=53)
+        part1 = body.slice(0, 6 * 1024 * 1024)
+        part2 = body.slice(6 * 1024 * 1024, 10 * 1024 * 1024)
+        target_id = initiate(port, "fx", "mp", "application/x-mp")
+        etag1 = upload_part(port, "fx", "mp", target_id, 1, part1)
+        etag2 = upload_part(port, "fx", "mp", target_id, 2, part2)
+        sentinel_id = initiate(port, "fx", "sen", "application/x-sen")
+        sentinel_part = b"sentinel-part-one"
+        sentinel_etag = upload_part(port, "fx", "sen", sentinel_id, 1, sentinel_part)
+        target_parts = list_parts(port, "fx", "mp", target_id)
+        sentinel_parts = list_parts(port, "fx", "sen", sentinel_id)
+        assembled = b"".join(body.chunks())
+
+        # With ~4 MiB free the ~10 MiB assembly cannot be written.
+        spacer = _consume_free_space(server, 4 * 1024 * 1024, "multipart completion")
+        parts = [(1, etag1), (2, etag2)]
+        response = _fault_complete(port, "fx", "mp", target_id, parts)
+        if response is not None and response.status == 200:
+            # Allowed only when the completed object is fully correct.
+            expect_present(
+                port, "fx", "mp", assembled, h.md5_etag(assembled), "application/x-mp", "completed mp"
+            )
+            return
+        check_failed_cleanly(
+            response,
+            f"completion status {response.status if response is not None else 'closed'}",
+            "multipart-completion-operational",
+        )
+
+        expect_present(port, "fx", "mp", old, old_etag, "application/x-old", "old mp after failure")
+        check(
+            list_parts(port, "fx", "mp", target_id) == target_parts,
+            "failed completion changed the target parts",
+        )
+        check(
+            list_parts(port, "fx", "sen", sentinel_id) == sentinel_parts,
+            "failed completion changed the sentinel parts",
+        )
+        expect(h.request(port, "GET", "/health"), 200, "health after failed completion")
+        # A fitting write while pressure remains catches a leaked assembled
+        # temporary file.
+        fit = _fault_body(2 * 1024 * 1024, seed=59)
+        put_expect(port, "fx", "fit", fit, "application/octet-stream", "fitting write")
+
+        _release_spacer(spacer)
+        retry = _fault_complete(port, "fx", "mp", target_id, parts)
+        check(retry is not None, "retry completion produced no response")
+        expect(retry, 200, "retry completion")
+        expect_present(
+            port, "fx", "mp", assembled, h.md5_etag(assembled), "application/x-mp", "assembled mp"
+        )
+        done = _fault_complete(port, "fx", "sen", sentinel_id, [(1, sentinel_etag)])
+        check(done is not None, "sentinel completion produced no response")
+        expect(done, 200, "sentinel completion")
+        expect_present(
+            port, "fx", "sen", sentinel_part, h.md5_etag(sentinel_part), "application/x-sen",
+            "assembled sen",
+        )
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(
+            port, "fx", "mp", assembled, h.md5_etag(assembled), "application/x-mp", "mp after restart"
+        )
+        expect_present(
+            port, "fx", "sen", sentinel_part, h.md5_etag(sentinel_part), "application/x-sen",
+            "sen after restart",
+        )
+
+        # Second phase: the same pressure against a second key, with an
+        # immediate restart that must preserve the old published state.
+        old2 = _fault_body(32 * 1024, seed=61)
+        old2_etag = h.md5_etag(old2)
+        expect(h.put_object(port, "fx", "mp2", old2, "text/x-old2"), 200, "put old mp2")
+        body2 = h.DeterministicBody(10 * 1024 * 1024, seed=67)
+        second_id = initiate(port, "fx", "mp2", "application/x-mp2")
+        etag_a = upload_part(port, "fx", "mp2", second_id, 1, body2.slice(0, 6 * 1024 * 1024))
+        etag_b = upload_part(
+            port, "fx", "mp2", second_id, 2, body2.slice(6 * 1024 * 1024, 10 * 1024 * 1024)
+        )
+        spacer2 = _consume_free_space(server, 4 * 1024 * 1024, "multipart completion mp2")
+        response = _fault_complete(port, "fx", "mp2", second_id, [(1, etag_a), (2, etag_b)])
+        if response is not None and response.status == 200:
+            assembled2 = b"".join(body2.chunks())
+            expect_present(
+                port, "fx", "mp2", assembled2, h.md5_etag(assembled2), "application/x-mp2",
+                "completed mp2",
+            )
+            return
+        check_failed_cleanly(
+            response,
+            f"completion status {response.status if response is not None else 'closed'}",
+            "multipart-completion-operational mp2",
+        )
+        expect_present(port, "fx", "mp2", old2, old2_etag, "text/x-old2", "old mp2 after failure")
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(port, "fx", "mp2", old2, old2_etag, "text/x-old2", "old mp2 after restart")
+        _release_spacer(spacer2)
+
+        # Third phase: the assembled 4 MiB body fits, but the large manifest
+        # rewrite after blob publication does not. This targets cleanup of a
+        # fully assembled blob when metadata commitment fails.
+        old3 = _fault_body(32 * 1024, seed=79)
+        old3_etag = h.md5_etag(old3)
+        expect(h.put_object(port, "fx", "mp3", old3, "text/x-old3"), 200, "put old mp3")
+        expect(h.put_object(port, "fx", "f/base", b"filler", "text/plain"), 200, "put mp3 filler base")
+        _fan_out_copies(port, "fx", "f/base", "f/", 4000)
+        body3 = h.DeterministicBody(4 * 1024 * 1024, seed=83)
+        third_id = initiate(port, "fx", "mp3", "application/x-mp3")
+        etag_3a = upload_part(port, "fx", "mp3", third_id, 1, body3.slice(0, 3 * 1024 * 1024))
+        etag_3b = upload_part(
+            port, "fx", "mp3", third_id, 2, body3.slice(3 * 1024 * 1024, 4 * 1024 * 1024)
+        )
+        third_parts = list_parts(port, "fx", "mp3", third_id)
+        spacer3 = _consume_free_space(
+            server, 4 * 1024 * 1024 + 256 * 1024, "multipart commit mp3"
+        )
+        free_before = _free_bytes(server)
+        response = _fault_complete(port, "fx", "mp3", third_id, [(1, etag_3a), (2, etag_3b)])
+        assembled3 = b"".join(body3.chunks())
+        if response is not None and response.status == 200:
+            expect_present(
+                port, "fx", "mp3", assembled3, h.md5_etag(assembled3), "application/x-mp3",
+                "completed mp3",
+            )
+            return
+        check_failed_cleanly(
+            response,
+            f"completion status {response.status if response is not None else 'closed'}",
+            "multipart-completion-operational mp3 commit",
+        )
+        expect_present(port, "fx", "mp3", old3, old3_etag, "text/x-old3", "old mp3 after commit failure")
+        check(
+            list_parts(port, "fx", "mp3", third_id) == third_parts,
+            "failed commit changed the mp3 parts",
+        )
+        free_after = _free_bytes(server)
+        check(
+            free_after >= free_before - 256 * 1024,
+            f"failed commit leaked assembled space: free before {free_before}, after {free_after}",
+        )
+        # Shrink the manifest again so the same upload can be retried without
+        # first removing the controlled spacer.
+        _fan_out_deletes(port, "fx", "f/", 4000)
+        contents, _prefixes = h.collect_listing(port, "fx", prefix="f/")
+        check(contents == [("f/base", 6, h.md5_etag(b"filler"))], f"mp3 filler cleanup: {contents}")
+        _release_spacer(spacer3)
+        retry3 = _fault_complete(port, "fx", "mp3", third_id, [(1, etag_3a), (2, etag_3b)])
+        check(retry3 is not None, "mp3 retry completion produced no response")
+        expect(retry3, 200, "mp3 retry completion")
+        expect_present(
+            port, "fx", "mp3", assembled3, h.md5_etag(assembled3), "application/x-mp3", "assembled mp3"
+        )
+    finally:
+        server.close()
+
+
+def p2_faults_part_replacement_preserves_old(binary: str, limits: Limits) -> None:
+    server = _scratch_server(binary, limits)
+    try:
+        port = server.port
+        assert port is not None
+        make_buckets(port, "fx")
+        upload_id = initiate(port, "fx", "pr", "application/x-pr")
+        etag1 = upload_part(port, "fx", "pr", upload_id, 1, b"part-one-small")
+        part2 = _fault_body(8 * 1024 * 1024, seed=71)
+        etag2 = upload_part(port, "fx", "pr", upload_id, 2, part2)
+
+        response, detail = oversized_put(
+            port,
+            multipart_path("fx", "pr", upload_id, 2),
+            int(limits["fault_write_bytes"]),
+        )
+        check_failed_cleanly(response, detail, "part-replacement-preserves-old")
+
+        parts = list_parts(port, "fx", "pr", upload_id)
+        check(
+            [(p["number"], p["etag"], p["size"]) for p in parts]
+            == [(1, etag1, len(b"part-one-small")), (2, etag2, len(part2))],
+            f"failed replacement disturbed the parts: {parts}",
+        )
+        assembled = b"part-one-small" + part2
+        expect(
+            complete_upload(port, "fx", "pr", upload_id, [(1, etag1), (2, etag2)]),
+            200,
+            "complete pr",
+        )
+        expect_present(
+            port, "fx", "pr", assembled, h.md5_etag(assembled), "application/x-pr", "completed pr"
+        )
+
+        fit = _fault_body(6 * 1024 * 1024, seed=73)
+        put_expect(port, "fx", "after", fit, "application/octet-stream", "fitting write")
+        server.restart()
+        port = server.port
+        assert port is not None
+        expect_present(
+            port, "fx", "pr", assembled, h.md5_etag(assembled), "application/x-pr", "pr after restart"
+        )
+        expect_present(
+            port, "fx", "after", fit, h.md5_etag(fit), "application/octet-stream", "after restart"
+        )
+    finally:
+        server.close()
+
+
 FAULT_CASES: dict[str, Callable[[str, Limits], None]] = {
     "put-preserves-old": p2_faults_put_preserves_old,
     "space-released": p2_faults_space_released,
     "multipart-staging": p2_faults_multipart_staging,
+    "put-commit-cleanup": p2_faults_put_commit_cleanup,
+    "batch-operational-rollback": p2_faults_batch_operational_rollback,
+    "multipart-completion-operational": p2_faults_multipart_completion_operational,
+    "part-replacement-preserves-old": p2_faults_part_replacement_preserves_old,
 }
 
 

@@ -1,6 +1,6 @@
 {
   "schema": "opencode-bench/locker-manifest@1",
-  "suite_version": "locker-v4",
+  "suite_version": "locker-v5",
   "seed": 20261106,
   "description": "Locker hidden behavioural suite. The manifest is the scoring denominator; case IDs are fixed and may not be inferred from a submitted result.",
   "tiers": {
@@ -178,7 +178,15 @@
       "id": "p2.faults",
       "tier": "P2",
       "title": "[P2][db] writes on a full data filesystem fail cleanly and release space",
-      "cases": ["put-preserves-old", "space-released", "multipart-staging"]
+      "cases": [
+        "put-preserves-old",
+        "space-released",
+        "multipart-staging",
+        "put-commit-cleanup",
+        "batch-operational-rollback",
+        "multipart-completion-operational",
+        "part-replacement-preserves-old"
+      ]
     }
   ]
 }

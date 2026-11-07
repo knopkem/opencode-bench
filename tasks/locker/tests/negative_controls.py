@@ -112,6 +112,104 @@ CONTROLS = [
         "needs_scratch": True,
     },
     {
+        "label": "keep an orphaned blob after a commit failure",
+        "fault": "keep-blob-on-commit-error",
+        "cases": [
+            (
+                "p2.faults",
+                "put-commit-cleanup",
+                runner.p2_faults_put_commit_cleanup,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
+        "label": "keep an assembled blob after a completion commit failure",
+        "fault": "keep-blob-on-commit-error",
+        "cases": [
+            (
+                "p2.faults",
+                "multipart-completion-operational",
+                runner.p2_faults_multipart_completion_operational,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
+        "label": "leak a staged batch copy after an error",
+        "fault": "leak-temp-on-error",
+        "cases": [
+            (
+                "p2.faults",
+                "batch-operational-rollback",
+                runner.p2_faults_batch_operational_rollback,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
+        "label": "expose a batch before its manifest save",
+        "fault": "batch-presave-effect",
+        "cases": [
+            (
+                "p2.faults",
+                "batch-operational-rollback",
+                runner.p2_faults_batch_operational_rollback,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
+        "label": "consume an upload after a completion error",
+        "fault": "consume-upload-on-complete-error",
+        "cases": [
+            (
+                "p2.faults",
+                "multipart-completion-operational",
+                runner.p2_faults_multipart_completion_operational,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
+        "label": "replace an old part before its replacement is stored",
+        "fault": "phantom-part",
+        "cases": [
+            (
+                "p2.faults",
+                "part-replacement-preserves-old",
+                runner.p2_faults_part_replacement_preserves_old,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
+        "label": "report an operational failure with the wrong status",
+        "fault": "wrong-op-status",
+        "cases": [
+            (
+                "p2.faults",
+                "put-commit-cleanup",
+                runner.p2_faults_put_commit_cleanup,
+            )
+        ],
+        "overrides": {},
+        "amplified": None,
+        "needs_scratch": True,
+    },
+    {
         "label": "clone the bucket before taking the commit lock",
         "fault": "stale-snapshot-clone",
         "cases": [("p1.concurrency", "no-lost-writes", runner.p1_concurrency_no_lost_writes)],

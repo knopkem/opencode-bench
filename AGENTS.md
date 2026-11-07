@@ -5,8 +5,9 @@ and its community leaderboard remain the `main`-branch suite; do not wire Locker
 submissions or CI until the task is calibrated.
 
 `HARD-TASK-V4-PLAN.md` is the implemented, frozen build record for the
-`locker-v4` hardening (batch, faults, histories, mutants). The invariants below
-are the v4 catalog.
+`locker-v4` hardening (batch, faults, histories, mutants). The current
+`locker-v5` catalog extends operational-failure recovery; the invariants below
+are the v5 catalog.
 
 ## Repository shape
 
@@ -54,7 +55,7 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 ## Hidden-suite and scoring invariants
 
 - `tasks/locker/tests/manifest.json` is the source of truth: 16 families,
-  P0 3 / P1 7 / P2 6 families, and 69 fixed subcases P0 8 / P1 42 / P2 19.
+  P0 3 / P1 7 / P2 6 families, and 73 fixed subcases P0 8 / P1 42 / P2 23.
 - `EXPECTED = {"P0": 3, "P1": 7, "P2": 6}` in `bench.py` counts **families**.
   Changing the catalog requires updating the manifest, `EXPECTED`, prompt and
   docs together; earlier results become non-comparable.
@@ -69,7 +70,7 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - Eligibility = successful build, every P0 subcase passed, no seed-passing
   subcase regressed, quality ≥ 0.80.
 - The runner writes `results.json` with schema
-  `opencode-bench/locker-tests@1`, `suite_version: locker-v4`, the fixture seed
+  `opencode-bench/locker-tests@1`, `suite_version: locker-v5`, the fixture seed
   and per-case durations/errors. `test_ok` is true only when all expected
   subcases pass.
 - The hidden suite runs only against the built `bin/locker`, with
@@ -107,19 +108,19 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
     --seed 20261106 --output /tmp/locker-result.json
   ```
 
-  Expect 69/69 subcases. Add `--scratch /scratch` with the frozen 32 MiB tmpfs
+  Expect 73/73 subcases. Add `--scratch /scratch` with the frozen 32 MiB tmpfs
   when `p2.faults` is included. `--family FAMILY` is author-only and marks the
   result diagnostic; it is never eligible for ingestion.
 - Oracle unit tests:
   `python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'`.
 - Evaluator sensitivity: `python3 tasks/locker/tests/negative_controls.py
-  --binary tasks/locker/reference/bin/locker`. Each injected fault must make
-  its intended invariant fail.
+  --binary tasks/locker/reference/bin/locker --scratch /scratch`. Each injected
+  fault must make its intended invariant fail.
 - Repeated crash/concurrency diagnostic runs are a release gate. A flaky run is
   an evaluator bug, not a model failure.
 - Seed baseline: build/run the seed, require all eight P0 subcases, and require
   the hidden suite output to match `tasks/locker/tests/seed-baseline.json`
-  subcase-for-subcase (14/69 today: P0 8, P1 1, P2 5). A no-op must score 0.0.
+  subcase-for-subcase (15/73 today: P0 8, P1 2, P2 5). A no-op must score 0.0.
   The saturated `p2.overwrite` family is a gate, not a scored family.
 - Run Linux-dependent cases in the pinned image with network disabled; the
   performance case reads `VmHWM` from `/proc/<pid>/status`.

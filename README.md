@@ -58,11 +58,11 @@ budget every run.
   that changes nothing scores `0.0`; passing every subcase scores `1.0`.
 - Eligible = successful build, every P0 subcase passed, no seed-passing
   subcase regressed, quality ≥ 0.80.
-- The seed baseline is `tasks/locker/tests/seed-baseline.json` (14/69 subcases:
-  P0 8, P1 1, P2 5; 12 scored families, 55 scored subcases).
+- The seed baseline is `tasks/locker/tests/seed-baseline.json` (15/73 subcases:
+  P0 8, P1 2, P2 5; 12 scored families, 58 scored subcases).
 
 The hidden manifest is `tasks/locker/tests/manifest.json`: 16 families,
-69 subcases (P0 8 / P1 42 / P2 19), suite `locker-v4`, fixture seed
+73 subcases (P0 8 / P1 42 / P2 23), suite `locker-v5`, fixture seed
 `20261106`.
 
 ## Resource limits
@@ -103,10 +103,10 @@ cd tasks/locker/reference
 go test ./...
 go build -trimpath -o bin/locker ./cmd/locker
 cd ../../..
-python3 tasks/locker/tests/run.py \
-  --binary "$PWD/tasks/locker/reference/bin/locker" \
-  --manifest tasks/locker/tests/manifest.json \
-  --seed 20261106 --output /tmp/locker-result.json
+
+# Run the complete 73-case suite in the pinned Linux image with the frozen
+# 32 MiB scratch filesystem (see AGENTS.md for the exact Docker invocation).
+# A run without p2.faults can use run.py directly on a development host.
 
 # Author-only diagnostic (result is marked diagnostic and is not ingestible):
 python3 tasks/locker/tests/run.py --binary ... \
@@ -116,7 +116,8 @@ python3 tasks/locker/tests/run.py --binary ... \
 # Oracle tests and injected-fault sensitivity controls:
 python3 -m unittest discover -s tasks/locker/tests -p 'test_*.py'
 python3 tasks/locker/tests/negative_controls.py \
-  --binary tasks/locker/reference/bin/locker
+  --binary tasks/locker/reference/bin/locker \
+  --scratch /scratch
 ```
 
 The reference and hidden tests are never mounted into an agent workdir.

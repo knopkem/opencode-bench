@@ -2458,7 +2458,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                     problems.append(
                         f"manifest has {tier_counts[tier]} {tier} families, expected {expected}"
                     )
-            expected_cases = {"P0": 8, "P1": 42, "P2": 19}
+            expected_cases = {"P0": 8, "P1": 42, "P2": 23}
             for tier, expected in expected_cases.items():
                 if case_counts[tier] != expected:
                     problems.append(

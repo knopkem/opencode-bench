@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,5 +57,26 @@ func TestBucketObjectRoundTrip(t *testing.T) {
 	response.Body.Close()
 	if string(body) != "hello" {
 		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestWrongOpStatusMapsStorageErrorTo503(t *testing.T) {
+	t.Setenv("LOCKER_FAULT", "wrong-op-status")
+	backend, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(backend, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
+	srv.writeStoreError(recorder, request, errors.New("disk failure"))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	body, _ := io.ReadAll(recorder.Body)
+	if !strings.Contains(string(body), "InternalError") {
+		t.Fatalf("error body = %q, want InternalError code", body)
 	}
 }

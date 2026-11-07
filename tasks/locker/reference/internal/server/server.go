@@ -160,13 +160,13 @@ func (s *Server) serveBucket(w http.ResponseWriter, r *http.Request, bucket stri
 	switch r.Method {
 	case http.MethodPut:
 		if err := s.store.CreateBucket(bucket); err != nil {
-			writeStoreError(w, r, err)
+			s.writeStoreError(w, r, err)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 	case http.MethodDelete:
 		if err := s.store.DeleteBucket(bucket); err != nil {
-			writeStoreError(w, r, err)
+			s.writeStoreError(w, r, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -206,7 +206,7 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, bucket strin
 	}
 	if err := s.store.Batch(bucket, ops); err != nil {
 		if !ackFirst {
-			writeStoreError(w, r, err)
+			s.writeStoreError(w, r, err)
 		}
 		return
 	}
@@ -241,7 +241,7 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 
 	objects, err := s.store.Objects(bucket)
 	if err != nil {
-		writeStoreError(w, r, err)
+		s.writeStoreError(w, r, err)
 		return
 	}
 
@@ -345,7 +345,7 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 			After:     page[len(page)-1].name,
 		})
 		if err != nil {
-			writeStoreError(w, r, err)
+			s.writeStoreError(w, r, err)
 			return
 		}
 		result.NextContinuationToken = token
@@ -427,7 +427,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 			}
 			etag, err := s.store.UploadPart(bucket, key, uploadID, number, r.Body, r.ContentLength)
 			if err != nil {
-				writeStoreError(w, r, err)
+				s.writeStoreError(w, r, err)
 				return
 			}
 			w.Header().Set("ETag", etag)
@@ -440,7 +440,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		}
 		object, err := s.store.PutObject(bucket, key, r.Body, r.ContentLength, contentType)
 		if err != nil {
-			writeStoreError(w, r, err)
+			s.writeStoreError(w, r, err)
 			return
 		}
 		w.Header().Set("ETag", object.ETag)
@@ -467,7 +467,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 			}
 			id, err := s.store.Initiate(bucket, key, contentType)
 			if err != nil {
-				writeStoreError(w, r, err)
+				s.writeStoreError(w, r, err)
 				return
 			}
 			result := struct {
@@ -495,14 +495,14 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		}
 		if uploadID != "" {
 			if err := s.store.Abort(bucket, key, uploadID); err != nil {
-				writeStoreError(w, r, err)
+				s.writeStoreError(w, r, err)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if err := s.store.DeleteObject(bucket, key); err != nil {
-			writeStoreError(w, r, err)
+			s.writeStoreError(w, r, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -514,7 +514,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string, head bool) {
 	object, file, err := s.store.GetObject(bucket, key)
 	if err != nil {
-		writeStoreError(w, r, err)
+		s.writeStoreError(w, r, err)
 		return
 	}
 	if file != nil {
@@ -568,7 +568,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key, id string) {
 	numbers, parts, err := s.store.ListParts(bucket, key, id)
 	if err != nil {
-		writeStoreError(w, r, err)
+		s.writeStoreError(w, r, err)
 		return
 	}
 	type partXML struct {
@@ -614,7 +614,7 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request, bucket, 
 	}
 	object, err := s.store.Complete(bucket, key, id, parts)
 	if err != nil {
-		writeStoreError(w, r, err)
+		s.writeStoreError(w, r, err)
 		return
 	}
 	result := struct {
@@ -656,7 +656,7 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 	writeXML(w, r, status, errorBody{Code: code, Message: message})
 }
 
-func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
+func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, store.ErrNoSuchBucket):
 		writeError(w, r, http.StatusNotFound, "NoSuchBucket", "the bucket does not exist")
@@ -671,6 +671,12 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, store.ErrPrecondition):
 		writeError(w, r, http.StatusPreconditionFailed, "PreconditionFailed", "a batch precondition failed")
 	default:
+		if s.fault == "wrong-op-status" {
+			// Author-only negative control: an operational storage error
+			// is reported as 503 while keeping the InternalError body.
+			writeError(w, r, http.StatusServiceUnavailable, "InternalError", "internal storage error")
+			return
+		}
 		writeError(w, r, http.StatusInternalServerError, "InternalError", "internal storage error")
 	}
 }
