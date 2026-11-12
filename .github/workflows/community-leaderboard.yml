@@ -20,6 +20,8 @@ on:
 
 permissions:
   contents: read
+  # Needed to poll the uploaded `github-pages` artifact before deploying.
+  actions: read
   issues: write
   pages: write
   id-token: write
@@ -39,9 +41,6 @@ jobs:
       (github.event.action == 'unlabeled' && github.event.label.name == 'benchmark-result') ||
       github.event.label.name == 'hidden'
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Check out the default branch
         uses: actions/checkout@v4
@@ -182,6 +181,50 @@ jobs:
         with:
           path: docs
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url || steps.deploy_retry.outputs.page_url }}
+    # Serialize deployments independently of the build concurrency group so a
+    # queued build can never overlap a deploy that is already in flight.
+    concurrency:
+      group: community-leaderboard-pages
+      cancel-in-progress: false
+    steps:
+      - name: Wait for the Pages artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # deploy-pages resolves the artifact through the Actions results
+          # service, which can briefly report a just-finalized upload as
+          # missing ("Found 0 artifact(s)"). Give it up to 60s to catch up;
+          # the deploy step below still fails loudly if it never appears.
+          for attempt in $(seq 1 12); do
+            count="$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=github-pages" \
+              --jq '.total_count' 2>/dev/null || echo 0)"
+            if [ "${count:-0}" -ge 1 ]; then
+              echo "github-pages artifact is visible (attempt $attempt)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "warning: github-pages artifact still not visible after 60s" >&2
+
       - name: Deploy Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+        id: deploy
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Pause before retrying the deployment
+        if: steps.deploy.outcome == 'failure'
+        run: sleep 20
+
+      - name: Deploy Pages (retry)
+        id: deploy_retry
+        if: steps.deploy.outcome == 'failure'
+        uses: actions/deploy-pages@v5
+

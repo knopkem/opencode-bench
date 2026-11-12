@@ -91,8 +91,11 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - `bench.py site` / `submit` are stdlib-only and must not require Docker or the
   OpenCode CLI. The workflow uses `gh issue list` JSON and never executes issue
   content as code.
-- The Pages workflow needs `contents: read`, `issues: write`, `pages: write`
-  and `id-token: write`. Do not add `contents: write` or bot commits.
+- The Pages workflow needs `contents: read`, `actions: read`, `issues: write`,
+  `pages: write` and `id-token: write`. Do not add `contents: write` or bot
+  commits. `actions: read` exists only so the deploy job can poll for the
+  uploaded `github-pages` artifact; the artifact lookup in `deploy-pages` is
+  eventually consistent, so `deploy` waits for it and retries once.
 - One-time repo setup: Pages source “GitHub Actions”; labels `benchmark-result`,
   `verified`, `hidden`, `needs-attention`.
 
