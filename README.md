@@ -60,11 +60,18 @@ python3 -m unittest discover -s tests   # metric/scoring regression tests
 ```
 
 Docker/OrbStack must be running (`docker info`). `--engine podman` uses the same
-CLI shape. The agent/build and evaluator images are configured separately with
-`--agent-image` and `--eval-image`, or `OPENCODE_BENCH_AGENT_IMAGE` and
-`OPENCODE_BENCH_EVAL_IMAGE`. A public evaluator image reduces casual source
-scraping, but its tests are still recoverable by anyone who pulls and inspects
-the image; it is not a secrecy boundary.
+CLI shape. The defaults point at the public GHCR images, so no image
+configuration is required:
+
+```text
+ghcr.io/knopkem/opencode-bench-agent:edge
+ghcr.io/knopkem/opencode-bench-eval:edge
+```
+
+Maintainers can override them with `--agent-image` and `--eval-image`, or
+`OPENCODE_BENCH_AGENT_IMAGE` and `OPENCODE_BENCH_EVAL_IMAGE`. A public evaluator
+image reduces casual source scraping, but its tests are still recoverable by
+anyone who pulls and inspects the image; it is not a secrecy boundary.
 
 ## Selecting a model
 
@@ -200,18 +207,17 @@ The deprecated global `--image` option remains an alias for `--agent-image`.
 `run`, `check`, `rescore` and `build-eval` accept both image options after the
 subcommand as well.
 
-For released public images, pull and select matching versions explicitly. The
-first release may require the repository owner to open the GHCR package
-settings and set visibility to **public** if GitHub's token cannot change a
-user-package setting automatically:
+The default images can be prefetched without any harness configuration:
 
 ```bash
-docker pull ghcr.io/knopkem/opencode-bench-agent:EDGE_OR_RELEASE
-docker pull ghcr.io/knopkem/opencode-bench-eval:SUITE_VERSION
-export OPENCODE_BENCH_AGENT_IMAGE=ghcr.io/knopkem/opencode-bench-agent:EDGE_OR_RELEASE
-export OPENCODE_BENCH_EVAL_IMAGE=ghcr.io/knopkem/opencode-bench-eval:SUITE_VERSION
+docker pull ghcr.io/knopkem/opencode-bench-agent:edge
+docker pull ghcr.io/knopkem/opencode-bench-eval:edge
 ./bench.py check
 ```
+
+The first release may require the repository owner to open the GHCR package
+settings and set visibility to **public** if GitHub's token cannot change a
+user-package setting automatically.
 
 Maintainers build an evaluator image from the private suite with:
 

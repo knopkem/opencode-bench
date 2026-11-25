@@ -57,7 +57,8 @@ Run from the repo root:
 `docker info` must succeed for build/build-eval/run/check/rescore; `check`
 and `models` also need the `opencode` CLI. `preview` only needs `node`;
 `report`, `leaderboard`, `backfill` and the unit tests need neither Docker nor
-`opencode`.
+`opencode`. The default image references are the public GHCR `edge` tags;
+image options and environment overrides are for maintainers and local builds.
 Harness syntax check: `python3 -m py_compile bench.py`.
 Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 

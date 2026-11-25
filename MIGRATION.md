@@ -8,8 +8,9 @@ Date: 2026-11-25
 Implemented locally:
 
 - `bench.py` uses separate agent/build and evaluator image configuration,
-  supports `build-eval`, validates the evaluator manifest and suite listing, and
-  records image provenance in scores and submissions.
+  defaults to the public GHCR `edge` images, supports `build-eval`, validates
+  the evaluator manifest and suite listing, and records image provenance in
+  scores and submissions.
 - `docker/agent.Dockerfile` remains the public agent/build recipe.
 - `docker/evaluator.Dockerfile` builds the private-suite evaluator layer.
 - `.github/workflows/agent-image.yml` publishes the public agent image.

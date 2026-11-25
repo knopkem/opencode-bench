@@ -424,6 +424,23 @@ class CommunitySubmissionTests(unittest.TestCase):
 
 
 class ImageMigrationTests(unittest.TestCase):
+    def test_default_images_are_public_ghcr_references(self) -> None:
+        parser = bench.make_parser()
+        args = parser.parse_args(["run", "--model", "provider/model"])
+        old_agent_default = bench.DEFAULT_AGENT_IMAGE
+        old_eval_default = bench.DEFAULT_EVAL_IMAGE
+        bench.DEFAULT_AGENT_IMAGE = bench.PUBLIC_AGENT_IMAGE
+        bench.DEFAULT_EVAL_IMAGE = bench.PUBLIC_EVAL_IMAGE
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                bench.resolve_image_args(parser, args)
+        finally:
+            bench.DEFAULT_AGENT_IMAGE = old_agent_default
+            bench.DEFAULT_EVAL_IMAGE = old_eval_default
+
+        self.assertEqual(args.agent_image, bench.PUBLIC_AGENT_IMAGE)
+        self.assertEqual(args.eval_image, bench.PUBLIC_EVAL_IMAGE)
+
     def test_image_defaults_and_legacy_alias(self) -> None:
         parser = bench.make_parser()
         args = parser.parse_args(

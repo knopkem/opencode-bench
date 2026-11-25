@@ -54,12 +54,14 @@ EVALUATOR_TESTS_DIR = "/opt/opencode-bench/tests"
 EVALUATOR_CONFIG = f"{EVALUATOR_TESTS_DIR}/playwright.config.ts"
 EVALUATOR_MANIFEST = "/opt/opencode-bench/evaluator.json"
 
+PUBLIC_AGENT_IMAGE = "ghcr.io/knopkem/opencode-bench-agent:edge"
+PUBLIC_EVAL_IMAGE = "ghcr.io/knopkem/opencode-bench-eval:edge"
 LEGACY_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "")
 DEFAULT_AGENT_IMAGE = os.environ.get(
     "OPENCODE_BENCH_AGENT_IMAGE",
-    LEGACY_IMAGE or "opencode-bench-agent:latest",
+    LEGACY_IMAGE or PUBLIC_AGENT_IMAGE,
 )
-DEFAULT_EVAL_IMAGE = os.environ.get("OPENCODE_BENCH_EVAL_IMAGE", "opencode-bench-eval:latest")
+DEFAULT_EVAL_IMAGE = os.environ.get("OPENCODE_BENCH_EVAL_IMAGE", PUBLIC_EVAL_IMAGE)
 DEFAULT_IMAGE = DEFAULT_AGENT_IMAGE
 DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
 OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
@@ -2232,10 +2234,14 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append(f"{args.engine} is not available")
     elif not args.dry_run:
         if not image_exists(args.engine, args.agent_image):
-            problems.append(
-                f"agent image {args.agent_image} missing; run ./bench.py build "
-                f"--agent-image {args.agent_image} or pull the configured public image"
-            )
+            if args.agent_image.startswith("ghcr.io/"):
+                hint = f"docker pull {args.agent_image}"
+            else:
+                hint = (
+                    f"./bench.py build --agent-image {args.agent_image} "
+                    "or pull the configured image"
+                )
+            problems.append(f"agent image {args.agent_image} missing; run: {hint}")
         else:
             try:
                 clean = subprocess.run(
@@ -2265,11 +2271,14 @@ def cmd_check(args: argparse.Namespace) -> int:
                     )
 
         if not image_exists(args.engine, args.eval_image):
-            problems.append(
-                f"evaluator image {args.eval_image} missing; run "
-                "./bench.py build-eval --tests-dir PRIVATE_SUITE_DIR "
-                f"--eval-image {args.eval_image} or pull the configured public image"
-            )
+            if args.eval_image.startswith("ghcr.io/"):
+                hint = f"docker pull {args.eval_image}"
+            else:
+                hint = (
+                    "./bench.py build-eval --tests-dir PRIVATE_SUITE_DIR "
+                    f"--eval-image {args.eval_image}"
+                )
+            problems.append(f"evaluator image {args.eval_image} missing; run: {hint}")
         else:
             manifest, manifest_error = read_evaluator_manifest(
                 args.engine, args.eval_image
