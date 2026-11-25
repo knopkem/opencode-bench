@@ -76,8 +76,27 @@ jobs:
           docker run --rm --network none "$image" \
             bash -lc 'opencode --version && node --version && npx playwright --version'
 
-      - name: Push the public agent image
-        run: docker push "${{ steps.image.outputs.reference }}"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Publish the multi-architecture agent image
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            -f docker/agent.Dockerfile \
+            -t "${{ steps.image.outputs.reference }}" \
+            --build-arg "OPENCODE_VERSION=${{ vars.OPENCODE_VERSION || '2.2.5' }}" \
+            .
+
+      - name: Verify the published architectures
+        run: |
+          docker buildx imagetools inspect "${{ steps.image.outputs.reference }}"
 
       - name: Make the agent package public
         continue-on-error: true
