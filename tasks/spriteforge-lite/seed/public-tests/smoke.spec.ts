@@ -4,6 +4,7 @@ type State = {
   frames: Array<{
     layers: Array<{ pixels: number[] }>;
   }>;
+  palette: string[];
   activeFrame: number;
   activeLayer: number;
 };
@@ -25,6 +26,22 @@ async function clickPixel(page: Page, x: number, y: number): Promise<void> {
   await page.mouse.click(box!.x + x * 16 + 8, box!.y + y * 16 + 8);
 }
 
+async function canvasPixel(page: Page, x: number, y: number): Promise<number[]> {
+  return page.evaluate(
+    ({ x, y }) => {
+      const canvas = document.querySelector<HTMLCanvasElement>('[data-testid="canvas"]');
+      if (!canvas) throw new Error("canvas missing");
+      const scale = canvas.width / 32;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("2d context missing");
+      const px = Math.min(canvas.width - 1, Math.floor(x * scale + scale / 2));
+      const py = Math.min(canvas.height - 1, Math.floor(y * scale + scale / 2));
+      return Array.from(ctx.getImageData(px, py, 1, 1).data);
+    },
+    { x, y },
+  );
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await page.waitForSelector('[data-testid="canvas"]');
@@ -43,6 +60,14 @@ test("draws and undoes a pixel", async ({ page }) => {
 
   await page.getByTestId("undo").click();
   expect(await pixel(page, 5, 5)).toBe(-1);
+});
+
+test("draws the default palette colour", async ({ page }) => {
+  expect((await state(page)).palette[0]).toBe("#000000");
+
+  await clickPixel(page, 5, 5);
+  expect(await pixel(page, 5, 5)).toBe(0);
+  await expect.poll(() => canvasPixel(page, 5, 5)).toEqual([0, 0, 0, 255]);
 });
 
 test("selects a palette colour", async ({ page }) => {

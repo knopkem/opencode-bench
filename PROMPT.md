@@ -83,6 +83,18 @@ window.__spriteforge = {
 document and re-renders. `reset()` clears persistence and returns to the
 default document.
 
+### Default document
+
+A fresh document (first boot, or after `reset()`) has:
+
+- 1 layer, 1 frame, fps 8, loop on;
+- 16 colours written as lowercase `#rrggbb`, with `palette[0]` set to
+  `#000000`;
+- palette index 0 selected, pencil selected, brush size 1.
+
+Drawing with the default selection therefore paints pure black
+(`rgb(0, 0, 0)`).
+
 ### Persistence
 
 - `localStorage` key: `spriteforge.project`.
@@ -133,7 +145,8 @@ At 1280×800:
 
 - App mounts; canvas exists at 512×512 CSS / 32×32 logical; no console or page
   errors.
-- Default document: 1 layer, 1 frame, 16-colour palette, fps 8, loop on.
+- Default document as described above: 1 layer, 1 frame, 16-colour palette
+  with `#000000` first, fps 8, loop on; pencil selected.
 - Pencil draws a pixel; eraser clears it.
 - Pencil press-and-drag paints a continuous stroke; eraser press-and-drag
   clears a continuous stroke.
@@ -162,7 +175,7 @@ At 1280×800:
   `[data-testid="onion-opacity"]` (default 50%; 0 = off). At 50%, the previous
   frame is blended at half strength; at 100%, it is fully visible through
   transparent areas of the active frame.
-- Status text updates for tool/frame/undo.
+- Status text updates for tool, frame and undo/redo changes.
 - No placeholder text, no dead buttons, no layout overflow.
 
 ## Out of scope

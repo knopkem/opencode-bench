@@ -442,7 +442,7 @@ Using the private reference implementation:
 
 - build the reference successfully;
 - pass all 20 hidden tests in three consecutive evaluator-image runs;
-- pass all 4 public smoke tests;
+- pass all 5 public smoke tests;
 - confirm the evaluator runs with no network and no host test mount;
 - rescore the same saved workdir with the old and new evaluation paths and confirm
   identical test counts and quality.

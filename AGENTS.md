@@ -146,6 +146,10 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - Root `PROMPT.md` is copied into every run as `PROMPT.md`; the seed has its own
   `AGENTS.md`. The task contract in `PROMPT.md`, the hidden tests, and the seed
   `data-testid`/state API must stay in sync.
+- The hidden P0/P1 canvas-pixel checks expect the default pencil colour to be
+  pure black. `PROMPT.md` pins `palette[0]` to `#000000` and the public smoke
+  test asserts the rendered pixel, so the stated contract, the public suite and
+  the hidden suite stay aligned.
 - `docker/agent.Dockerfile` copies the seed's `package.json` +
   `package-lock.json` and runs `npm ci --ignore-scripts` at image-build time.
   Changing seed dependencies or the lockfile requires rebuilding the agent
@@ -166,7 +170,7 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
   evaluator image from the private suite, then run it against the private
   reference. The exact commands are in that repository's reference README.
 - The documented validation bar is 20/20 hidden tests, three consecutive runs,
-  plus 4/4 public smoke tests. Treat a suite that is flaky on the reference as
+  plus 5/5 public smoke tests. Treat a suite that is flaky on the reference as
   a test bug, not a model failure.
 - `watchdog: exit` alone is not success. Interpret finished runs with `outcome`
   (`complete`, `gave_up`, `incomplete`, `timeout`, `stalled`, `error`),
