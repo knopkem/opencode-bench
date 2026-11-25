@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -424,6 +425,37 @@ class CommunitySubmissionTests(unittest.TestCase):
 
 
 class ImageMigrationTests(unittest.TestCase):
+    def test_missing_public_image_is_pulled(self) -> None:
+        with (
+            mock.patch.object(bench, "image_exists", return_value=False),
+            mock.patch.object(bench.subprocess, "run") as run,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(bench.ensure_image("docker", bench.PUBLIC_AGENT_IMAGE))
+
+        run.assert_called_once_with(
+            ["docker", "pull", bench.PUBLIC_AGENT_IMAGE], check=False
+        )
+
+    def test_missing_custom_image_is_not_pulled_automatically(self) -> None:
+        with (
+            mock.patch.object(bench, "image_exists", return_value=False),
+            mock.patch.object(bench.subprocess, "run") as run,
+        ):
+            self.assertFalse(bench.ensure_image("docker", "local-agent:test"))
+
+        run.assert_not_called()
+
+    def test_existing_image_is_not_pulled(self) -> None:
+        with (
+            mock.patch.object(bench, "image_exists", return_value=True),
+            mock.patch.object(bench.subprocess, "run") as run,
+        ):
+            self.assertTrue(bench.ensure_image("docker", bench.PUBLIC_AGENT_IMAGE))
+
+        run.assert_not_called()
+
     def test_default_images_are_public_ghcr_references(self) -> None:
         parser = bench.make_parser()
         args = parser.parse_args(["run", "--model", "provider/model"])

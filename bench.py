@@ -354,6 +354,17 @@ def image_exists(engine: str, image: str) -> bool:
     return proc.returncode == 0
 
 
+def ensure_image(engine: str, image: str) -> bool:
+    """Return whether an image is available, pulling missing public images."""
+    if image_exists(engine, image):
+        return True
+    if not image.startswith("ghcr.io/"):
+        return False
+    print(f"Pulling {image}...")
+    proc = subprocess.run([engine, "pull", image], check=False)
+    return proc.returncode == 0
+
+
 def image_inspect(engine: str, image: str) -> dict | None:
     """Return the container engine's JSON image metadata, or None when absent."""
     proc = subprocess.run(
@@ -2233,15 +2244,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     if not engine_available(args.engine, args.dry_run):
         problems.append(f"{args.engine} is not available")
     elif not args.dry_run:
-        if not image_exists(args.engine, args.agent_image):
+        if not ensure_image(args.engine, args.agent_image):
             if args.agent_image.startswith("ghcr.io/"):
-                hint = f"docker pull {args.agent_image}"
+                hint = f"{args.engine} pull {args.agent_image}"
             else:
                 hint = (
                     f"./bench.py build --agent-image {args.agent_image} "
                     "or pull the configured image"
                 )
-            problems.append(f"agent image {args.agent_image} missing; run: {hint}")
+            problems.append(f"agent image {args.agent_image} unavailable; run: {hint}")
         else:
             try:
                 clean = subprocess.run(
@@ -2270,15 +2281,15 @@ def cmd_check(args: argparse.Namespace) -> int:
                         "agent image contains evaluator tests or reference files"
                     )
 
-        if not image_exists(args.engine, args.eval_image):
+        if not ensure_image(args.engine, args.eval_image):
             if args.eval_image.startswith("ghcr.io/"):
-                hint = f"docker pull {args.eval_image}"
+                hint = f"{args.engine} pull {args.eval_image}"
             else:
                 hint = (
                     "./bench.py build-eval --tests-dir PRIVATE_SUITE_DIR "
                     f"--eval-image {args.eval_image}"
                 )
-            problems.append(f"evaluator image {args.eval_image} missing; run: {hint}")
+            problems.append(f"evaluator image {args.eval_image} unavailable; run: {hint}")
         else:
             manifest, manifest_error = read_evaluator_manifest(
                 args.engine, args.eval_image
