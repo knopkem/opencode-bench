@@ -1,11 +1,13 @@
 runs/
-results.csv
-results.csv.lock
-report.md
-leaderboard.html
+.private-eval/
+results*.csv
+results*.csv.lock
+report*.md
+*leaderboard*.html
 docs/
 **/node_modules/
 **/dist/
 **/test-results/
 **/playwright-report/
 __pycache__/
+.serena/

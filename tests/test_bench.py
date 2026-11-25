@@ -423,5 +423,100 @@ class CommunitySubmissionTests(unittest.TestCase):
         self.assertEqual(row["source"], "community")
 
 
+class ImageMigrationTests(unittest.TestCase):
+    def test_image_defaults_and_legacy_alias(self) -> None:
+        parser = bench.make_parser()
+        args = parser.parse_args(
+            [
+                "--image",
+                "legacy-agent:test",
+                "run",
+                "--model",
+                "provider/model",
+                "--eval-image",
+                "evaluator:test",
+            ]
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            bench.resolve_image_args(parser, args)
+
+        self.assertEqual(args.agent_image, "legacy-agent:test")
+        self.assertEqual(args.eval_image, "evaluator:test")
+        self.assertEqual(args.image, "legacy-agent:test")
+
+    def test_subcommand_image_options_and_conflict(self) -> None:
+        parser = bench.make_parser()
+        args = parser.parse_args(
+            [
+                "run",
+                "--agent-image",
+                "agent:test",
+                "--eval-image",
+                "eval:test",
+                "--model",
+                "provider/model",
+            ]
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            bench.resolve_image_args(parser, args)
+        self.assertEqual(args.agent_image, "agent:test")
+        self.assertEqual(args.eval_image, "eval:test")
+
+        conflicting = parser.parse_args(
+            [
+                "--image",
+                "legacy:test",
+                "--agent-image",
+                "agent:test",
+                "run",
+                "--model",
+                "provider/model",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                bench.resolve_image_args(parser, conflicting)
+
+    def test_count_suite_tiers_from_private_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            tests_dir = Path(temp)
+            (tests_dir / "suite.spec.ts").write_text(
+                'test("[P0] one", async () => {});\n'
+                'test.describe("[P1] group", () => {\n'
+                '  test("[P1] two", async () => {});\n'
+                '  test("[P1] three", async () => {});\n'
+                '});\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                bench.count_suite_tiers(tests_dir), {"P0": 1, "P1": 2, "P2": 0}
+            )
+
+    def test_run_tests_uses_evaluator_image_without_host_test_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workdir = root / "workdir"
+            run_dir = root / "run"
+            (workdir / "dist").mkdir(parents=True)
+            (workdir / "dist" / "index.html").write_text("ok", encoding="utf-8")
+            run_dir.mkdir()
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = bench.run_tests(
+                    run_dir,
+                    workdir,
+                    engine="docker",
+                    evaluator_image="evaluator:test",
+                    dry_run=True,
+                )
+
+            self.assertTrue(result["test_ok"])
+            command = stdout.getvalue()
+            self.assertIn("evaluator:test", command)
+            self.assertIn(f"--config {bench.EVALUATOR_CONFIG}", command)
+            self.assertNotIn(":/opt/opencode-bench/tests:ro", command)
+
+
 if __name__ == "__main__":
     unittest.main()

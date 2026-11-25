@@ -30,14 +30,15 @@ shortcuts, and the `window.__spriteforge` state API. It must use the required
 There is no fixed time limit, only watchdogs for hung runs. The model may run
 the public smoke tests and add its own tests under `tests-local/`, but cannot
 add dependencies, use the network, or modify the hidden suite. The hidden
-20-test Playwright suite (P0: 5, P1: 9, P2: 6) is mounted only after the agent
-exits and is never visible to the model.
+20-test Playwright suite (P0: 5, P1: 9, P2: 6) runs in a separate evaluator
+container after the agent exits and is never mounted into the agent container.
 
 ## Quick start
 
 ```bash
-./bench.py build                 # build the agent/eval image once
-./bench.py check                 # config, seed, tests, image
+./bench.py build                 # build the public agent/build image
+./bench.py build-eval --tests-dir PRIVATE_SUITE_DIR  # maintainer evaluator build
+./bench.py check                 # config, seed, evaluator manifest and images
 ./bench.py models                # provider summary from `opencode models`
 ./bench.py models --provider NAME
 ./bench.py run --model provider/model
@@ -59,7 +60,11 @@ python3 -m unittest discover -s tests   # metric/scoring regression tests
 ```
 
 Docker/OrbStack must be running (`docker info`). `--engine podman` uses the same
-CLI shape.
+CLI shape. The agent/build and evaluator images are configured separately with
+`--agent-image` and `--eval-image`, or `OPENCODE_BENCH_AGENT_IMAGE` and
+`OPENCODE_BENCH_EVAL_IMAGE`. A public evaluator image reduces casual source
+scraping, but its tests are still recoverable by anyone who pulls and inspects
+the image; it is not a secrecy boundary.
 
 ## Selecting a model
 
@@ -185,11 +190,42 @@ The runner uses the OpenCode config that `opencode` already uses:
 - API keys stay in your OpenCode config or environment; this repo stores none.
 
 The agent container mounts the config directory read-only at `/config/opencode`
-and copies it into a writable XDG config. The image installs OpenCode 2.2.5
-through the v2 installer; override with
+and copies it into a writable XDG config. The agent image installs OpenCode
+2.2.5 through the v2 installer; override with
 `./bench.py build --opencode-version X.Y.Z`. The Playwright base image is
 `mcr.microsoft.com/playwright:v1.64.1-noble`; override with
 `./bench.py build --playwright-image ...`.
+
+The deprecated global `--image` option remains an alias for `--agent-image`.
+`run`, `check`, `rescore` and `build-eval` accept both image options after the
+subcommand as well.
+
+For released public images, pull and select matching versions explicitly:
+
+```bash
+docker pull ghcr.io/knopkem/opencode-bench-agent:EDGE_OR_RELEASE
+docker pull ghcr.io/knopkem/opencode-bench-eval:SUITE_VERSION
+export OPENCODE_BENCH_AGENT_IMAGE=ghcr.io/knopkem/opencode-bench-agent:EDGE_OR_RELEASE
+export OPENCODE_BENCH_EVAL_IMAGE=ghcr.io/knopkem/opencode-bench-eval:SUITE_VERSION
+./bench.py check
+```
+
+Maintainers build an evaluator image from the private suite with:
+
+```bash
+./bench.py build-eval \
+  --tests-dir PRIVATE_SUITE_DIR \
+  --agent-image AGENT_IMAGE \
+  --eval-image EVAL_IMAGE \
+  --suite-version SUITE_VERSION \
+  --source-revision PRIVATE_SUITE_REVISION
+```
+
+The resulting image contains `/opt/opencode-bench/tests` and an
+`/opt/opencode-bench/evaluator.json` manifest with the suite version and
+expected P0/P1/P2 counts. `check` validates that manifest, runs Playwright's
+test listing, and verifies that the agent image contains neither the evaluator
+suite nor a reference implementation.
 
 ## Reports and artifacts
 
@@ -335,10 +371,11 @@ The canonical JSON format, LLM instructions and a filled example are in
 [`submissions/TEMPLATE.md`](submissions/TEMPLATE.md) and
 [`submissions/examples/issue-1.json`](submissions/examples/issue-1.json).
 
-`submit` reads `score.json`, strips local paths, includes the M1 metrics
-(self-test time/runs, retries, work wall, median tok/s), computes a score hash and
-validates the block before posting. Hardware is a single optional free-text
-line; there is no structured hardware capture.
+`submit` reads `score.json`, strips local paths, includes the effort metrics and
+image provenance (agent/evaluator references and identifiers, plus evaluator
+suite version), computes a score hash and validates the block before posting.
+Hardware is a single optional free-text line; there is no structured hardware
+capture.
 
 ### Validation and evidence
 
@@ -474,16 +511,20 @@ not required for these metrics.
 
 ## Isolation
 
-- **agent container** — mounts only `workdir/` and the OpenCode config.
-  Contains Chromium, Playwright, OpenCode and the seed's public smoke tests. It
-  never mounts the hidden `tests/`, the reference app, the host home or the
-  Docker socket.
-- **build container** — mounts `workdir` only. No tests.
-- **test container** — mounts `dist/` and hidden `tests/` read-only. Serves the
-  build over local HTTP and runs Playwright with no network.
+- **agent container** — mounts only `workdir/` and the OpenCode config. Uses the
+  public agent image and contains no evaluator suite or reference app. It never
+  mounts the host home or Docker socket.
+- **build container** — mounts `workdir` only and uses the same agent image. No
+  evaluator files.
+- **evaluator container** — uses a separate evaluator image with the suite at
+  `/opt/opencode-bench/tests`. It mounts only `dist/` read-only plus the local
+  output directory, serves the build over local HTTP and runs Playwright with
+  no network.
 
-The agent runs as an isolated process; Dockerizing only the tests would not hide
-them. The image exposes Playwright Chromium as `google-chrome` with
+The agent runs as an isolated process; image separation prevents accidental
+local filesystem discovery. A public evaluator image is still readable by anyone
+who pulls it, so treat its contents as public-but-less-discoverable rather than
+secret. The image exposes Playwright Chromium as `google-chrome` with
 `--no-sandbox`, so a config that enables `chrome-devtools` MCP has a browser to
 launch.
 
@@ -494,31 +535,28 @@ bench.py                     orchestrator
 tests/test_bench.py          metric/scoring regression tests
 submissions/                 public result schema, template and example
 .github/ISSUE_TEMPLATE/      benchmark-result issue form
-.github/workflows/           community leaderboard build + Pages deploy
+.github/workflows/           public image release + community Pages deploy
 docs/                        generated public page (gitignored)
-docker/agent.Dockerfile      Playwright + Chromium + OpenCode 2 image
+docker/agent.Dockerfile      public Playwright + Chromium + OpenCode 2 image
+docker/evaluator.Dockerfile  private-suite evaluator layer (public recipe)
 docker/entrypoint.sh         config copy + preinstalled node_modules
 docker/serve.mjs             static server for the built app
 PROMPT.md                    build task and test contract
 tasks/spriteforge-lite/
   seed/                      starter repo with public-tests/
-  tests/                     hidden Playwright suite + config
-  reference/                 instrumented spriteforge; validation only
-runs/                        per-run workdirs, logs, scores
-results.csv                  one row per run
-leaderboard.html             generated all-runs leaderboard
+runs/                        per-run workdirs, logs, scores (gitignored)
+results.csv                  one row per run (gitignored)
+leaderboard.html             generated all-runs leaderboard (gitignored)
 ```
 
 ## Status
 
-- The reference implementation is instrumented with test IDs, state API, PNG
-  export and play/pause controls.
-- Hidden suite: 20/20 against the reference; public smoke: 4/4.
-- The image is built (`opencode-bench:latest`), and `docker build --check` passes.
+- Evaluator validation: 20/20 hidden tests against the private reference in
+  three consecutive runs; public smoke suite 4/4. Validation details and the
+  reference live in the private evaluator-source repository.
+- The public agent/evaluator image split and manifest checks are documented in
+  `MIGRATION.md`.
 - OpenCode 2.2.5 v2 installer verified locally.
-- The current hidden suite covers canvas/drawing, continuous pencil/eraser
-  drags, palette, layers, frames, playback, persistence, PNG export, onion
-  opacity, keyboard/focus behaviour, layout and edge cases.
 - `./bench.py leaderboard` serves and opens a ranked all-runs page on
   `127.0.0.1:4174` for live overnight monitoring; `--write` only writes the
   HTML file.

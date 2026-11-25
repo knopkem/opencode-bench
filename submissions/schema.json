@@ -43,7 +43,12 @@
             "P1": {"const": 9},
             "P2": {"const": 6}
           }
-        }
+        },
+        "agent_image": {"type": ["string", "null"]},
+        "agent_image_id": {"type": ["string", "null"]},
+        "evaluator_image": {"type": ["string", "null"]},
+        "evaluator_image_id": {"type": ["string", "null"]},
+        "evaluator_suite_version": {"type": ["string", "null"]}
       }
     },
     "model": {

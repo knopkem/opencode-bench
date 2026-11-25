@@ -7,24 +7,31 @@
   is no root `package.json`; `tests/test_bench.py` is a stdlib `unittest` suite
   for metric extraction and leaderboard scoring.
 - `tasks/spriteforge-lite/seed/` is copied into each run and is what the model
-  sees. `tasks/spriteforge-lite/tests/` is the hidden Playwright suite.
-  `tasks/spriteforge-lite/reference/` is a working implementation used only to
-  validate the suite; never expose it to the model.
+  sees. The hidden Playwright suite and the reference implementation live only
+  in the private evaluator-source repository and inside evaluator images; they
+  must not be present in the public source tree.
+- `docker/agent.Dockerfile` builds the public agent/build image.
+  `docker/evaluator.Dockerfile` is the public recipe for adding a private suite
+  to a separate evaluator image. `MIGRATION.md` records the split and release
+  procedure.
 - `submissions/` holds the public result schema, template and example;
   `.github/ISSUE_TEMPLATE/` holds the result form and
   `.github/workflows/community-leaderboard.yml` builds/deploys the public page.
 - `runs/`, `results.csv`, `report.md`, `leaderboard.html` and `docs/` are
   generated artifacts. Do not hand-edit per-run workdirs or generated reports;
-  fix the source (`bench.py`, `PROMPT.md`, seed, hidden tests, submissions,
-  templates) and regenerate.
+  fix the source (`bench.py`, `PROMPT.md`, seed, private evaluator suite,
+  submissions, templates) and regenerate.
 
 ## Commands
 
 Run from the repo root:
 
-- `./bench.py build` — build/rebuild the single agent/build/test image.
-- `./bench.py check` — validate prompt, seed, hidden-test tier counts, model
-  config and image. This is the main preflight.
+- `./bench.py build` — build/rebuild the public agent/build image.
+- `./bench.py build-eval --tests-dir PRIVATE_SUITE_DIR` — build a separate
+  evaluator image from a private suite checkout, with suite-version metadata.
+  Evaluator releases are built from the private evaluator-source repository.
+- `./bench.py check` — validate prompt, seed, evaluator manifest and tier
+  counts, image separation and model config. This is the main preflight.
 - `./bench.py run --model provider/model` — score one run.
   `--variant all --keep-going` runs every named variant, highest effort first.
   `--dry-run` prints the Docker commands and discards the run; it writes no
@@ -47,9 +54,10 @@ Run from the repo root:
   label on a community result.
 - `./bench.py preview --run RUN_ID` — serve a built app on `127.0.0.1:4173`.
 
-`docker info` must succeed for build/run/check/rescore; `check` and `models`
-also need the `opencode` CLI. `preview` only needs `node`; `report`,
-`leaderboard`, `backfill` and the unit tests need neither Docker nor `opencode`.
+`docker info` must succeed for build/build-eval/run/check/rescore; `check`
+and `models` also need the `opencode` CLI. `preview` only needs `node`;
+`report`, `leaderboard`, `backfill` and the unit tests need neither Docker nor
+`opencode`.
 Harness syntax check: `python3 -m py_compile bench.py`.
 Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 
@@ -58,13 +66,17 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - Test titles **must** start with `[P0]`, `[P1]` or `[P2]`; `score_run()` parses
   the tier from that prefix. Unprefixed titles fall through to P2.
 - `EXPECTED = {"P0": 5, "P1": 9, "P2": 6}` in `bench.py` must match the suite;
-  `check` fails otherwise and scoring caps each tier at these totals. Adding or
-  removing a hidden test means updating `EXPECTED` (and docs that state counts).
-- The hidden suite runs only against the built `dist/`, served by
-  `docker/serve.mjs` with no network. It does not use the seed's Vite dev
-  server, and `npm run test:e2e` covers only the public smoke tests.
-- Hidden tests and the reference are mounted only after the agent exits. Never
-  copy either into the seed, `PROMPT.md`, the image, or an agent workdir.
+  `check` compares it with the evaluator manifest and Playwright listing.
+  Adding or removing a hidden test means updating `EXPECTED`, evaluator suite
+  metadata, and docs that state counts.
+- The hidden suite runs only inside the evaluator image against the built
+  `dist/`, served by `docker/serve.mjs` with no network. It does not use the
+  seed's Vite dev server, and `npm run test:e2e` covers only the public smoke
+  tests.
+- The agent/build image and evaluator image are separate. The evaluator runs
+  only after the agent exits and is never mounted into the agent container.
+  Never copy the private suite or reference into the seed, `PROMPT.md`, the
+  agent image, an agent workdir, or a public artifact.
 
 ## Community leaderboard invariants
 
@@ -133,21 +145,25 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
 - Root `PROMPT.md` is copied into every run as `PROMPT.md`; the seed has its own
   `AGENTS.md`. The task contract in `PROMPT.md`, the hidden tests, and the seed
   `data-testid`/state API must stay in sync.
-- The Dockerfile copies the seed's `package.json` + `package-lock.json` and runs
-  `npm ci --ignore-scripts` at image-build time. Changing seed dependencies or
-  the lockfile requires `./bench.py build`; runtime only copies a missing
-  `node_modules` from the image.
+- `docker/agent.Dockerfile` copies the seed's `package.json` +
+  `package-lock.json` and runs `npm ci --ignore-scripts` at image-build time.
+  Changing seed dependencies or the lockfile requires rebuilding the agent
+  image; runtime only copies a missing `node_modules` from the image.
+- `.dockerignore` must exclude `.private-eval/`, all historical evaluator
+  paths, run directories and generated result files from every public image
+  build context. `docker/evaluator.Dockerfile` uses a named `tests` build
+  context supplied by the private evaluator repository.
 - The seed pins `@playwright/test` `1.64.1`, matching the
   `mcr.microsoft.com/playwright:v1.64.1-noble` base image. Update both together
   if the Playwright version changes.
 
 ## Validating changes
 
-- For prompt/seed/test changes, run `./bench.py check`, then run the hidden suite
-  against the reference. The exact local command is in
-  `tasks/spriteforge-lite/reference/README.md` (build the reference, then run
-  the hidden config with `APP_DIR`, `APP_PORT`, `SERVE_SCRIPT`, `RESULT_FILE`
-  and `NODE_PATH`). Append `--grep '\[P0\]'` (or another tier) to run a subset.
+- For prompt/seed changes, run the public syntax/unit checks below plus
+  `./bench.py check` with validated agent and evaluator images. Hidden-suite
+  validation happens only in the private evaluator-source repository: build the
+  evaluator image from the private suite, then run it against the private
+  reference. The exact commands are in that repository's reference README.
 - The documented validation bar is 20/20 hidden tests, three consecutive runs,
   plus 4/4 public smoke tests. Treat a suite that is flaky on the reference as
   a test bug, not a model failure.
@@ -156,10 +172,13 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
   `COMPLETION.md` and `files_changed`.
 - For community/site changes, run
   `./bench.py submit --check submissions/examples/issue-1.json`,
-  `./bench.py site --issues tests/fixtures/issues.json --output /tmp/site`,
+  `./bench.py site --issues tests/fixtures/issues.json --output
+  /private/var/folders/2w/hgzb68wd3c37r_g6dqdm10940000gn/T/opencode/site`,
   `./bench.py site --issues tests/fixtures/issues-invalid.json --output
-  /tmp/site-bad --errors /tmp/errors.json`, `python3 -m unittest discover -s
-  tests`, and `actionlint .github/workflows/community-leaderboard.yml`.
+  /private/var/folders/2w/hgzb68wd3c37r_g6dqdm10940000gn/T/opencode/site-bad
+  --errors /private/var/folders/2w/hgzb68wd3c37r_g6dqdm10940000gn/T/opencode/errors.json`,
+  `python3 -m unittest discover -s tests`, and
+  `actionlint .github/workflows/*.yml`.
 - The public page is generated into `docs/` and is **not committed**. Do not
   hand-edit it; fix `bench.py`, the issue template/schema, or the workflow and
   rebuild.

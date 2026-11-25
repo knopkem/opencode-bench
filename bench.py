@@ -12,8 +12,8 @@ straight through to `opencode run` inside the agent container. The agent
 container gets the local OpenCode config mounted read-only, plus Chromium,
 Playwright and the seed's public smoke tests.
 
-The hidden Playwright suite is mounted only into the test container after the
-agent is dead.
+The hidden Playwright suite runs in a separate evaluator image after the agent
+is dead.
 """
 
 from __future__ import annotations
@@ -46,13 +46,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TASK_DIR = ROOT / "tasks" / "spriteforge-lite"
 SEED_DIR = TASK_DIR / "seed"
-TESTS_DIR = TASK_DIR / "tests"
 PROMPT_PATH = ROOT / "PROMPT.md"
 RUNS_DIR = ROOT / "runs"
 RESULTS_PATH = ROOT / "results.csv"
 REPORT_PATH = ROOT / "report.md"
+EVALUATOR_TESTS_DIR = "/opt/opencode-bench/tests"
+EVALUATOR_CONFIG = f"{EVALUATOR_TESTS_DIR}/playwright.config.ts"
+EVALUATOR_MANIFEST = "/opt/opencode-bench/evaluator.json"
 
-DEFAULT_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "opencode-bench:latest")
+LEGACY_IMAGE = os.environ.get("OPENCODE_BENCH_IMAGE", "")
+DEFAULT_AGENT_IMAGE = os.environ.get(
+    "OPENCODE_BENCH_AGENT_IMAGE",
+    LEGACY_IMAGE or "opencode-bench-agent:latest",
+)
+DEFAULT_EVAL_IMAGE = os.environ.get("OPENCODE_BENCH_EVAL_IMAGE", "opencode-bench-eval:latest")
+DEFAULT_IMAGE = DEFAULT_AGENT_IMAGE
 DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
 OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
 
@@ -178,6 +186,11 @@ CSV_FIELDS = [
     *EFFORT_FIELDS,
     "files_changed",
     "agent_ok",
+    "agent_image",
+    "agent_image_id",
+    "evaluator_image",
+    "evaluator_image_id",
+    "evaluator_suite_version",
     "report",
 ]
 
@@ -337,6 +350,127 @@ def image_exists(engine: str, image: str) -> bool:
         check=False,
     )
     return proc.returncode == 0
+
+
+def image_inspect(engine: str, image: str) -> dict | None:
+    """Return the container engine's JSON image metadata, or None when absent."""
+    proc = subprocess.run(
+        [engine, "image", "inspect", "--format", "{{json .}}", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def image_identifier(engine: str, image: str) -> str | None:
+    """Return a repository digest when present, falling back to the local image ID."""
+    data = image_inspect(engine, image)
+    if not data:
+        return None
+    digests = data.get("RepoDigests")
+    if isinstance(digests, list):
+        for digest in digests:
+            if isinstance(digest, str) and digest.strip():
+                return digest.strip()
+    image_id = data.get("Id")
+    return image_id if isinstance(image_id, str) and image_id else None
+
+
+def image_labels(engine: str, image: str) -> dict:
+    data = image_inspect(engine, image)
+    config = data.get("Config") if data else None
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    return labels if isinstance(labels, dict) else {}
+
+
+def collect_image_metadata(
+    engine: str, agent_image: str, evaluator_image: str
+) -> dict:
+    """Capture image references and immutable identifiers in run metadata."""
+    return {
+        "agent_image": agent_image,
+        "agent_image_id": image_identifier(engine, agent_image),
+        "evaluator_image": evaluator_image,
+        "evaluator_image_id": image_identifier(engine, evaluator_image),
+        "evaluator_suite_version": image_labels(engine, evaluator_image).get(
+            "org.opencode-bench.evaluator-suite-version"
+        ),
+    }
+
+
+def count_suite_tiers(tests_dir: Path) -> dict[str, int]:
+    """Count tier-prefixed tests in an evaluator source checkout."""
+    counts = {tier: 0 for tier in EXPECTED}
+    for path in sorted(tests_dir.glob("*.spec.ts")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for tier in counts:
+            counts[tier] += len(re.findall(rf'test\("\[{tier}\]', text))
+    return counts
+
+
+def read_evaluator_manifest(engine: str, image: str) -> tuple[dict | None, str | None]:
+    proc = subprocess.run(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-w",
+            "/opt/opencode-bench",
+            image,
+            "cat",
+            EVALUATOR_MANIFEST,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None, proc.stderr.strip() or "evaluator manifest could not be read"
+    try:
+        manifest = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid evaluator manifest: {exc}"
+    if not isinstance(manifest, dict):
+        return None, "invalid evaluator manifest: expected an object"
+    return manifest, None
+
+
+def list_evaluator_tests(engine: str, image: str) -> tuple[str | None, str | None]:
+    proc = subprocess.run(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-w",
+            "/opt/opencode-bench",
+            image,
+            "npx",
+            "playwright",
+            "test",
+            "--config",
+            EVALUATOR_CONFIG,
+            "--list",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None, proc.stderr.strip() or "evaluator Playwright listing failed"
+    return proc.stdout, None
 
 
 def config_env(config_dir: Path | None) -> dict[str, str]:
@@ -1211,7 +1345,7 @@ def start_agent(
         command += ["-e", f"OPENCODE_BENCH_VARIANT={args.variant}"]
     for key in sorted(env_names):
         command += ["-e", key]
-    command += ["-w", "/work", args.image, "bash", "-lc", agent_command(args)]
+    command += ["-w", "/work", args.agent_image, "bash", "-lc", agent_command(args)]
 
     if args.dry_run:
         print("+ " + " ".join(shlex.quote(part) for part in command))
@@ -1297,7 +1431,9 @@ def read_code(path: Path) -> int | None:
         return None
 
 
-def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run: bool) -> dict:
+def build_app(
+    run_dir: Path, workdir: Path, *, engine: str, agent_image: str, dry_run: bool
+) -> dict:
     command = [
         engine,
         "run",
@@ -1310,7 +1446,7 @@ def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         f"{run_dir}:/out",
         "-w",
         "/work",
-        image,
+        agent_image,
         "bash",
         "-lc",
         "set +e; "
@@ -1330,7 +1466,9 @@ def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
     }
 
 
-def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run: bool) -> dict:
+def run_tests(
+    run_dir: Path, workdir: Path, *, engine: str, evaluator_image: str, dry_run: bool
+) -> dict:
     result_file = run_dir / "playwright.json"
     if result_file.exists():
         result_file.unlink()
@@ -1344,8 +1482,6 @@ def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         "-v",
         f"{workdir / 'dist'}:/app:ro",
         "-v",
-        f"{TESTS_DIR}:/opt/opencode-bench/tests:ro",
-        "-v",
         f"{run_dir}:/out",
         "-w",
         "/opt/opencode-bench",
@@ -1355,10 +1491,10 @@ def run_tests(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         "RESULT_FILE=/out/playwright.json",
         "-e",
         "OUTPUT_DIR=/out/test-results",
-        image,
+        evaluator_image,
         "bash",
         "-lc",
-        "npx playwright test --config /opt/opencode-bench/tests/playwright.config.ts",
+        f"npx playwright test --config {EVALUATOR_CONFIG}",
     ]
     proc = run_command(command, log_path=run_dir / "test.log", dry_run=dry_run)
     if dry_run:
@@ -1540,6 +1676,17 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         f"- model: `{meta['model']}`",
         f"- provider: {meta['provider']}",
+        *([f"- agent image: `{meta['agent_image']}`"] if meta.get("agent_image") else []),
+        *(
+            [f"- evaluator image: `{meta['evaluator_image']}`"]
+            if meta.get("evaluator_image")
+            else []
+        ),
+        *(
+            [f"- evaluator suite: {meta['evaluator_suite_version']}"]
+            if meta.get("evaluator_suite_version")
+            else []
+        ),
         *([f"- hardware: {meta['hardware']}"] if meta.get("hardware") else []),
         f"- variant: {meta.get('variant', 'default')}",
         f"- thinking: {meta.get('thinking', 'unknown')}"
@@ -1707,12 +1854,58 @@ def cmd_build(args: argparse.Namespace) -> int:
         "-f",
         str(ROOT / "docker" / "agent.Dockerfile"),
         "-t",
-        args.image,
+        args.agent_image,
     ]
     if args.playwright_image:
         command += ["--build-arg", f"PLAYWRIGHT_IMAGE={args.playwright_image}"]
     if args.opencode_version:
         command += ["--build-arg", f"OPENCODE_VERSION={args.opencode_version}"]
+    command.append(str(ROOT))
+    print("+ " + " ".join(shlex.quote(part) for part in command))
+    if args.dry_run:
+        return 0
+    return subprocess.run(command, check=False).returncode
+
+
+def cmd_build_eval(args: argparse.Namespace) -> int:
+    tests_dir = Path(args.tests_dir).expanduser().resolve()
+    if not tests_dir.is_dir():
+        eprint(f"error: evaluator tests directory not found: {tests_dir}")
+        return 2
+    counts = count_suite_tiers(tests_dir)
+    if counts != EXPECTED:
+        found = " / ".join(f"{tier} {counts[tier]}" for tier in EXPECTED)
+        wanted = " / ".join(f"{tier} {EXPECTED[tier]}" for tier in EXPECTED)
+        eprint(f"error: evaluator suite has {found}; expected {wanted}")
+        return 2
+    if not engine_available(args.engine, args.dry_run):
+        eprint(f"error: {args.engine} is not available; start Docker/OrbStack or pass --engine")
+        return 2
+
+    suite_version = args.suite_version or os.environ.get(
+        "OPENCODE_BENCH_EVALUATOR_SUITE_VERSION", "local"
+    )
+    source_revision = args.source_revision or os.environ.get(
+        "OPENCODE_BENCH_EVALUATOR_SOURCE_REVISION", "local"
+    )
+    command = [
+        args.engine,
+        "build",
+        "-f",
+        str(ROOT / "docker" / "evaluator.Dockerfile"),
+        "--build-context",
+        f"tests={tests_dir}",
+        "-t",
+        args.eval_image,
+        "--build-arg",
+        f"AGENT_IMAGE={args.agent_image}",
+        "--build-arg",
+        f"EVALUATOR_SUITE_VERSION={suite_version}",
+        "--build-arg",
+        f"EVALUATOR_SOURCE_REVISION={source_revision}",
+    ]
+    for tier, total in EXPECTED.items():
+        command += ["--build-arg", f"EXPECTED_{tier}={total}"]
     command.append(str(ROOT))
     print("+ " + " ".join(shlex.quote(part) for part in command))
     if args.dry_run:
@@ -1898,9 +2091,17 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         files_changed=files_changed,
         agent_ok=agent["agent_ok"],
     )
-    build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
+    build = build_app(
+        run_dir, workdir, engine=args.engine, agent_image=args.agent_image, dry_run=args.dry_run
+    )
     if build["dist"]:
-        tests = run_tests(run_dir, workdir, engine=args.engine, image=args.image, dry_run=args.dry_run)
+        tests = run_tests(
+            run_dir,
+            workdir,
+            engine=args.engine,
+            evaluator_image=args.eval_image,
+            dry_run=args.dry_run,
+        )
     else:
         tests = {
             "test_ok": False,
@@ -1915,9 +2116,13 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         return {}
 
     score = score_run(tests["tests"], build, goal=args.goal)
+    image_meta = {} if args.dry_run else collect_image_metadata(
+        args.engine, args.agent_image, args.eval_image
+    )
     meta = {
         "run_id": run_id,
         "timestamp": timestamp,
+        **image_meta,
         "model": model,
         "provider": provider_of(model),
         "hardware": (getattr(args, "hardware", None) or "").strip()[:300],
@@ -2021,23 +2226,91 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append(f"missing {SEED_DIR / 'package.json'}")
     if not (SEED_DIR / "package-lock.json").exists():
         problems.append(f"missing {SEED_DIR / 'package-lock.json'}")
-    hidden = sorted(TESTS_DIR.glob("*.spec.ts"))
-    if not hidden:
-        problems.append(f"no hidden specs in {TESTS_DIR}")
-    tier_counts = {tier: 0 for tier in EXPECTED}
-    for path in hidden:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for tier in tier_counts:
-            tier_counts[tier] += len(re.findall(rf'test\("\[{tier}\]', text))
-    for tier, expected in EXPECTED.items():
-        if tier_counts[tier] != expected:
-            problems.append(
-                f"hidden suite has {tier_counts[tier]} {tier} tests, expected {expected}"
-            )
+
+    evaluator_info: dict = {}
     if not engine_available(args.engine, args.dry_run):
         problems.append(f"{args.engine} is not available")
-    elif not args.dry_run and not image_exists(args.engine, args.image):
-        problems.append(f"image {args.image} missing; run ./bench.py build")
+    elif not args.dry_run:
+        if not image_exists(args.engine, args.agent_image):
+            problems.append(
+                f"agent image {args.agent_image} missing; run ./bench.py build "
+                f"--agent-image {args.agent_image} or pull the configured public image"
+            )
+        else:
+            try:
+                clean = subprocess.run(
+                    [
+                        args.engine,
+                        "run",
+                        "--rm",
+                        "--network",
+                        "none",
+                        args.agent_image,
+                        "bash",
+                        "-lc",
+                        f"test ! -e {EVALUATOR_TESTS_DIR} && "
+                        "test ! -e /opt/opencode-bench/reference",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                problems.append("agent image contamination check timed out")
+            else:
+                if clean.returncode != 0:
+                    problems.append(
+                        "agent image contains evaluator tests or reference files"
+                    )
+
+        if not image_exists(args.engine, args.eval_image):
+            problems.append(
+                f"evaluator image {args.eval_image} missing; run "
+                "./bench.py build-eval --tests-dir PRIVATE_SUITE_DIR "
+                f"--eval-image {args.eval_image} or pull the configured public image"
+            )
+        else:
+            manifest, manifest_error = read_evaluator_manifest(
+                args.engine, args.eval_image
+            )
+            if manifest_error:
+                problems.append(manifest_error)
+            elif manifest:
+                expected = manifest.get("expected")
+                if expected != EXPECTED:
+                    problems.append(
+                        "evaluator manifest counts "
+                        f"{expected} do not match harness {EXPECTED}"
+                    )
+                else:
+                    evaluator_info = manifest
+                    listing, list_error = list_evaluator_tests(
+                        args.engine, args.eval_image
+                    )
+                    if list_error:
+                        problems.append(list_error)
+                    elif listing is not None:
+                        tier_counts = {
+                            tier: len(
+                                re.findall(
+                                    rf"›\s+\[[^][]+\][^›]*›\s+\[{tier}\]", listing
+                                )
+                            )
+                            for tier in EXPECTED
+                        }
+                        if tier_counts != EXPECTED:
+                            found = " / ".join(
+                                f"{tier} {tier_counts[tier]}" for tier in EXPECTED
+                            )
+                            problems.append(
+                                f"evaluator suite has {found}; expected "
+                                + " / ".join(
+                                    f"{tier} {EXPECTED[tier]}" for tier in EXPECTED
+                                )
+                            )
+                        else:
+                            evaluator_info["tier_counts"] = tier_counts
 
     config_dir = None
     models: list[str] = []
@@ -2061,7 +2334,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "--rm",
                     "--network",
                     "none",
-                    args.image,
+                    args.agent_image,
                     "bash",
                     "-lc",
                     "opencode --version && node --version && npx playwright --version",
@@ -2072,10 +2345,12 @@ def cmd_check(args: argparse.Namespace) -> int:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            problems.append("image smoke timed out")
+            problems.append("agent image smoke timed out")
         else:
             if smoke.returncode != 0:
-                problems.append(f"image smoke failed: {smoke.stdout}{smoke.stderr}")
+                problems.append(
+                    f"agent image smoke failed: {smoke.stdout}{smoke.stderr}"
+                )
             else:
                 versions = smoke.stdout.strip().replace("\n", ", ")
 
@@ -2085,14 +2360,23 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     print("ok")
-    print(f"  image   {args.image}")
-    print(f"  seed    {SEED_DIR}")
-    counts_label = " / ".join(f"{tier} {tier_counts[tier]}" for tier in EXPECTED)
-    print(f"  tests   {TESTS_DIR} ({sum(tier_counts.values())} tests: {counts_label})")
-    print(f"  config  {config_dir}")
-    print(f"  models  {len(models)}")
+    print(f"  agent image     {args.agent_image}")
+    print(f"  evaluator image {args.eval_image}")
+    if evaluator_info:
+        print(f"  suite           {evaluator_info.get('suite', 'spriteforge-lite')}")
+        print(f"  suite version   {evaluator_info.get('version', 'unknown')}")
+        counts_label = " / ".join(
+            f"{tier} {evaluator_info['tier_counts'][tier]}" for tier in EXPECTED
+        )
+        print(f"  tests           {sum(EXPECTED.values())} ({counts_label})")
+    else:
+        counts_label = " / ".join(f"{tier} {EXPECTED[tier]}" for tier in EXPECTED)
+        print(f"  tests           {sum(EXPECTED.values())} expected ({counts_label})")
+    print(f"  seed            {SEED_DIR}")
+    print(f"  config          {config_dir}")
+    print(f"  models          {len(models)}")
     if versions:
-        print(f"  tools   {versions}")
+        print(f"  tools           {versions}")
     return 0
 
 
@@ -2131,12 +2415,21 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         files_changed=meta["files_changed"],
         agent_ok=bool(meta.get("agent_ok")),
     )
-    build = build_app(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
+    build = build_app(
+        run_dir, workdir, engine=args.engine, agent_image=args.agent_image, dry_run=False
+    )
     if not build["dist"]:
         eprint("error: build produced no dist/index.html")
         return 1
-    tests = run_tests(run_dir, workdir, engine=args.engine, image=args.image, dry_run=False)
+    tests = run_tests(
+        run_dir,
+        workdir,
+        engine=args.engine,
+        evaluator_image=args.eval_image,
+        dry_run=False,
+    )
     score = score_run(tests["tests"], build, goal=meta.get("goal", "balanced"))
+    meta.update(collect_image_metadata(args.engine, args.agent_image, args.eval_image))
     meta.update(
         {
             "build_ok": build["build_ok"],
@@ -3291,6 +3584,11 @@ def submission_from_score(meta: dict, *, hardware: str | None = None) -> dict:
             "opencode_version": os.environ.get("OPENCODE_BENCH_OPENCODE_VERSION"),
             "suite": "spriteforge-lite",
             "hidden_tests": dict(EXPECTED),
+            "agent_image": meta.get("agent_image"),
+            "agent_image_id": meta.get("agent_image_id"),
+            "evaluator_image": meta.get("evaluator_image"),
+            "evaluator_image_id": meta.get("evaluator_image_id"),
+            "evaluator_suite_version": meta.get("evaluator_suite_version"),
         },
         "model": {
             "ref": meta.get("model"),
@@ -4987,13 +5285,56 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_image_arguments(
+    parser: argparse.ArgumentParser, *, include_evaluator: bool = False
+) -> None:
+    parser.add_argument(
+        "--agent-image",
+        default=argparse.SUPPRESS,
+        help="agent/build image reference",
+    )
+    if include_evaluator:
+        parser.add_argument(
+            "--eval-image",
+            default=argparse.SUPPRESS,
+            help="evaluator image reference containing the private suite",
+        )
+
+
+def resolve_image_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    legacy_image = getattr(args, "image", None)
+    explicit_agent = getattr(args, "agent_image", None)
+    if legacy_image:
+        eprint("warning: --image is deprecated; use --agent-image")
+        if explicit_agent and explicit_agent != legacy_image:
+            parser.error("--image cannot be combined with a different --agent-image")
+        args.agent_image = legacy_image
+    elif explicit_agent:
+        args.agent_image = explicit_agent
+    else:
+        args.agent_image = DEFAULT_AGENT_IMAGE
+    args.eval_image = getattr(args, "eval_image", None) or DEFAULT_EVAL_IMAGE
+    args.image = args.agent_image
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="opencode-bench")
     parser.add_argument("--engine", default=DEFAULT_ENGINE, help="docker or podman")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument(
+        "--image",
+        default=None,
+        help="deprecated alias for --agent-image",
+    )
+    parser.add_argument("--agent-image", default=None, help="agent/build image reference")
+    parser.add_argument(
+        "--eval-image",
+        default=None,
+        help="evaluator image reference containing the private suite",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    build = sub.add_parser("build", help="build the agent/eval image")
+    build = sub.add_parser("build", help="build the public agent/build image")
+    add_image_arguments(build)
     build.add_argument("--dry-run", action="store_true")
     build.add_argument(
         "--playwright-image",
@@ -5007,6 +5348,29 @@ def make_parser() -> argparse.ArgumentParser:
     )
     build.set_defaults(func=cmd_build)
 
+    build_eval = sub.add_parser(
+        "build-eval",
+        help="build an evaluator image from a private tests checkout",
+    )
+    add_image_arguments(build_eval, include_evaluator=True)
+    build_eval.add_argument(
+        "--tests-dir",
+        required=True,
+        help="private directory containing the hidden Playwright suite",
+    )
+    build_eval.add_argument(
+        "--suite-version",
+        default=None,
+        help="suite version stored in the evaluator image (default: local)",
+    )
+    build_eval.add_argument(
+        "--source-revision",
+        default=None,
+        help="private suite source revision recorded in the evaluator image",
+    )
+    build_eval.add_argument("--dry-run", action="store_true")
+    build_eval.set_defaults(func=cmd_build_eval)
+
     models = sub.add_parser("models", help="list models from `opencode models`")
     models.add_argument("--provider", default=None)
     models.add_argument("--all", action="store_true", help="print every model reference")
@@ -5014,6 +5378,7 @@ def make_parser() -> argparse.ArgumentParser:
     models.set_defaults(func=cmd_models)
 
     run = sub.add_parser("run", help="run one or more OpenCode models")
+    add_image_arguments(run, include_evaluator=True)
     run.add_argument("--model", default=None, help="provider/model, or 'all'")
     run.add_argument("--provider", default=None, help="filter the model menu")
     run.add_argument("--config", default=None, help="OpenCode config file or directory")
@@ -5043,12 +5408,16 @@ def make_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-preflight", action="store_true")
     run.set_defaults(func=cmd_run)
 
-    check = sub.add_parser("check", help="validate config, seed, tests and image")
+    check = sub.add_parser(
+        "check", help="validate config, seed, evaluator suite and images"
+    )
+    add_image_arguments(check, include_evaluator=True)
     check.add_argument("--dry-run", action="store_true")
     check.add_argument("--config", default=None, help="OpenCode config file or directory")
     check.set_defaults(func=cmd_check)
 
     rescore = sub.add_parser("rescore", help="rerun build+tests on an existing run")
+    add_image_arguments(rescore, include_evaluator=True)
     rescore.add_argument("--run", default=None, help="run directory name (default: latest)")
     rescore.set_defaults(func=cmd_rescore)
 
@@ -5147,6 +5516,7 @@ def make_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = make_parser()
     args = parser.parse_args()
+    resolve_image_args(parser, args)
     return int(args.func(args))
 
 

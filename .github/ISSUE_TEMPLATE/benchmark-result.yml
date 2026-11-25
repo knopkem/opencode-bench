@@ -39,7 +39,12 @@ body:
             "commit": null,
             "opencode_version": null,
             "suite": "spriteforge-lite",
-            "hidden_tests": {"P0": 5, "P1": 9, "P2": 6}
+            "hidden_tests": {"P0": 5, "P1": 9, "P2": 6},
+            "agent_image": null,
+            "agent_image_id": null,
+            "evaluator_image": null,
+            "evaluator_image_id": null,
+            "evaluator_suite_version": null
           },
           "model": {
             "ref": "provider/model",
@@ -127,5 +132,5 @@ body:
     attributes:
       label: Confirmation
       options:
-        - label: This run used the unmodified current hidden test suite and I did not edit score.json.
+        - label: This run used the unmodified current evaluator suite and I did not edit score.json.
           required: true
