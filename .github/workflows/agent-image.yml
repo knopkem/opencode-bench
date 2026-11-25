@@ -78,3 +78,19 @@ jobs:
 
       - name: Push the public agent image
         run: docker push "${{ steps.image.outputs.reference }}"
+
+      - name: Make the agent package public
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: opencode-bench-agent
+        run: |
+          owner_type="$(gh api "/users/$OWNER" --jq '.type' 2>/dev/null || echo Organization)"
+          encoded="$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["PACKAGE"], safe=""))')"
+          if [[ "$owner_type" == "User" ]]; then
+            endpoint="/user/packages/container/$encoded"
+          else
+            endpoint="/orgs/$OWNER/packages/container/$encoded"
+          fi
+          gh api --method PATCH "$endpoint" -f visibility=public
