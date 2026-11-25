@@ -1,6 +1,6 @@
 # Migration Plan: Public Harness with a Separate Evaluator Image
 
-Status: public history rewritten and force-pushed; private evaluator repository created; image publishing and final public visibility remain  
+Status: public history rewritten and force-pushed; private evaluator repository created; agent/evaluator images pushed; final package/source visibility remains  
 Date: 2026-11-25
 
 ## 0. Current implementation state
@@ -29,16 +29,22 @@ Completed for the public repository:
 - The private pre-rewrite bundle, ref map and old-to-new commit map are stored
   under `.private-eval/history/`.
 
-Still pending because they require external services or repository-owner
-actions:
+Image releases:
 
-1. Make the pushed public agent GHCR package public; GitHub's workflow token
-   cannot manage this user-package visibility.
-2. Publish a validated evaluator image from `knopkem/opencode-bench-eval` and
-   make that package public only when ready to distribute the suite image.
-3. Re-run the GitHub issue/artifact audit immediately before changing source
+- `ghcr.io/knopkem/opencode-bench-agent:edge` was pushed and its package made
+  public. Anonymous HTTP manifest access returns 200.
+- `ghcr.io/knopkem/opencode-bench-eval:edge` was built from
+  `knopkem/opencode-bench-eval`, passed the private reference suite in CI, and
+  was pushed. Its package remains private until the owner explicitly changes
+  visibility.
+
+Still pending because they require repository-owner actions:
+
+1. Make `opencode-bench-eval` public only when ready to distribute the
+   evaluator suite image. Anyone pulling it can inspect and recover the tests.
+2. Re-run the GitHub issue/artifact audit immediately before changing source
    repository visibility.
-4. Make the public source repository public only after those checks pass.
+3. Make the public source repository public only after those checks pass.
 
 ## 1. Purpose and threat model
 
