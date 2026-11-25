@@ -1,6 +1,6 @@
 # Migration Plan: Public Harness with a Separate Evaluator Image
 
-Status: implementation in progress; history rewrite and force-push intentionally deferred for final confirmation  
+Status: public history rewritten and force-pushed; private repository, image publishing and GitHub artifact audit remain  
 Date: 2026-11-25
 
 ## 0. Current implementation state
@@ -19,15 +19,23 @@ Implemented locally:
 - Public documentation, submission metadata and regression tests reflect the
   split.
 
-Still pending because they require external services or destructive Git/remote
-operations:
+Completed for the public repository:
+
+- The migration was committed and all public branches were rewritten with
+  `git-filter-repo`.
+- The rewritten history was verified for removed paths and distinctive hidden
+  test content, then force-pushed.
+- The private pre-rewrite bundle, ref map and old-to-new commit map are stored
+  under `.private-eval/history/`.
+
+Still pending because they require external services or repository-owner
+actions:
 
 1. Copy `.private-eval/` into the real private evaluator-source repository.
 2. Publish validated public agent and evaluator images.
-3. Commit the public-source migration.
-4. Prune all branches/tags with `git-filter-repo` and force-push.
-5. Audit GitHub issues, PRs, releases, Actions artifacts and cached objects.
-6. Make the repository public only after those checks pass.
+3. Audit GitHub issues, PRs, releases, Actions artifacts, package metadata and
+   cached objects that Git refs do not rewrite.
+4. Make the repository public only after those checks pass.
 
 ## 1. Purpose and threat model
 
