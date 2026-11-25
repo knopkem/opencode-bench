@@ -1,6 +1,6 @@
 # Migration Plan: Public Harness with a Separate Evaluator Image
 
-Status: public history rewritten and force-pushed; private repository, image publishing and GitHub artifact audit remain  
+Status: public history rewritten and force-pushed; private evaluator repository created; image publishing and final public visibility remain  
 Date: 2026-11-25
 
 ## 0. Current implementation state
@@ -14,8 +14,9 @@ Implemented locally:
 - `docker/evaluator.Dockerfile` builds the private-suite evaluator layer.
 - `.github/workflows/agent-image.yml` publishes the public agent image.
 - The private suite, reference, historical planning documents and raw detailed
-  reports are staged locally under the ignored `.private-eval/` directory, with
-  a private evaluator-image workflow in `.private-eval/.github/workflows/`.
+  reports now live in the private `knopkem/opencode-bench-eval` repository. Its
+  local checkout is the ignored `.private-eval/` directory inside this working
+  tree, including the private evaluator-image workflow under `.github/workflows/`.
 - Public documentation, submission metadata and regression tests reflect the
   split.
 
@@ -31,11 +32,13 @@ Completed for the public repository:
 Still pending because they require external services or repository-owner
 actions:
 
-1. Copy `.private-eval/` into the real private evaluator-source repository.
-2. Publish validated public agent and evaluator images.
-3. Audit GitHub issues, PRs, releases, Actions artifacts, package metadata and
-   cached objects that Git refs do not rewrite.
-4. Make the repository public only after those checks pass.
+1. Make the pushed public agent GHCR package public; GitHub's workflow token
+   cannot manage this user-package visibility.
+2. Publish a validated evaluator image from `knopkem/opencode-bench-eval` and
+   make that package public only when ready to distribute the suite image.
+3. Re-run the GitHub issue/artifact audit immediately before changing source
+   repository visibility.
+4. Make the public source repository public only after those checks pass.
 
 ## 1. Purpose and threat model
 
