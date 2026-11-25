@@ -200,7 +200,10 @@ The deprecated global `--image` option remains an alias for `--agent-image`.
 `run`, `check`, `rescore` and `build-eval` accept both image options after the
 subcommand as well.
 
-For released public images, pull and select matching versions explicitly:
+For released public images, pull and select matching versions explicitly. The
+first release may require the repository owner to open the GHCR package
+settings and set visibility to **public** if GitHub's token cannot change a
+user-package setting automatically:
 
 ```bash
 docker pull ghcr.io/knopkem/opencode-bench-agent:EDGE_OR_RELEASE

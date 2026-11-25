@@ -80,6 +80,7 @@ jobs:
         run: docker push "${{ steps.image.outputs.reference }}"
 
       - name: Make the agent package public
+        continue-on-error: true
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -93,4 +94,6 @@ jobs:
           else
             endpoint="/orgs/$OWNER/packages/container/$encoded"
           fi
-          gh api --method PATCH "$endpoint" -f visibility=public
+          if ! gh api --method PATCH "$endpoint" -f visibility=public; then
+            echo "::warning::Set $PACKAGE package visibility to public in GitHub Packages; the workflow token cannot manage this user package."
+          fi
