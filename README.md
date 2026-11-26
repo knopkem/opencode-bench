@@ -72,7 +72,25 @@ Running the benchmark is the full test:
 ./bench.py run --model provider/model
 ```
 
-The model works in an isolated container. After it finishes, OpenCode Bench:
+The model works in an isolated container. Its network is restricted to the
+selected model provider and OpenCode infrastructure through a separate forwarding
+proxy. TLS is not intercepted, so existing API keys and authenticated cloud-model
+connections continue to work. Custom provider `baseURL` values and local IP/ports
+are discovered from OpenCode configuration. If a provider uses an additional API
+or authentication host, approve it explicitly:
+
+```bash
+./bench.py run --model provider/model --allow-host auth.example.com:443
+```
+
+The option is repeatable and accepts URLs, hostnames, IP addresses, and explicit
+ports. It does not disable the network policy. For a provider on the host, use a
+container-reachable address such as `host.docker.internal`, not `127.0.0.1`.
+Requests denied by the proxy are recorded in `egress.log`; attempts to reach
+evaluation sources make the run ineligible without discarding its test-quality
+results. Direct connections have no route outside the internal network.
+
+After the model finishes, OpenCode Bench:
 
 1. checks that the app compiles;
 2. serves the built app locally;
@@ -137,8 +155,9 @@ The browser tests are grouped by importance:
 - **P1:** core editor features
 - **P2:** polish and edge cases
 
-A run is eligible when it builds successfully, has no P0 failures, and reaches at
-least 80% weighted quality. The local leaderboard combines quality, speed, and
+A run is eligible when it builds successfully, has no P0 failures, reaches at
+least 80% weighted quality, and has no recorded evaluation-source integrity
+violation. The local leaderboard combines quality, speed, and
 the number of context compactions. Full quality matters more than a fast but
 broken app.
 

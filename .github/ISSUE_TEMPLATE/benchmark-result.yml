@@ -98,6 +98,7 @@ body:
             },
             "quality": null,
             "eligible": false,
+            "integrity_violation": false,
             "steps": 0,
             "input_tokens": null,
             "output_tokens": null,

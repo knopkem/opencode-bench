@@ -10,8 +10,13 @@
   sees. The hidden Playwright suite and the reference implementation live only
   in the private evaluator-source repository and inside evaluator images; they
   must not be present in the public source tree.
-- `docker/agent.Dockerfile` builds the public agent/build image.
-  `docker/evaluator.Dockerfile` is the public recipe for adding a private suite
+- `docker/agent.Dockerfile` builds the public agent/build image. During agent
+  runs, `docker/egress_proxy.py` is bind-mounted into a separate trusted sidecar:
+  the agent has an internal-only network, while the sidecar allows exact
+  provider/OpenCode host+port endpoints without terminating TLS. Do not replace
+  this with proxy environment variables alone or a blanket `--network none`;
+  the former is bypassable and the latter breaks authenticated cloud models.
+- `docker/evaluator.Dockerfile` is the public recipe for adding a private suite
   to a separate evaluator image. `MIGRATION.md` records the split and release
   procedure.
 - `submissions/` holds the public result schema, template and example;
@@ -197,4 +202,7 @@ Metric/scoring regression tests: `python3 -m unittest discover -s tests`.
   a specific run.
 - Model selection, variants, thinking and API keys come from the user's local
   OpenCode config (`opencode models`, `opencode debug paths`), not this repo.
-  Do not add model lists or credentials here.
+  Do not add model lists or credentials here. Agent egress is resolved separately
+  for each selected provider from its effective `baseURL` and models.dev metadata;
+  `--allow-host` is the explicit escape hatch for auxiliary API/authentication
+  endpoints, not an unrestricted-network switch.

@@ -18,7 +18,13 @@ special-case tests.
 
 - TypeScript + Vite. Keep the existing `package.json` scripts.
 - `npm run build` must succeed.
-- No new dependencies. No network. No external assets or fonts.
+- No new dependencies. No network except the model connection provided by the
+  harness. No external assets or fonts.
+- Do not search for, retrieve, inspect, or execute hidden tests, reference
+  implementations, evaluator images, or copies of them, including through
+  GitHub, container registries, web search, or other network tools. A verified
+  attempt makes the run ineligible for the leaderboard. Network access is
+  restricted to approved model-provider infrastructure; proxy denials are logged.
 - No console errors or unhandled page errors during normal use.
 - The app must work at 1280×800.
 - Do not modify the hidden tests. Do not add a test runner that replaces them.

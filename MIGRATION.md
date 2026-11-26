@@ -162,10 +162,14 @@ The target flow is:
 The evaluator container no longer needs a host `TESTS_DIR` bind mount. It must
 still receive no agent credentials and must not mount the agent workdir read-write.
 
-Image separation prevents accidental local filesystem discovery by the agent. It
-does not prevent an agent from retrieving a public evaluator image over a network.
-If runtime retrieval becomes a concern, use a private evaluator image or add
-network egress restrictions that allow only required model/provider endpoints.
+Image separation prevents accidental local filesystem discovery by the agent.
+Runtime retrieval is additionally restricted by an internal-only agent network
+and a separate non-TLS-terminating egress proxy. The proxy allows only the
+selected model provider and required OpenCode infrastructure, so authenticated
+cloud providers continue to work; custom auxiliary endpoints require an explicit
+`--allow-host`. This does not make a public evaluator image confidential to a
+determined person outside the sandbox. Use a private evaluator image or trusted
+remote scoring service when that stronger guarantee is required.
 
 ## 4. Harness changes
 

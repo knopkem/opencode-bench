@@ -15,7 +15,9 @@ first.
 
 - Do not ask questions. Make reasonable decisions and record them in
   `DECISIONS.md`.
-- Do not look for hidden acceptance tests; they are not in this container.
+- Do not look for hidden acceptance tests, reference implementations, or
+  evaluator images. Accessing evaluation sources over any network/tool is an
+  integrity violation, not a workaround for a missing local file.
 - The public tests are a subset. Passing them is necessary, not sufficient.
 - When done, write `COMPLETION.md` and stop.
 

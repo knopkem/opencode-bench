@@ -130,6 +130,7 @@
         },
         "quality": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "eligible": {"type": ["boolean", "null"]},
+        "integrity_violation": {"type": "boolean"},
         "steps": {"type": ["integer", "null"], "minimum": 0},
         "input_tokens": {"type": ["integer", "null"], "minimum": 0},
         "output_tokens": {"type": ["integer", "null"], "minimum": 0},

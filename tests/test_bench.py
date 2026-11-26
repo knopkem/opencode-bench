@@ -424,6 +424,144 @@ class CommunitySubmissionTests(unittest.TestCase):
         self.assertEqual(row["source"], "community")
 
 
+class AgentNetworkTests(unittest.TestCase):
+    def test_custom_provider_base_url_and_extra_auth_host_are_allowed(self) -> None:
+        info = {
+            "providers": {
+                "custom": {
+                    "settings": {"baseURL": "https://api.example.com/v1"},
+                    "models": {"model": {}},
+                }
+            }
+        }
+        with mock.patch.object(bench, "load_config_info", return_value=info):
+            allowlist = bench.resolve_agent_allowlist(
+                "custom/model", Path("/config"), ["https://login.example.com/oauth"]
+            )
+
+        self.assertEqual(allowlist["api.example.com"], [443])
+        self.assertEqual(allowlist["login.example.com"], [443])
+        self.assertEqual(allowlist["models.dev"], [443])
+        self.assertNotIn("github.com", allowlist)
+
+    def test_builtin_provider_uses_model_metadata_and_sdk_default(self) -> None:
+        with (
+            mock.patch.object(bench, "load_config_info", return_value={}),
+            mock.patch.object(
+                bench,
+                "load_models_dev",
+                return_value={"anthropic": {"npm": "@ai-sdk/anthropic"}},
+            ),
+        ):
+            allowlist = bench.resolve_agent_allowlist("anthropic/claude", Path("/config"), [])
+        self.assertEqual(allowlist["api.anthropic.com"], [443])
+
+    def test_unknown_provider_fails_closed_with_actionable_option(self) -> None:
+        with (
+            mock.patch.object(bench, "load_config_info", return_value={}),
+            mock.patch.object(bench, "load_models_dev", return_value={}),
+            self.assertRaisesRegex(SystemExit, "--allow-host"),
+        ):
+            bench.resolve_agent_allowlist("unknown/model", Path("/config"), [])
+
+    def test_endpoint_parser_supports_local_ports_and_rejects_credentials(self) -> None:
+        self.assertEqual(bench.parse_endpoint("http://192.168.1.5:8000/v1"), ("192.168.1.5", 8000))
+        self.assertEqual(bench.parse_endpoint("api.example.com"), ("api.example.com", 443))
+        with self.assertRaisesRegex(ValueError, "credentials"):
+            bench.parse_endpoint("https://user:secret@api.example.com")
+
+    def test_agent_dry_run_uses_internal_network_and_preserves_auth_forwarding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("work", "data", "run", "config"):
+                (root / name).mkdir()
+            args = argparse.Namespace(
+                engine="docker",
+                agent_image="agent:test",
+                dry_run=True,
+                variant=None,
+                agent=None,
+                pure=False,
+                timeout=100,
+                idle_timeout=50,
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(bench.subprocess, "Popen") as popen,
+                contextlib.redirect_stdout(output),
+            ):
+                result = bench.start_agent(
+                    "custom/model",
+                    root / "config",
+                    root / "work",
+                    root / "data",
+                    root / "run",
+                    env_names={"API_KEY"},
+                    allowlist={"api.example.com": [443]},
+                    args=args,
+                )
+            popen.assert_not_called()
+
+        command = output.getvalue()
+        self.assertIn("network create --internal", command)
+        self.assertIn("HTTPS_PROXY=http://egress-proxy:8080", command)
+        self.assertIn("-e API_KEY", command)
+        self.assertNotIn("API_KEY=", command)
+        self.assertIn("OPENCODE_CONFIG_CONTENT=", command)
+        self.assertFalse(result["integrity_violation"])
+
+    def test_egress_audit_separates_integrity_from_other_denials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "egress.log"
+            events = [
+                {"event": "allow", "host": "api.example.com", "port": 443},
+                {"event": "deny", "host": "example.com", "port": 443},
+                {"event": "deny", "host": "ghcr.io", "port": 443},
+                {"event": "deny", "host": "raw.githubusercontent.com", "port": 443},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            audit = bench.read_egress_audit(log)
+
+        self.assertEqual(audit["network_denied"], 3)
+        self.assertTrue(audit["integrity_violation"])
+        self.assertEqual(len(audit["integrity_reasons"]), 2)
+        self.assertNotIn("example.com", " ".join(audit["integrity_reasons"]))
+
+    def test_integrity_violation_changes_eligibility_not_quality(self) -> None:
+        tests = {
+            f"[{tier}] test-{index}": True
+            for tier, total in bench.EXPECTED.items()
+            for index in range(total)
+        }
+        clean = bench.score_run(tests, {"build_ok": True}, goal="balanced")
+        flagged = bench.score_run(
+            tests,
+            {"build_ok": True},
+            goal="balanced",
+            integrity_violation=True,
+        )
+        self.assertTrue(clean["eligible"])
+        self.assertFalse(flagged["eligible"])
+        self.assertEqual(flagged["quality"], clean["quality"])
+        self.assertEqual(flagged["counts"], clean["counts"])
+
+    def test_community_integrity_round_trip(self) -> None:
+        example = json.loads(
+            (ROOT / "submissions" / "examples" / "issue-1.json").read_text()
+        )
+        example["run"]["integrity_violation"] = True
+        example["run"]["eligible"] = True
+        self.assertTrue(any("eligible" in error for error in bench.validate_submission(example)))
+
+        example["run"]["eligible"] = False
+        self.assertEqual(bench.validate_submission(example), [])
+        normalized = bench.normalize_submission(example)
+        row = bench.submission_to_row(normalized)
+        self.assertFalse(row["eligible"])
+        self.assertTrue(row["integrity_violation"])
+        self.assertEqual(row["quality"], 1.0)
+
+
 class ImageMigrationTests(unittest.TestCase):
     def test_missing_public_image_is_pulled(self) -> None:
         with (

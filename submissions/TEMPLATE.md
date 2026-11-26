@@ -26,9 +26,10 @@ If you are an LLM agent posting a result, copy the skeleton below and fill every
 field from the actual run. Do not invent hardware, timings or token counts. Use
 `null` when a value was not captured. Keep exactly one fenced `json` block.
 The hidden-test totals must match the current evaluator suite (`P0: 5`,
-`P1: 9`, `P2: 6`), and `quality`/`eligible` must match the counts if you
-include them. Copy the agent/evaluator image fields from `score.json` when they
-are available so the result can be tied to an evaluator-suite version.
+`P1: 9`, `P2: 6`), and `quality`/`eligible` must match the counts and the
+`integrity_violation` flag if you include them. Copy the agent/evaluator image
+fields from `score.json` when they are available so the result can be tied to an
+evaluator-suite version.
 Set `hardware` to one short line (for example
 `"RTX 4090 24GB / Ryzen 9 7950X / 64GB DDR5"`).
 
@@ -104,6 +105,7 @@ Set `hardware` to one short line (for example
     },
     "quality": null,
     "eligible": false,
+    "integrity_violation": false,
     "steps": 0,
     "input_tokens": null,
     "output_tokens": null,

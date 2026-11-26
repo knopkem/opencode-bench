@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
@@ -53,6 +54,34 @@ REPORT_PATH = ROOT / "report.md"
 EVALUATOR_TESTS_DIR = "/opt/opencode-bench/tests"
 EVALUATOR_CONFIG = f"{EVALUATOR_TESTS_DIR}/playwright.config.ts"
 EVALUATOR_MANIFEST = "/opt/opencode-bench/evaluator.json"
+EGRESS_PROXY_PATH = ROOT / "docker" / "egress_proxy.py"
+# OpenCode may need model metadata and provider SDKs before the first request.
+# These hosts are infrastructure, not general web access.
+OPENCODE_INFRA_ENDPOINTS = {
+    "models.dev": [443],
+    "models.opencode.ai": [443],
+    "registry.npmjs.org": [443],
+}
+# models.dev leaves the endpoint implicit for a few first-party AI SDKs.
+SDK_ENDPOINTS = {
+    "@ai-sdk/anthropic": "https://api.anthropic.com",
+    "@ai-sdk/cerebras": "https://api.cerebras.ai",
+    "@ai-sdk/cohere": "https://api.cohere.com",
+    "@ai-sdk/deepinfra": "https://api.deepinfra.com",
+    "@ai-sdk/google": "https://generativelanguage.googleapis.com",
+    "@ai-sdk/groq": "https://api.groq.com",
+    "@ai-sdk/mistral": "https://api.mistral.ai",
+    "@ai-sdk/openai": "https://api.openai.com",
+    "@ai-sdk/xai": "https://api.x.ai",
+    "@openrouter/ai-sdk-provider": "https://openrouter.ai",
+}
+EVALUATION_SOURCE_SUFFIXES = (
+    "github.com",
+    "githubusercontent.com",
+    "ghcr.io",
+    "docker.com",
+    "docker.io",
+)
 
 PUBLIC_AGENT_IMAGE = "ghcr.io/knopkem/opencode-bench-agent:edge"
 PUBLIC_EVAL_IMAGE = "ghcr.io/knopkem/opencode-bench-eval:edge"
@@ -179,6 +208,8 @@ CSV_FIELDS = [
     "minor_issues",
     "fatal",
     "eligible",
+    "integrity_violation",
+    "network_denied",
     "wall_s",
     "compactions",
     "watchdog",
@@ -565,25 +596,32 @@ def resolve_config_dir(explicit: str | None, run_dir: Path) -> Path:
     sys.exit("error: could not find the OpenCode config directory; pass --config")
 
 
-def load_model_entry(model: str) -> dict | None:
+def load_config_info(config_dir: Path | None = None) -> dict:
+    """Return effective OpenCode config without printing its secret values."""
     try:
         proc = subprocess.run(
             [OPENCODE, "debug", "config", "--standalone"],
             capture_output=True,
             text=True,
             timeout=15,
+            env=config_env(config_dir),
             check=False,
         )
         sources = json.loads(proc.stdout)
         info: dict = {}
         for source in sources:
-            if isinstance(source.get("info"), dict):
+            if isinstance(source, dict) and isinstance(source.get("info"), dict):
                 info.update(source["info"])
-        providers = info.get("providers") or info.get("provider") or {}
-        provider, _, model_id = model.partition("/")
-        return (providers.get(provider) or {}).get("models", {}).get(model_id)
+        return info
     except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
-        return None
+        return {}
+
+
+def load_model_entry(model: str, config_dir: Path | None = None) -> dict | None:
+    info = load_config_info(config_dir)
+    providers = info.get("providers") or info.get("provider") or {}
+    provider, _, model_id = model.partition("/")
+    return (providers.get(provider) or {}).get("models", {}).get(model_id)
 
 
 def describe_variant(entry: dict, variant: str | None) -> tuple[str, str]:
@@ -608,8 +646,10 @@ def describe_variant(entry: dict, variant: str | None) -> tuple[str, str]:
     return "unknown", ""
 
 
-def model_thinking(model: str, variant: str | None) -> tuple[str, str]:
-    entry = load_model_entry(model)
+def model_thinking(
+    model: str, variant: str | None, config_dir: Path | None = None
+) -> tuple[str, str]:
+    entry = load_model_entry(model, config_dir)
     return describe_variant(entry, variant) if entry else ("unknown", "")
 
 
@@ -662,6 +702,140 @@ def config_env_names(config_dir: Path) -> set[str]:
             if name in os.environ:
                 names.add(name)
     return names
+
+
+def parse_endpoint(value: str) -> tuple[str, int]:
+    """Parse an approved URL or host[:port], rejecting credentials and wildcards."""
+    text = value.strip()
+    if not text or "*" in text:
+        raise ValueError(f"invalid network endpoint {value!r}")
+    candidate = text if "://" in text else f"https://{text}"
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"invalid network endpoint {value!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("network endpoints must not contain credentials")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"invalid network endpoint {value!r}") from exc
+    host = parsed.hostname.rstrip(".").lower()
+    return host, port
+
+
+def add_endpoint(allowlist: dict[str, list[int]], value: str) -> None:
+    host, port = parse_endpoint(value)
+    ports = allowlist.setdefault(host, [])
+    if port not in ports:
+        ports.append(port)
+        ports.sort()
+
+
+def configured_base_urls(value: object) -> list[str]:
+    """Collect endpoint fields from one selected provider, never logging the config."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in ("baseurl", "api") and isinstance(item, str):
+                if item.startswith(("http://", "https://")):
+                    found.append(item)
+            elif isinstance(item, (dict, list)):
+                found.extend(configured_base_urls(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(configured_base_urls(item))
+    return found
+
+
+def load_models_dev(config_dir: Path) -> dict:
+    """Read OpenCode's model metadata, refreshing it on the host only if needed."""
+    cache_dir: Path | None = None
+    try:
+        proc = subprocess.run(
+            [OPENCODE, "debug", "paths"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=config_env(config_dir),
+            check=False,
+        )
+        for line in proc.stdout.splitlines():
+            match = re.match(r"^cache\s+(.+)$", line.strip())
+            if match:
+                cache_dir = Path(match.group(1)).expanduser()
+                break
+        if cache_dir:
+            cached = cache_dir / "models.json"
+            if cached.exists():
+                data = json.loads(cached.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        with urllib.request.urlopen("https://models.dev/api.json", timeout=10) as response:
+            data = json.load(response)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def resolve_agent_allowlist(
+    model: str, config_dir: Path, extra_endpoints: list[str]
+) -> dict[str, list[int]]:
+    """Build a per-run, fail-closed allowlist for the selected model provider."""
+    allowlist = {host: list(ports) for host, ports in OPENCODE_INFRA_ENDPOINTS.items()}
+    discovered: list[str] = []
+    info = load_config_info(config_dir)
+    providers = info.get("providers") or info.get("provider") or {}
+    provider_name, _, model_id = model.partition("/")
+    provider = providers.get(provider_name) or {}
+    if isinstance(provider, dict):
+        discovered.extend(configured_base_urls(provider))
+        selected = (provider.get("models") or {}).get(model_id) or {}
+        discovered.extend(configured_base_urls(selected))
+
+    if not discovered:
+        metadata = load_models_dev(config_dir).get(provider_name) or {}
+        if isinstance(metadata, dict):
+            api = metadata.get("api")
+            if isinstance(api, str) and api.startswith(("http://", "https://")):
+                discovered.append(api)
+            sdk_endpoint = SDK_ENDPOINTS.get(str(metadata.get("npm") or ""))
+            if sdk_endpoint:
+                discovered.append(sdk_endpoint)
+
+    for value in discovered:
+        try:
+            add_endpoint(allowlist, value)
+        except ValueError:
+            # An unrelated malformed provider field must not disable validation of
+            # an explicitly supplied endpoint below.
+            continue
+    for value in extra_endpoints:
+        try:
+            add_endpoint(allowlist, value)
+        except ValueError as exc:
+            raise SystemExit(f"error: --allow-host: {exc}") from exc
+
+    approved = {
+        (host, port)
+        for host, ports in allowlist.items()
+        for port in ports
+        if host not in OPENCODE_INFRA_ENDPOINTS
+    }
+    if not approved:
+        raise SystemExit(
+            f"error: could not determine the API endpoint for {provider_name!r}; "
+            "pass --allow-host HOST[:PORT] or --allow-host https://api.example.com. "
+            "The agent network remains restricted; model authentication is unchanged."
+        )
+    return allowlist
+
+
+def format_allowlist(allowlist: dict[str, list[int]]) -> list[str]:
+    return [
+        f"{host}:{port}"
+        for host, ports in sorted(allowlist.items())
+        for port in sorted(ports)
+    ]
 
 
 def copy_seed(destination: Path) -> None:
@@ -1322,6 +1496,147 @@ def classify_outcome(
     return "incomplete"
 
 
+def start_egress_proxy(
+    engine: str,
+    agent_image: str,
+    run_dir: Path,
+    allowlist: dict[str, list[int]],
+    dry_run: bool,
+) -> dict:
+    """Start a trusted proxy with a route out; the agent gets only an internal net."""
+    suffix = uuid.uuid4().hex[:8]
+    proxy = f"opencode-bench-egress-{suffix}"
+    network = f"opencode-bench-internal-{suffix}"
+    policy_path = run_dir / "egress-allowlist.json"
+    policy_path.write_text(json.dumps(allowlist, indent=2) + "\n", encoding="utf-8")
+    info = {
+        "proxy": proxy,
+        "network": network,
+        "policy_path": policy_path,
+        "log_path": run_dir / "egress.log",
+        "dry_run": dry_run,
+    }
+    create = [engine, "network", "create", "--internal", network]
+    launch = [
+        engine,
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        proxy,
+        "--add-host",
+        "host.docker.internal:host-gateway",
+        "-v",
+        f"{policy_path}:/run/egress-allowlist.json:ro",
+        "-v",
+        f"{EGRESS_PROXY_PATH}:/opt/opencode-bench/egress_proxy.py:ro",
+        "--entrypoint",
+        "python3",
+        agent_image,
+        "/opt/opencode-bench/egress_proxy.py",
+        "--port",
+        "8080",
+        "--allowlist",
+        "/run/egress-allowlist.json",
+    ]
+    connect = [engine, "network", "connect", "--alias", "egress-proxy", network, proxy]
+    if dry_run:
+        for command in (create, launch, connect):
+            print("+ " + " ".join(shlex.quote(part) for part in command))
+        return info
+
+    try:
+        for command in (create, launch, connect):
+            proc = subprocess.run(command, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or f"command failed: {command[1]}")
+        ready = False
+        for _ in range(50):
+            probe = subprocess.run(
+                [
+                    engine,
+                    "exec",
+                    proxy,
+                    "python3",
+                    "-c",
+                    "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if probe.returncode == 0:
+                ready = True
+                break
+            time.sleep(0.1)
+        if not ready:
+            raise RuntimeError("egress proxy did not become ready")
+        return info
+    except Exception:
+        stop_egress_proxy(engine, info)
+        raise
+
+
+def evaluation_source_host(host: str) -> bool:
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in EVALUATION_SOURCE_SUFFIXES)
+
+
+def read_egress_audit(path: Path) -> dict:
+    denied: set[str] = set()
+    integrity_reasons: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("event") != "deny":
+            continue
+        host = str(event.get("host") or "").lower()
+        port = event.get("port")
+        destination = f"{host}:{port}" if host else "unknown"
+        denied.add(destination)
+        if evaluation_source_host(host):
+            integrity_reasons.add(f"blocked evaluation-source access to {destination}")
+    return {
+        "network_denied": len(denied),
+        "network_denied_hosts": sorted(denied),
+        "integrity_violation": bool(integrity_reasons),
+        "integrity_reasons": sorted(integrity_reasons),
+    }
+
+
+def stop_egress_proxy(engine: str, info: dict) -> dict:
+    """Save a credential-free audit before removing the sidecar and its network."""
+    if info.get("dry_run"):
+        for command in (
+            [engine, "rm", "-f", info["proxy"]],
+            [engine, "network", "rm", info["network"]],
+        ):
+            print("+ " + " ".join(shlex.quote(part) for part in command))
+        return read_egress_audit(info["log_path"])
+    logs = subprocess.run(
+        [engine, "logs", info["proxy"]], capture_output=True, text=True, check=False
+    )
+    info["log_path"].write_text(logs.stdout + logs.stderr, encoding="utf-8")
+    subprocess.run(
+        [engine, "rm", "-f", info["proxy"]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    subprocess.run(
+        [engine, "network", "rm", info["network"]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return read_egress_audit(info["log_path"])
+
+
 def start_agent(
     model: str,
     config_dir: Path,
@@ -1330,8 +1645,12 @@ def start_agent(
     run_dir: Path,
     *,
     env_names: set[str],
+    allowlist: dict[str, list[int]],
     args: argparse.Namespace,
 ) -> dict:
+    egress = start_egress_proxy(
+        args.engine, args.agent_image, run_dir, allowlist, args.dry_run
+    )
     name = f"opencode-bench-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
     log_path = run_dir / "agent.log"
     command = [
@@ -1340,6 +1659,8 @@ def start_agent(
         "--rm",
         "--name",
         name,
+        "--network",
+        egress["network"],
         "--shm-size=1g",
         "-v",
         f"{workdir}:/work",
@@ -1353,6 +1674,22 @@ def start_agent(
         "XDG_CONFIG_HOME=/home/agent/.config",
         "-e",
         f"OPENCODE_BENCH_MODEL={model}",
+        "-e",
+        "HTTP_PROXY=http://egress-proxy:8080",
+        "-e",
+        "HTTPS_PROXY=http://egress-proxy:8080",
+        "-e",
+        "ALL_PROXY=http://egress-proxy:8080",
+        "-e",
+        "http_proxy=http://egress-proxy:8080",
+        "-e",
+        "https_proxy=http://egress-proxy:8080",
+        "-e",
+        "NO_PROXY=localhost,127.0.0.1,::1",
+        "-e",
+        "no_proxy=localhost,127.0.0.1,::1",
+        "-e",
+        'OPENCODE_CONFIG_CONTENT={"permission":{"webfetch":"deny","websearch":"deny"},"websearch":false}',
     ]
     if args.variant:
         command += ["-e", f"OPENCODE_BENCH_VARIANT={args.variant}"]
@@ -1362,79 +1699,86 @@ def start_agent(
 
     if args.dry_run:
         print("+ " + " ".join(shlex.quote(part) for part in command))
+        audit = stop_egress_proxy(args.engine, egress)
         return {
             "wall_s": 0.0,
             "watchdog": "dry-run",
             "completion": False,
             "agent_ok": True,
             "self_test_runs": 0,
+            **audit,
         }
 
-    start = time.time()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as handle:
-        handle.write("+ " + " ".join(shlex.quote(part) for part in command) + "\n\n")
-        handle.flush()
-        proc = subprocess.Popen(
-            command,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-
-        completion_path = workdir / "COMPLETION.md"
-        last_size = 0
-        last_change = start
-        completion_seen_at: float | None = None
-        watchdog = "exit"
-
-        while proc.poll() is None:
-            now = time.time()
-            try:
-                size = log_path.stat().st_size
-            except FileNotFoundError:
-                size = 0
-            if size != last_size:
-                last_size = size
-                last_change = now
-
-            if completion_path.exists() and completion_seen_at is None:
-                completion_seen_at = now
-                print("  COMPLETION.md seen; stopping in 60s unless the agent exits")
-            if completion_seen_at is not None and now - completion_seen_at > 60:
-                watchdog = "completion"
-                break
-            if now - start > args.timeout:
-                watchdog = "hard"
-                break
-            if now - last_change > args.idle_timeout:
-                watchdog = "idle"
-                break
-            time.sleep(2)
-
-        if watchdog != "exit":
-            subprocess.run(
-                [args.engine, "rm", "-f", name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+    try:
+        start = time.time()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write("+ " + " ".join(shlex.quote(part) for part in command) + "\n\n")
+            handle.flush()
+            proc = subprocess.Popen(
+                command,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
             )
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
 
-    wall_s = time.time() - start
-    log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    self_tests = log_text.count("playwright test") + log_text.count("test:e2e")
-    return {
-        "wall_s": wall_s,
-        "watchdog": watchdog,
-        "completion": (workdir / "COMPLETION.md").exists(),
-        "agent_ok": proc.returncode == 0,
-        "self_test_runs": self_tests,
-    }
+            completion_path = workdir / "COMPLETION.md"
+            last_size = 0
+            last_change = start
+            completion_seen_at: float | None = None
+            watchdog = "exit"
+
+            while proc.poll() is None:
+                now = time.time()
+                try:
+                    size = log_path.stat().st_size
+                except FileNotFoundError:
+                    size = 0
+                if size != last_size:
+                    last_size = size
+                    last_change = now
+
+                if completion_path.exists() and completion_seen_at is None:
+                    completion_seen_at = now
+                    print("  COMPLETION.md seen; stopping in 60s unless the agent exits")
+                if completion_seen_at is not None and now - completion_seen_at > 60:
+                    watchdog = "completion"
+                    break
+                if now - start > args.timeout:
+                    watchdog = "hard"
+                    break
+                if now - last_change > args.idle_timeout:
+                    watchdog = "idle"
+                    break
+                time.sleep(2)
+
+            if watchdog != "exit":
+                subprocess.run(
+                    [args.engine, "rm", "-f", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        wall_s = time.time() - start
+        log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        self_tests = log_text.count("playwright test") + log_text.count("test:e2e")
+        result = {
+            "wall_s": wall_s,
+            "watchdog": watchdog,
+            "completion": (workdir / "COMPLETION.md").exists(),
+            "agent_ok": proc.returncode == 0,
+            "self_test_runs": self_tests,
+        }
+    finally:
+        audit = stop_egress_proxy(args.engine, egress)
+    result.update(audit)
+    return result
 
 
 def read_code(path: Path) -> int | None:
@@ -1555,7 +1899,13 @@ def run_tests(
     }
 
 
-def score_run(tests: dict[str, bool], build: dict, *, goal: str) -> dict:
+def score_run(
+    tests: dict[str, bool],
+    build: dict,
+    *,
+    goal: str,
+    integrity_violation: bool = False,
+) -> dict:
     counts = {tier: {"pass": 0, "total": EXPECTED[tier]} for tier in EXPECTED}
     details = []
     for title, ok in tests.items():
@@ -1574,7 +1924,12 @@ def score_run(tests: dict[str, bool], build: dict, *, goal: str) -> dict:
     fatal = counts["P0"]["total"] - counts["P0"]["pass"]
     major = counts["P1"]["total"] - counts["P1"]["pass"]
     minor = counts["P2"]["total"] - counts["P2"]["pass"]
-    eligible = bool(build.get("build_ok")) and fatal == 0 and quality >= 0.80
+    eligible = (
+        bool(build.get("build_ok"))
+        and fatal == 0
+        and quality >= 0.80
+        and not integrity_violation
+    )
 
     return {
         "counts": counts,
@@ -1718,6 +2073,14 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- quality: {score['quality']:.3f}",
         f"- fatal/major/minor: {score['fatal']}/{score['major']}/{score['minor']}",
         f"- eligible: {score['eligible']}",
+        f"- integrity violation: {bool(meta.get('integrity_violation'))}",
+        f"- blocked network destinations: {meta.get('network_denied', 0)}",
+        *(
+            ["", "### Integrity evidence", ""]
+            + [f"- {reason}" for reason in meta.get("integrity_reasons", [])]
+            if meta.get("integrity_violation")
+            else []
+        ),
         "",
         *render_effort_lines(meta),
         "## Tests",
@@ -1734,6 +2097,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "## Artifacts",
         "",
         "- `agent.log`",
+        "- `egress.log`",
         "- `build.log`",
         "- `typecheck.log`",
         "- `test.log`",
@@ -1819,6 +2183,8 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   minor {score['minor']}   major {score['major']}"
         f"   {'ELIGIBLE' if score['eligible'] else 'not eligible'}"
     )
+    if meta.get("integrity_violation"):
+        print("  integrity VIOLATION — see egress.log; quality retained, run ineligible")
     print(
         f"  wall {format_duration(meta['wall_s'])}"
         f"   work {format_optional_duration(meta.get('wall_ex_self_test_s'))}"
@@ -2076,7 +2442,8 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             )
 
     variant_label = variant or "default"
-    thinking, effort = model_thinking(model, variant)
+    thinking, effort = model_thinking(model, variant, config_dir)
+    allowlist = resolve_agent_allowlist(model, config_dir, args.allow_host)
     run_args = argparse.Namespace(**vars(args))
     run_args.variant = variant
     print(f"run {run_id}")
@@ -2085,6 +2452,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     print(f"  config  {config_dir}")
     print(f"  thinking {thinking}" + (f" ({effort})" if effort else "") + f"  variant={variant_label}")
     print(f"  goal    {args.goal}")
+    print(f"  egress  provider-only ({', '.join(format_allowlist(allowlist))})")
 
     agent = start_agent(
         model,
@@ -2093,6 +2461,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         data_dir,
         run_dir,
         env_names=env_names,
+        allowlist=allowlist,
         args=run_args,
     )
     steps = count_agent_steps(run_dir / "agent.log")
@@ -2128,7 +2497,12 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         shutil.rmtree(run_dir, ignore_errors=True)
         return {}
 
-    score = score_run(tests["tests"], build, goal=args.goal)
+    score = score_run(
+        tests["tests"],
+        build,
+        goal=args.goal,
+        integrity_violation=agent.get("integrity_violation", False),
+    )
     image_meta = {} if args.dry_run else collect_image_metadata(
         args.engine, args.agent_image, args.eval_image
     )
@@ -2168,6 +2542,13 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "major": score["major"],
         "minor": score["minor"],
         "eligible": score["eligible"],
+        "integrity_violation": agent.get("integrity_violation", False),
+        "integrity_reasons": agent.get("integrity_reasons", []),
+        "network_policy": "provider-only",
+        "network_allowed_hosts": format_allowlist(allowlist),
+        "network_denied": agent.get("network_denied", 0),
+        "network_denied_hosts": agent.get("network_denied_hosts", []),
+        "egress_log": str(run_dir / "egress.log"),
         "report": str(run_dir / "report.md"),
         "agent_log": str(run_dir / "agent.log"),
         "build_log": str(run_dir / "build.log"),
@@ -2239,6 +2620,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append(f"missing {SEED_DIR / 'package.json'}")
     if not (SEED_DIR / "package-lock.json").exists():
         problems.append(f"missing {SEED_DIR / 'package-lock.json'}")
+    if not EGRESS_PROXY_PATH.exists():
+        problems.append(f"missing {EGRESS_PROXY_PATH}")
 
     evaluator_info: dict = {}
     if not engine_available(args.engine, args.dry_run):
@@ -2448,7 +2831,12 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         evaluator_image=args.eval_image,
         dry_run=False,
     )
-    score = score_run(tests["tests"], build, goal=meta.get("goal", "balanced"))
+    score = score_run(
+        tests["tests"],
+        build,
+        goal=meta.get("goal", "balanced"),
+        integrity_violation=bool(meta.get("integrity_violation")),
+    )
     meta.update(collect_image_metadata(args.engine, args.agent_image, args.eval_image))
     meta.update(
         {
@@ -2995,6 +3383,10 @@ def validate_submission(data: object) -> list[str]:
     if not isinstance(build_ok, bool):
         errors.append("run.build_ok must be boolean")
         build_ok = False
+    integrity_violation = run.get("integrity_violation", False)
+    if not isinstance(integrity_violation, bool):
+        errors.append("run.integrity_violation must be boolean when present")
+        integrity_violation = True
 
     counts = run.get("counts")
     quality, p0_failures = _counts_quality(counts if isinstance(counts, dict) else {})
@@ -3007,10 +3399,13 @@ def validate_submission(data: object) -> list[str]:
             if not _is_number(value) or abs(float(value) - expected_quality) > 0.001:
                 errors.append("run.quality does not match run.counts")
         expected_eligible = (
-            build_ok and p0_failures == 0 and expected_quality >= 0.80
+            build_ok
+            and p0_failures == 0
+            and expected_quality >= 0.80
+            and not integrity_violation
         )
         if run.get("eligible") is not None and bool(run.get("eligible")) != expected_eligible:
-            errors.append("run.eligible does not match counts/build_ok")
+            errors.append("run.eligible does not match counts/build_ok/integrity_violation")
         test_ok = run.get("test_ok")
         if not isinstance(test_ok, bool):
             errors.append("run.test_ok must be boolean")
@@ -3087,7 +3482,10 @@ def normalize_submission(
     run["quality"] = quality if quality is not None else 0.0
     build_ok = bool(run.get("build_ok"))
     run["eligible"] = bool(
-        build_ok and p0_failures == 0 and (quality or 0.0) >= 0.80
+        build_ok
+        and p0_failures == 0
+        and (quality or 0.0) >= 0.80
+        and run.get("integrity_violation") is not True
     )
     wall = float(run.get("wall_s") or 0)
     self_test = run.get("self_test_s")
@@ -3162,6 +3560,7 @@ def submission_to_row(submission: dict) -> dict:
         "minor_issues": minor,
         "fatal": fatal,
         "eligible": bool(run.get("eligible")),
+        "integrity_violation": run.get("integrity_violation") is True,
         "wall_s": wall,
         "span_s": run.get("span_s"),
         "agent_s": run.get("agent_s"),
@@ -3457,6 +3856,7 @@ def submission_template() -> dict:
                 for tier, total in EXPECTED.items()
             },
             "eligible": False,
+            "integrity_violation": False,
             "steps": 0,
             "input_tokens": None,
             "output_tokens": None,
@@ -3577,6 +3977,7 @@ def submission_from_score(meta: dict, *, hardware: str | None = None) -> dict:
         "counts": meta.get("counts") or {},
         "quality": meta.get("quality"),
         "eligible": meta.get("eligible"),
+        "integrity_violation": bool(meta.get("integrity_violation")),
         "steps": meta.get("steps"),
         "input_tokens": meta.get("input_tokens"),
         "output_tokens": meta.get("output_tokens"),
@@ -3642,7 +4043,12 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
             else wall_total
         )
         compactions = compaction_count(row)
-        eligible = str(row.get("eligible", "")).lower() == "true"
+        integrity_violation = row.get("integrity_violation") is True or str(
+            row.get("integrity_violation", "")
+        ).lower() == "true"
+        eligible = (
+            str(row.get("eligible", "")).lower() == "true" and not integrity_violation
+        )
         compaction_score = (
             1.0 / (1.0 + compactions) if compactions is not None else 0.0
         )
@@ -5403,6 +5809,16 @@ def make_parser() -> argparse.ArgumentParser:
     run.add_argument("--provider", default=None, help="filter the model menu")
     run.add_argument("--config", default=None, help="OpenCode config file or directory")
     run.add_argument("--env", action="append", default=[], metavar="KEY", help="pass an env var")
+    run.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        metavar="HOST[:PORT]|URL",
+        help=(
+            "allow an additional model API/authentication endpoint; repeatable. "
+            "Does not disable provider-only egress enforcement"
+        ),
+    )
     run.add_argument(
         "--hardware",
         default=None,
